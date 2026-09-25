@@ -1,0 +1,80 @@
+[
+  {
+    "id": "acc_admin",
+    "name": "Habib Akari",
+    "email": "admin@italcar.com",
+    "password": "admin123",
+    "role": "administration"
+  },
+  {
+    "id": "acc_1789998596227_qcn1y",
+    "name": "Ala Mezlini",
+    "email": "ala@italcar.com",
+    "password": "ala123",
+    "role": "chef_equipe",
+    "assignedTeam": "Lourd"
+  },
+  {
+    "id": "acc_1789998650796_aqtw5",
+    "name": "Amen Allah Amara",
+    "email": "amen.allah@italcar.com",
+    "password": "amenallah123",
+    "role": "chef_equipe",
+    "assignedTeam": "Changan"
+  },
+  {
+    "id": "acc_1789998683545_n5mht",
+    "name": "Khalil Ben Amara",
+    "email": "khalil@italcar.com",
+    "password": "khalil123",
+    "role": "chef_equipe",
+    "assignedTeam": "Carrosserie"
+  },
+  {
+    "id": "acc_1789998737151_32xzt",
+    "name": "SALIM BOUSHIH",
+    "email": "salim@italcar.com",
+    "password": "salim123",
+    "role": "chef_equipe",
+    "assignedTeam": "Elictrique"
+  },
+  {
+    "id": "acc_1789998789174_9d6uz",
+    "name": "Mehdi Mefteh",
+    "email": "mehdi@italcar.com",
+    "password": "mehdi123",
+    "role": "chef_atelier"
+  },
+  {
+    "id": "acc_1789998824319_93lpn",
+    "name": "ezzar",
+    "email": "abdelkarimezzar@gmail.com",
+    "password": "123456",
+    "role": "reception",
+    "assignedTeam": "Daily1"
+  },
+  {
+    "id": "acc_1789997723883_r5503",
+    "name": "WAJIH TOUIL",
+    "email": "wajih@italcar.com",
+    "password": "wajih123",
+    "role": "chef_equipe",
+    "assignedTeam": "Daily1"
+  },
+  {
+    "id": "acc_moez_trabelsi",
+    "name": "Moez Trabelsi",
+    "email": "moez.trabelsi@italcar.com",
+    "password": "moez123",
+    "role": "chef_equipe",
+    "assignedTeam": "Service Rapide"
+  },
+  {
+    "id": "acc_chef_daily2",
+    "name": "Mourad Menjli",
+    "email": "daily2@italcar.com",
+    "password": "daily123",
+    "role": "chef_equipe",
+    "assignedTeam": "Daily2"
+  }
+]
