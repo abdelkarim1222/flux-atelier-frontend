@@ -6,7 +6,12 @@ export interface RolePermissions {
   canAddEntree: boolean;
   canEditEmplacement: boolean;
   canEditEtat: boolean;
+  canEditAvancement: boolean;
   canViewMap: boolean;
+  canViewAttenteAchat: boolean;
+  canViewDevis: boolean;
+  canViewSuiviTemps: boolean;
+  canViewEssai: boolean;
   defaultTab: "chargement" | "suivi_entrees" | "plan_atelier";
 }
 

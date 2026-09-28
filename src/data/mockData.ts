@@ -54,6 +54,7 @@ export interface Flux {
   equipe3?: string;
   isPendingNewEntry?: boolean;
   creationTimestamp?: number;
+  dateModification?: string;
 }
 
 export const statusMeta: Array<{

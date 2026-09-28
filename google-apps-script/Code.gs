@@ -284,6 +284,29 @@ function doGet(e) {
   return reponseJsonp_(params.callback, result);
 }
 
+function doPost(e) {
+  let params = {};
+  try {
+    if (e && e.postData && e.postData.contents) {
+      try {
+        params = JSON.parse(e.postData.contents);
+      } catch (_) {
+        params = e.parameter || {};
+      }
+    } else if (e && e.parameter) {
+      params = e.parameter;
+    }
+  } catch (_) {
+    params = (e && e.parameter) || {};
+  }
+
+  const result = traiterRequeteApp_(params);
+
+  return ContentService
+    .createTextOutput(JSON.stringify(result))
+    .setMimeType(ContentService.MimeType.JSON);
+}
+
 /************************************************************
  * ASSIGNATION EMPLACEMENT SECURISEE
  * Supprime toute règle de validation avant d'écrire la valeur
@@ -1756,6 +1779,18 @@ function gererAvancement_(
     sheet
       .getRange(row, COL.ETAT)
       .setValue("attends acheter");
+    return;
+  }
+
+
+  // ==========================================================
+  // ATENDE DEVIS -> Emplacement automatique P (Parking)
+  // ==========================================================
+
+  if (avancement === "ATENDE DEVIS" || avancement.toLowerCase().includes("devis")) {
+    try {
+      assignerEmplacementSecurise_(sheet, row, emplacementCol, "P");
+    } catch (_) {}
     return;
   }
 
@@ -4069,16 +4104,20 @@ function traiterRequeteApp_(params) {
         return { ok: false, error: "Avancement vide." };
       }
 
+      const nowObj = new Date();
+      const nowFormatted = Utilities.formatDate(nowObj, "Africa/Tunis", "dd/MM/yyyy HH:mm");
+      const dateModif = String(params.dateModification || nowFormatted).trim();
+
       // Déterminer le bloc actif (1, 2 ou 3) de façon séquentielle : AVANCEMENT 1 -> AVANCEMENT 2 -> AVANCEMENT 3
       const bloc = determinerBlocActif_(sheet, ligne, params);
       const cols = obtenirColonnesBloc_(bloc);
 
-      // Si l'équipe du bloc est vide, l'initialiser
+      // Mise à jour ou initialisation de l'équipe du bloc
       const cellEq = sheet.getRange(ligne, cols.equipe);
-      if (cellEq.isBlank()) {
-        if (params.equipe) {
-          ecrireCelluleSecurisee_(cellEq, String(params.equipe).trim());
-        } else if (bloc === 2) {
+      if (params.equipe) {
+        ecrireCelluleSecurisee_(cellEq, String(params.equipe).trim());
+      } else if (cellEq.isBlank()) {
+        if (bloc === 2) {
           const av1Prec = sheet.getRange(ligne, COL.AV1).getDisplayValue().trim();
           if (av1Prec && VR_EQUIPE[av1Prec] && VR_EQUIPE[av1Prec].length > 0) {
             ecrireCelluleSecurisee_(cellEq, VR_EQUIPE[av1Prec][0]);
@@ -4091,15 +4130,27 @@ function traiterRequeteApp_(params) {
         }
       }
 
-      // Si la date de début du bloc est vide, l'enregistrer
+      // Si la date de début du bloc est vide, l'enregistrer avec l'horodatage exact de maintenant
       const cellDebut = sheet.getRange(ligne, cols.debut);
       if (cellDebut.isBlank()) {
-        cellDebut.setValue(new Date());
+        cellDebut.setValue(nowObj);
         try { cellDebut.setNumberFormat("dd/MM/yyyy HH:mm"); } catch (_) {}
       }
 
       // Inscription de l'avancement dans la colonne du bloc actif (AV1, AV2 ou AV3)
       ecrireCelluleSecurisee_(sheet.getRange(ligne, cols.avancement), nouvelAvancement);
+
+      // Mise à jour ou conservation du technicien du bloc si fourni (ex: accord devis)
+      if (params.technicien && String(params.technicien).trim() !== "-") {
+        try {
+          ecrireCelluleSecurisee_(sheet.getRange(ligne, cols.matricule), String(params.technicien).trim());
+        } catch (_) {}
+      }
+      if (params.nomTechnicien && String(params.nomTechnicien).trim() !== "-") {
+        try {
+          ecrireCelluleSecurisee_(sheet.getRange(ligne, cols.nom), String(params.nomTechnicien).trim());
+        } catch (_) {}
+      }
 
       // Si une demande de pièces / achat est transmise (attends acheter)
       if (params.ref || params.designation) {
@@ -4157,7 +4208,11 @@ function traiterRequeteApp_(params) {
               "EQUIPE",
               "DEMANDEUR",
               "COMMENTAIRE",
-              "STATUT"
+              "STATUT",
+              "DATE ET HEURE APPEL CLIENT",
+              "APPELÉ PAR",
+              "DATE ET HEURE DÉCISION",
+              "ACCORD CLIENT"
             ]);
           }
           const nowStr = Utilities.formatDate(new Date(), "Africa/Tunis", "dd/MM/yyyy HH:mm:ss");
@@ -4172,7 +4227,11 @@ function traiterRequeteApp_(params) {
             params.equipe || "",
             params.demandeur || "",
             params.commentaire || "",
-            "En attente accord"
+            "En attente accord",
+            params.dateAppel || "",
+            params.appelant || "",
+            params.dateDecision || "",
+            ""
           ]);
         } catch (errDevis) {
           Logger.log("Erreur enregistrement devis: " + errDevis);
@@ -4222,7 +4281,17 @@ function traiterRequeteApp_(params) {
         Logger.log("Info gererAvancement_ : " + errAv);
       }
 
-      if (nouvelAvancement === "attends acheter") {
+      if (params.etat) {
+        try {
+          sheet.getRange(ligne, COL.ETAT).clearDataValidations();
+          sheet.getRange(ligne, COL.ETAT).setValue(String(params.etat).trim());
+        } catch (_) {}
+      } else if (nouvelAvancement === "Attente réparation" || nouvelAvancement === "Attente Réparation") {
+        try {
+          sheet.getRange(ligne, COL.ETAT).clearDataValidations();
+          sheet.getRange(ligne, COL.ETAT).setValue("Attente réparation");
+        } catch (_) {}
+      } else if (nouvelAvancement === "attends acheter") {
         try {
           sheet.getRange(ligne, COL.ETAT).clearDataValidations();
           sheet.getRange(ligne, COL.ETAT).setValue("attends acheter");
@@ -4244,6 +4313,39 @@ function traiterRequeteApp_(params) {
         } catch (_) {}
       }
 
+      // Si Terminer : horodater la date de fin du bloc à maintenant (dd/MM/yyyy HH:mm)
+      if (nouvelAvancement === "Terminer") {
+        try {
+          const cellFin = sheet.getRange(ligne, cols.fin);
+          cellFin.setValue(nowObj);
+          cellFin.setNumberFormat("dd/MM/yyyy HH:mm");
+        } catch (_) {}
+      }
+
+      // Si Transfert VR : horodater la fin du bloc actuel et le début du prochain bloc à maintenant
+      if (estUneReparation_(nouvelAvancement) || nouvelAvancement.toLowerCase().startsWith("vr")) {
+        try {
+          const cellFin = sheet.getRange(ligne, cols.fin);
+          cellFin.setValue(nowObj);
+          cellFin.setNumberFormat("dd/MM/yyyy HH:mm");
+
+          const prochainBloc = bloc < 3 ? bloc + 1 : 3;
+          const prochainesCols = obtenirColonnesBloc_(prochainBloc);
+          const cellProchainDebut = sheet.getRange(ligne, prochainesCols.debut);
+          cellProchainDebut.setValue(nowObj);
+          cellProchainDebut.setNumberFormat("dd/MM/yyyy HH:mm");
+        } catch (_) {}
+      }
+
+      // Si ATENDE DEVIS ou demande de devis : l'emplacement bascule automatiquement en P (Parking)
+      if (nouvelAvancement === "ATENDE DEVIS" || nouvelAvancement.toLowerCase().includes("devis") || params.emplacement === "P") {
+        try {
+          assignerEmplacementSecurise_(sheet, ligne, emplacementCol, "P");
+        } catch (errDevisEmp) {
+          Logger.log("Erreur assignation emplacement P devis: " + errDevisEmp);
+        }
+      }
+
       SpreadsheetApp.flush();
 
       const nouvelEtat = sheet.getRange(ligne, COL.ETAT).getDisplayValue().trim();
@@ -4256,6 +4358,11 @@ function traiterRequeteApp_(params) {
           ligneSuivi = trouverLigneParIdentifiants_(sheetSuivi, params.no, params.cs, params.chassis);
         }
         if (ligneSuivi > 0) {
+          if (params.equipe) {
+            try {
+              sheetSuivi.getRange(ligneSuivi, 10).setValue(String(params.equipe).trim());
+            } catch (_) {}
+          }
           if (nouvelEtat) {
             try {
               sheetSuivi.getRange(ligneSuivi, 17).clearDataValidations();
@@ -4265,6 +4372,15 @@ function traiterRequeteApp_(params) {
           try {
             sheetSuivi.getRange(ligneSuivi, 14).setValue(nouvelAvancement);
           } catch (errSuiviAv) {}
+
+          // Si Terminer, enregistrer la date et heure de fin dans Suivi des entrées
+          if (nouvelAvancement === "Terminer") {
+            try {
+              const parts = dateModif.split(" ");
+              sheetSuivi.getRange(ligneSuivi, 12).setValue(parts[0] || Utilities.formatDate(nowObj, "Africa/Tunis", "dd/MM/yyyy"));
+              sheetSuivi.getRange(ligneSuivi, 13).setValue(parts[1] || Utilities.formatDate(nowObj, "Africa/Tunis", "HH:mm"));
+            } catch (_) {}
+          }
         }
       }
 
@@ -4312,6 +4428,111 @@ function traiterRequeteApp_(params) {
           }
         }
       }
+      SpreadsheetApp.flush();
+      return { ok: true, updated: updated, statut: nouveauStatut, date: nowStr };
+    }
+
+    // --------------------------------------------------------
+    // Action 5b : Mise à jour du statut de devis (DEVIS)
+    // --------------------------------------------------------
+    if (params.action === "updateStatutDevis") {
+      const NOM_FEUILLE_DEVIS = "DEVIS";
+      let sheetDevis = trouverFeuille_(ss, NOM_FEUILLE_DEVIS);
+      if (!sheetDevis) {
+        sheetDevis = ss.insertSheet(NOM_FEUILLE_DEVIS);
+      }
+
+      // S'assurer que les en-têtes existent
+      if (sheetDevis.getLastRow() < 1) {
+        sheetDevis.appendRow([
+          "DATE",
+          "N° DEVIS",
+          "OR",
+          "IMMATRICULATION",
+          "MODELE",
+          "CHASSIS",
+          "CLIENT",
+          "EQUIPE",
+          "DEMANDEUR",
+          "COMMENTAIRE",
+          "STATUT",
+          "DATE ET HEURE APPEL CLIENT",
+          "APPELÉ PAR",
+          "DATE ET HEURE DÉCISION",
+          "ACCORD CLIENT"
+        ]);
+      } else {
+        while (sheetDevis.getMaxColumns() < 15) {
+          sheetDevis.insertColumnAfter(sheetDevis.getMaxColumns());
+        }
+        if (!sheetDevis.getRange(1, 12).getValue()) sheetDevis.getRange(1, 12).setValue("DATE ET HEURE APPEL CLIENT");
+        if (!sheetDevis.getRange(1, 13).getValue()) sheetDevis.getRange(1, 13).setValue("APPELÉ PAR");
+        if (!sheetDevis.getRange(1, 14).getValue()) sheetDevis.getRange(1, 14).setValue("DATE ET HEURE DÉCISION");
+        if (!sheetDevis.getRange(1, 15).getValue()) sheetDevis.getRange(1, 15).setValue("ACCORD CLIENT");
+      }
+
+      const targetNumeroDevis = String(params.numeroDevis || "").trim();
+      const targetOr = String(params.or || params.no || "").trim();
+      const targetChassis = String(params.chassis || "").trim();
+      const nouveauStatut = String(params.statutDevis || params.statut || "Client appelé").trim();
+      const nowStr = Utilities.formatDate(new Date(), "Africa/Tunis", "dd/MM/yyyy HH:mm");
+
+      let updated = false;
+      const lastRow = sheetDevis.getLastRow();
+      if (lastRow >= 2) {
+        const maxCol = Math.max(sheetDevis.getLastColumn(), 15);
+        const data = sheetDevis.getRange(2, 1, lastRow - 1, maxCol).getValues();
+        for (let i = 0; i < data.length; i++) {
+          const rowNumDevis = String(data[i][1] || "").trim();
+          const rowOr = String(data[i][2] || "").trim();
+          const rowChassis = String(data[i][5] || "").trim();
+
+          const matchNum = targetNumeroDevis && (rowNumDevis === targetNumeroDevis);
+          const matchOr = targetOr && (rowOr === targetOr);
+          const matchChassis = targetChassis && (rowChassis === targetChassis);
+
+          if (matchNum || matchOr || matchChassis) {
+            sheetDevis.getRange(i + 2, 11).setValue(nouveauStatut);
+
+            // Enregistrer la date et heure exacte de l'appel au client
+            if (params.dateAppel || nouveauStatut === "Client appelé") {
+              sheetDevis.getRange(i + 2, 12).setValue(params.dateAppel || nowStr);
+              sheetDevis.getRange(i + 2, 13).setValue(params.appelant || "Réception");
+            }
+
+            // Enregistrer la date et heure d'accord ou de refus client
+            if (nouveauStatut === "Accepté" || nouveauStatut === "Refusé" || params.dateDecision) {
+              sheetDevis.getRange(i + 2, 14).setValue(params.dateDecision || nowStr);
+              sheetDevis.getRange(i + 2, 15).setValue(nouveauStatut === "Accepté" ? "OUI (Accord)" : "NON (Refus)");
+            }
+
+            updated = true;
+          }
+        }
+      }
+
+      // Si le devis n'était pas encore présent dans la feuille, on l'ajoute automatiquement
+      if (!updated && (targetOr || targetChassis || targetNumeroDevis)) {
+        sheetDevis.appendRow([
+          params.dateDevis || nowStr.split(" ")[0],
+          targetNumeroDevis || ("DV-" + (targetOr || targetChassis)),
+          targetOr,
+          params.immatriculation || params.serie || "",
+          params.modele || "",
+          targetChassis,
+          params.client || params.nomClient || "",
+          params.equipe || "",
+          params.demandeur || "",
+          params.pieces || params.commentaire || "",
+          nouveauStatut,
+          params.dateAppel || (nouveauStatut === "Client appelé" ? nowStr : ""),
+          params.appelant || (nouveauStatut === "Client appelé" ? "Réception" : ""),
+          params.dateDecision || (nouveauStatut === "Accepté" || nouveauStatut === "Refusé" ? nowStr : ""),
+          nouveauStatut === "Accepté" ? "OUI (Accord)" : nouveauStatut === "Refusé" ? "NON (Refus)" : ""
+        ]);
+        updated = true;
+      }
+
       SpreadsheetApp.flush();
       return { ok: true, updated: updated, statut: nouveauStatut, date: nowStr };
     }
@@ -4436,6 +4657,85 @@ function traiterRequeteApp_(params) {
       }
       SpreadsheetApp.flush();
       return { ok: true, annee: annee, mois: mois, message: "Période mise à jour avec succès dans Google Sheets." };
+    }
+
+    // --------------------------------------------------------
+    // Action 10 : Sauvegarder les équipes (EQUIPE et _LISTES_EQUIPE)
+    // --------------------------------------------------------
+    if (params.action === "sauvegarderEquipes") {
+      const rawJson = params.equipesJson || params.membresJson;
+      if (!rawJson) {
+        return { ok: false, error: "Données d'équipes manquantes." };
+      }
+      let membres = [];
+      try {
+        membres = typeof rawJson === "string" ? JSON.parse(rawJson) : rawJson;
+      } catch (e) {
+        return { ok: false, error: "JSON invalide." };
+      }
+      if (!Array.isArray(membres) || membres.length === 0) {
+        return { ok: false, error: "Liste des membres vide." };
+      }
+
+      // 1. Mettre à jour la feuille _LISTES_EQUIPE (colonnes A à D sans impacter les colonnes E à Z)
+      let sheetListes = trouverFeuille_(ss, NOM_LISTES);
+      if (!sheetListes) {
+        sheetListes = ss.insertSheet(NOM_LISTES);
+        sheetListes.appendRow(["EQUIPE", "N°Matricule", "NOM DE Technicien", "Poste"]);
+      }
+      const maxRowsListes = Math.max(sheetListes.getLastRow(), membres.length + 5, 25);
+      sheetListes.getRange(2, 1, maxRowsListes, 4).clearContent();
+
+      const listesRows = membres.map(function(m) {
+        return [
+          String(m.team || "").trim(),
+          String(m.matricule || "").trim(),
+          String(m.name || "").trim(),
+          String(m.poste || "").trim()
+        ];
+      });
+      if (listesRows.length > 0) {
+        sheetListes.getRange(2, 1, listesRows.length, 4).setValues(listesRows);
+      }
+
+      // 2. Mettre à jour la feuille EQUIPE (affichage en colonnes)
+      let sheetEquipe = trouverFeuille_(ss, NOM_FEUILLE_EQUIPE);
+      if (sheetEquipe) {
+        const maxR = Math.max(sheetEquipe.getLastRow(), 35);
+        sheetEquipe.getRange(2, 1, maxR, 11).clearContent();
+
+        function populateTeamBlock(teamName, startRow, colOffset) {
+          const teamMembers = membres.filter(function(m) {
+            return String(m.team || "").toLowerCase().replace(/[^a-z0-9]/g, "") === teamName.toLowerCase().replace(/[^a-z0-9]/g, "");
+          });
+          if (teamMembers.length > 0) {
+            const rowsData = teamMembers.map(function(m) {
+              return [String(m.matricule || ""), String(m.name || ""), String(m.poste || "")];
+            });
+            sheetEquipe.getRange(startRow, colOffset, rowsData.length, 3).setValues(rowsData);
+          }
+          return startRow + Math.max(teamMembers.length, 1) + 2;
+        }
+
+        // Col 1 (A-C)
+        let r1 = 2;
+        r1 = populateTeamBlock("Daily1", r1, 1);
+        populateTeamBlock("Service Rapide", r1, 1);
+
+        // Col 2 (E-G)
+        let r2 = 2;
+        r2 = populateTeamBlock("Daily2", r2, 5);
+        populateTeamBlock("Lourd", r2, 5);
+
+        // Col 3 (I-K)
+        let r3 = 2;
+        r3 = populateTeamBlock("Changan", r3, 9);
+        r3 = populateTeamBlock("Carrosserie", r3, 9);
+        populateTeamBlock("Elictrique", r3, 9);
+      }
+
+      SpreadsheetApp.flush();
+      return { ok: true, message: "Équipes sauvegardées avec succès (" + membres.length + " membres)." };
     }
 
     return { ok: false, error: "Action inconnue : " + params.action };

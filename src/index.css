@@ -982,6 +982,10 @@ button {
   width: 150px;
 }
 
+.vehicle-detail-table .col-immat {
+  width: 135px;
+}
+
 .vehicle-detail-table .col-emplacement {
   width: 132px;
 }

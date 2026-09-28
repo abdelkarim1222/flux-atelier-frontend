@@ -12,6 +12,7 @@ import {
   ShieldCheck,
   AlertCircle,
   FileSignature,
+  Wrench,
 } from "lucide-react";
 import type { Flux } from "../data/mockData";
 import type { DemandeDevis } from "../services/googleSheets";
@@ -42,6 +43,7 @@ export default function DemandeDevisModal({
   onConfirm,
 }: DemandeDevisModalProps) {
   const [numeroDevis, setNumeroDevis] = useState("");
+  const [pieces, setPieces] = useState("");
   const [commentaire, setCommentaire] = useState("");
   const [dateDevis, setDateDevis] = useState(getNowFormatted);
   const [error, setError] = useState<string | null>(null);
@@ -50,6 +52,7 @@ export default function DemandeDevisModal({
   useEffect(() => {
     if (isOpen && vehicle) {
       setNumeroDevis("");
+      setPieces("");
       setCommentaire("");
       setDateDevis(getNowFormatted());
       setError(null);
@@ -87,10 +90,15 @@ export default function DemandeDevisModal({
         modele: modele,
         immatriculation: immat,
         date: dateDevis || getNowFormatted(),
+        pieces: pieces.trim() || undefined,
         equipe: vehicle.equipe || undefined,
+        equipeOrigine: vehicle.equipe || undefined,
+        technicien: vehicle.technicien && vehicle.technicien !== "-" ? vehicle.technicien : undefined,
+        nomTechnicien: vehicle.nomTechnicien && vehicle.nomTechnicien !== "-" ? vehicle.nomTechnicien : undefined,
         demandeur: currentChefEquipeName || undefined,
         statutDevis: "En attente accord",
         commentaire: commentaire.trim() || undefined,
+        createdAtTimestamp: Date.now(),
       };
 
       await onConfirm(devis);
@@ -231,6 +239,30 @@ export default function DemandeDevisModal({
             </p>
           </div>
 
+          {/* Pièces à remplacer dès réception de la demande (Piess) */}
+          <div>
+            <label
+              htmlFor="pieces-devis-input"
+              className="block text-xs font-bold text-slate-700 mb-1"
+            >
+              Pièces à remplacer (Pièces / Piess) <span className="text-amber-600 font-semibold text-[11px]">(Identifiées dès réception)</span>
+            </label>
+            <div className="relative">
+              <input
+                id="pieces-devis-input"
+                type="text"
+                value={pieces}
+                onChange={(e) => setPieces(e.target.value)}
+                placeholder="Ex : Plaquettes AV + Disques, Kit distribution, Pompe à eau..."
+                className="w-full px-3.5 py-2.5 text-xs font-semibold bg-white border border-slate-300 rounded-xl shadow-2xs focus:ring-2 focus:ring-orange-500/20 focus:border-orange-500 outline-none transition-all placeholder:text-slate-400 placeholder:font-normal"
+              />
+              <Wrench size={16} className="absolute right-3 top-2.5 text-amber-500 pointer-events-none" />
+            </div>
+            <p className="text-[10px] text-slate-400 mt-0.5">
+              Ces pièces seront directement visibles par la <strong>Réception</strong> pour détailler le devis au client.
+            </p>
+          </div>
+
           {/* Commentaire optionnel */}
           <div>
             <label
@@ -273,7 +305,7 @@ export default function DemandeDevisModal({
           <div className="p-3 bg-orange-50/80 border border-orange-200/80 rounded-xl text-orange-900 text-[11px] flex items-center gap-2">
             <Check size={14} className="text-orange-600 shrink-0" />
             <span>
-              À la validation, l'avancement sera défini sur <strong>ATENDE DEVIS</strong> et vous serez automatiquement basculé vers la <strong>Page Devis</strong>.
+              À la validation, l'avancement sera défini sur <strong>ATENDE DEVIS</strong> et l'emplacement passera automatiquement en <strong>P (Parking)</strong>.
             </span>
           </div>
 

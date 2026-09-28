@@ -22,7 +22,7 @@ import {
   searchVehicleByVin,
   type VinVehicleInfo,
 } from "../services/googleSheets";
-import { DESTINATION_TEAMS } from "../config/teams";
+import { getAllDestinationTeams } from "../config/teams";
 import type { UnifiedReceptionRow } from "./SuiviEntreesTable";
 
 interface ModifierEntreeModalProps {
@@ -556,12 +556,12 @@ export default function ModifierEntreeModal({
                   }
                   className="w-full px-3 py-2 text-xs border border-slate-300 rounded-xl focus:ring-2 focus:ring-blue-500/20 focus:border-blue-500 outline-none transition-all bg-white font-semibold text-slate-800"
                 >
-                  {DESTINATION_TEAMS.map((team) => (
+                  {getAllDestinationTeams().map((team) => (
                     <option key={team} value={team}>
                       {team} {team === "Daily" ? "(Daily1 & Daily2)" : ""}
                     </option>
                   ))}
-                  {!DESTINATION_TEAMS.includes(formData.equipe as any) && formData.equipe && (
+                  {!getAllDestinationTeams().includes(formData.equipe) && formData.equipe && (
                     <option value={formData.equipe}>{formData.equipe}</option>
                   )}
                 </select>

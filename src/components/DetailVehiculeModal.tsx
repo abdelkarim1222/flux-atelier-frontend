@@ -1,4 +1,4 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useMemo } from "react";
 import { createPortal } from "react-dom";
 import {
   X,
@@ -18,17 +18,26 @@ import {
   ShieldCheck,
   Truck,
   Activity,
+  Timer,
 } from "lucide-react";
 import {
   searchVehicleByVin,
+  getDemandesDevisLocal,
+  getReaffectationsLocal,
   type VinVehicleInfo,
+  type DemandeDevis,
+  type ReaffectationRecord,
 } from "../services/googleSheets";
+import { calculateVehicleTimes } from "../services/timeTracking";
+import ChronoTimelineModal from "./ChronoTimelineModal";
 
 export interface VehiculeDetailData {
-  id?: string;
+  id?: string | number;
   noOr?: string;
   cs?: string;
   chassis: string;
+  immatriculation?: string;
+  serie?: string;
   nomClient: string;
   codeClient?: string;
   dateEntreeHeure?: string;
@@ -45,6 +54,7 @@ export interface VehiculeDetailData {
   nomTechnicien?: string;
   avancement?: string;
   dateFinRep?: string;
+  heureFin?: string;
   emplacement?: string;
   // Références de lignes pour édition directe
   suiviRowNumber?: number;
@@ -183,30 +193,6 @@ function getConditionMeta(etatRaw?: string, avancementRaw?: string) {
   };
 }
 
-// Calcul de durée de séjour
-function computeDureeSejour(dateStr?: string): string {
-  if (!dateStr || dateStr === "-" || dateStr.includes("1899")) return "-";
-  try {
-    const match = dateStr.match(/(\d{1,2})[/-](\d{1,2})[/-](\d{2,4})/);
-    if (!match) return "-";
-    const day = parseInt(match[1], 10);
-    const month = parseInt(match[2], 10) - 1;
-    let year = parseInt(match[3], 10);
-    if (year < 100) year += 2000;
-
-    const entryDate = new Date(year, month, day);
-    const now = new Date();
-    const diffMs = now.getTime() - entryDate.getTime();
-    if (diffMs < 0) return "Aujourd'hui";
-    const diffDays = Math.floor(diffMs / (1000 * 60 * 60 * 24));
-    if (diffDays === 0) return "Aujourd'hui";
-    if (diffDays === 1) return "1 jour";
-    return `${diffDays} jours`;
-  } catch {
-    return "-";
-  }
-}
-
 export default function DetailVehiculeModal({
   isOpen,
   onClose,
@@ -217,6 +203,80 @@ export default function DetailVehiculeModal({
   const [copiedVin, setCopiedVin] = useState(false);
   const [vinDetails, setVinDetails] = useState<VinVehicleInfo | null>(null);
   const [loadingVin, setLoadingVin] = useState(false);
+  const [isChronoModalOpen, setIsChronoModalOpen] = useState(false);
+  const [timeTick, setTimeTick] = useState(0);
+
+  // Synchronisation dynamique avec les événements de l'atelier & mise à jour live des minutes
+  useEffect(() => {
+    if (!isOpen) return;
+    const handleUpdate = () => setTimeTick((t) => t + 1);
+    window.addEventListener("vehicle_time_tracking_updated", handleUpdate);
+    window.addEventListener("reaffectations_updated", handleUpdate);
+    window.addEventListener("demandes_devis_updated", handleUpdate);
+    window.addEventListener("demandes_achat_updated", handleUpdate);
+    window.addEventListener("vehicle_essais_updated", handleUpdate);
+    window.addEventListener("storage", handleUpdate);
+
+    const timer = setInterval(() => {
+      setTimeTick((t) => t + 1);
+    }, 60000);
+
+    return () => {
+      window.removeEventListener("vehicle_time_tracking_updated", handleUpdate);
+      window.removeEventListener("reaffectations_updated", handleUpdate);
+      window.removeEventListener("demandes_devis_updated", handleUpdate);
+      window.removeEventListener("demandes_achat_updated", handleUpdate);
+      window.removeEventListener("vehicle_essais_updated", handleUpdate);
+      window.removeEventListener("storage", handleUpdate);
+      clearInterval(timer);
+    };
+  }, [isOpen]);
+
+  const chronoCalc = useMemo(() => {
+    return vehicule ? calculateVehicleTimes(vehicule as any) : null;
+  }, [vehicule, timeTick]);
+
+  const devisRecord = useMemo<DemandeDevis | null>(() => {
+    if (!isOpen || !vehicule) return null;
+    const all = getDemandesDevisLocal();
+    const keysToTry = [
+      String(vehicule.id || ""),
+      String(vehicule.noOr || ""),
+      String(vehicule.chassis || ""),
+    ].filter(Boolean);
+
+    for (const k of keysToTry) {
+      if (all[k]) return all[k];
+    }
+    const found = Object.values(all).find((d) => {
+      if (vehicule.id && String(d.vehicleId) === String(vehicule.id)) return true;
+      if (vehicule.noOr && d.or && d.or.trim() === vehicule.noOr.trim()) return true;
+      if (vehicule.chassis && d.chassis && d.chassis.trim().toUpperCase() === vehicule.chassis.trim().toUpperCase()) return true;
+      return false;
+    });
+    return found || null;
+  }, [isOpen, vehicule, timeTick]);
+
+  const reaffectationRecord = useMemo<ReaffectationRecord | null>(() => {
+    if (!isOpen || !vehicule) return null;
+    const all = getReaffectationsLocal();
+    const keysToTry = [
+      String(vehicule.id || ""),
+      String(vehicule.noOr || ""),
+      String(vehicule.chassis || ""),
+    ].filter(Boolean);
+
+    for (const k of keysToTry) {
+      if (all[k]) return all[k];
+    }
+    const found = Object.values(all).find((r) => {
+      if (vehicule.id && String(r.vehicleId) === String(vehicule.id)) return true;
+      if (vehicule.noOr && r.or && r.or.trim() === vehicule.noOr.trim()) return true;
+      if (vehicule.chassis && r.chassis && r.chassis.trim().toUpperCase() === vehicule.chassis.trim().toUpperCase()) return true;
+      return false;
+    });
+    return found || null;
+  }, [isOpen, vehicule, timeTick]);
 
   // Recherche automatique des caractéristiques complètes dans la base VIN Google Sheets
   useEffect(() => {
@@ -265,9 +325,6 @@ export default function DetailVehiculeModal({
   const condition = getConditionMeta(rawEtat, rawAvancement);
   const ConditionIcon = condition.icon;
   const pct = parseAvancementPct(rawAvancement);
-  const dureeSejour = computeDureeSejour(
-    vehicule.dateEntreeHeure || vehicule.dateEntree
-  );
 
   const handleCopyVin = () => {
     if (!vehicule.chassis) return;
@@ -621,44 +678,149 @@ export default function DetailVehiculeModal({
                 </div>
               </div>
 
-              {/* Suivi des Délais & Calendrier */}
+              {/* Suivi des Délais & Chronométrie Atelier */}
               <div className="bg-slate-50/80 border border-slate-200 rounded-xl p-4 space-y-3">
                 <div className="flex items-center justify-between pb-2 border-b border-slate-200">
                   <h3 className="text-xs font-bold uppercase tracking-wider text-slate-700 flex items-center gap-1.5">
-                    <Clock className="w-4 h-4 text-emerald-600" />
-                    Délais & Séjour Atelier
+                    <Timer className="w-4 h-4 text-indigo-600" />
+                    Chronométrie & Calcul des Temps
                   </h3>
+                  <button
+                    type="button"
+                    onClick={() => setIsChronoModalOpen(true)}
+                    className="inline-flex items-center gap-1 px-2 py-0.5 text-[11px] font-bold text-indigo-700 bg-indigo-50 hover:bg-indigo-100 rounded-md border border-indigo-200 transition-colors cursor-pointer"
+                  >
+                    <span>Détail & Pauses</span>
+                  </button>
                 </div>
 
-                <div className="space-y-2 text-xs">
-                  <div className="grid grid-cols-2 gap-2">
-                    <div className="bg-white p-2.5 rounded-lg border border-slate-200">
-                      <span className="text-[10px] font-bold uppercase text-slate-400 block">
-                        Date & Heure d'entrée
-                      </span>
-                      <span className="font-mono text-slate-800 font-semibold">
-                        {dateEntreeAffichee}
-                      </span>
+                {chronoCalc && (
+                  <div className="space-y-2 text-xs">
+                    <div className="grid grid-cols-2 gap-2">
+                      {/* Attente Réparation */}
+                      <div className="bg-white p-2.5 rounded-lg border border-slate-200">
+                        <span className="text-[10px] font-bold uppercase text-amber-600 block">
+                          Attente Réparation
+                        </span>
+                        <strong className="text-amber-800 font-mono font-bold text-xs">
+                          {chronoCalc.tempsAttenteReparationFormat}
+                        </strong>
+                      </div>
+
+                      {/* Travail Net Actif */}
+                      <div className="bg-blue-50 p-2.5 rounded-lg border border-blue-200 shadow-2xs">
+                        <span className="text-[10px] font-bold uppercase text-blue-700 block">
+                          Travail Net Effectif
+                        </span>
+                        <strong className="text-blue-900 font-mono font-black text-sm">
+                          {chronoCalc.tempsTravailEffectifFormat}
+                        </strong>
+                        <span className="text-[9px] text-blue-600 block mt-0.5">
+                          Séjour Total - (Pauses & Attentes)
+                        </span>
+                      </div>
                     </div>
-                    <div className="bg-white p-2.5 rounded-lg border border-slate-200">
-                      <span className="text-[10px] font-bold uppercase text-slate-400 block">
-                        Présence à l'Atelier
+
+                    <div className="grid grid-cols-2 gap-2">
+                      {/* Attente Pièces */}
+                      <div className="bg-white p-2.5 rounded-lg border border-slate-200">
+                        <span className="text-[10px] font-bold uppercase text-orange-600 block">
+                          Attente Pièces
+                        </span>
+                        <strong className="text-orange-800 font-mono font-bold text-xs">
+                          {chronoCalc.tempsAttentePiecesFormat}
+                        </strong>
+                      </div>
+
+                      {/* Attente Devis */}
+                      <div className="bg-white p-2.5 rounded-lg border border-slate-200">
+                        <span className="text-[10px] font-bold uppercase text-purple-600 block">
+                          Attente Devis
+                        </span>
+                        <strong className="text-purple-800 font-mono font-bold text-xs">
+                          {chronoCalc.tempsAttenteDevisFormat}
+                        </strong>
+                      </div>
+                    </div>
+
+                    <div className="grid grid-cols-2 gap-2">
+                      {/* Technicien réaffecté */}
+                      <div className="bg-white p-2.5 rounded-lg border border-slate-200">
+                        <span className="text-[10px] font-bold uppercase text-fuchsia-600 block">
+                          Technicien Réaffecté
+                        </span>
+                        <strong className="text-fuchsia-800 font-mono font-bold text-xs">
+                          {chronoCalc.tempsReaffecteFormat}
+                        </strong>
+                      </div>
+
+                      {/* Essai Routier */}
+                      <div className="bg-white p-2.5 rounded-lg border border-slate-200">
+                        <span className="text-[10px] font-bold uppercase text-violet-600 block">
+                          Essai Routier
+                        </span>
+                        <strong className="text-violet-800 font-mono font-bold text-xs">
+                          {chronoCalc.tempsEssaiFormat}
+                        </strong>
+                      </div>
+                    </div>
+
+                    {/* Dates Entrée & Fin */}
+                    <div className="bg-white p-2.5 rounded-lg border border-slate-200 grid grid-cols-2 gap-2 text-xs">
+                      <div>
+                        <span className="text-[10px] font-bold uppercase text-slate-400 block">Date Entrée</span>
+                        <span className="font-mono text-slate-800 font-semibold">{dateEntreeAffichee}</span>
+                      </div>
+                      <div>
+                        <span className="text-[10px] font-bold uppercase text-slate-400 block">Date Fin Prév.</span>
+                        <span className="font-mono text-slate-800 font-semibold">{dateFinAffichee}</span>
+                      </div>
+                    </div>
+
+                    {/* Séjour Total */}
+                    <div className="bg-white p-2.5 rounded-lg border border-slate-200 flex items-center justify-between">
+                      <span className="text-[10px] font-bold uppercase text-slate-500">
+                        Séjour Total (Entrée → Sortie)
                       </span>
-                      <strong className="text-emerald-700 font-bold font-mono">
-                        {dureeSejour}
+                      <strong className="text-slate-900 font-mono font-bold text-xs">
+                        {chronoCalc.tempsPresenceTotalFormat}
+                      </strong>
+                    </div>
+
+                    {/* Formule de Calcul Explicite du Travail Net Effectif */}
+                    <div className="bg-slate-50 p-2.5 rounded-lg border border-slate-200">
+                      <span className="text-[10px] font-bold uppercase text-slate-500 block mb-0.5">
+                        Détail du Calcul (Formule Atelier) :
+                      </span>
+                      <p className="text-[11px] font-mono text-slate-800 font-semibold break-words leading-relaxed">
+                        {chronoCalc.formuleCalcul}
+                      </p>
+                    </div>
+
+                    {/* Reste dans le travail */}
+                    <div className="bg-gradient-to-r from-indigo-50 to-blue-50 p-2.5 rounded-lg border border-indigo-200 flex items-center justify-between">
+                      <div>
+                        <span className="text-[10px] font-bold uppercase text-indigo-700 block">
+                          ⏳ Reste dans le travail (Estimé)
+                        </span>
+                        <span className="text-[10px] text-slate-500 font-mono">
+                          {chronoCalc.resteTravailStatut === "termine"
+                            ? "Travaux atelier achevés (100%)"
+                            : chronoCalc.resteTravailStatut === "depasse"
+                            ? "Temps barème alloué dépassé"
+                            : chronoCalc.tempsAlloueMin
+                            ? `Barème alloué : ${chronoCalc.tempsAlloueFormat}`
+                            : chronoCalc.avancementPct > 0
+                            ? `Calculé sur avancement (${chronoCalc.avancementPct}% réalisé)`
+                            : "En attente de démarrage"}
+                        </span>
+                      </div>
+                      <strong className="text-indigo-950 font-mono font-black text-xs">
+                        {chronoCalc.tempsRestantEstimeFormat}
                       </strong>
                     </div>
                   </div>
-
-                  <div className="bg-white p-2.5 rounded-lg border border-slate-200">
-                    <span className="text-[10px] font-bold uppercase text-slate-400 block">
-                      Date prévisionnelle fin des réparations
-                    </span>
-                    <span className="font-mono font-semibold text-slate-800">
-                      {dateFinAffichee}
-                    </span>
-                  </div>
-                </div>
+                )}
               </div>
             </div>
           </div>
@@ -688,6 +850,181 @@ export default function DetailVehiculeModal({
                 <span className="font-mono font-bold text-slate-800">
                   {codeClientAffiche}
                 </span>
+              </div>
+            </div>
+          </div>
+
+          {/* ========================================================= */}
+          {/* BLOC 4 : SUIVI DÉTAILLÉ DEVIS & RÉAFFECTATION DU TECHNICIEN */}
+          {/* ========================================================= */}
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+            {/* CARTE SUIVI DEVIS & APPEL CLIENT */}
+            <div className="bg-amber-50/70 border border-amber-200 rounded-xl p-4 space-y-3">
+              <div className="flex items-center justify-between pb-2 border-b border-amber-200">
+                <h3 className="text-xs font-bold uppercase tracking-wider text-amber-900 flex items-center gap-1.5">
+                  <PhoneCall className="w-4 h-4 text-amber-600" />
+                  Suivi Devis & Accord Client
+                </h3>
+                {devisRecord?.statutDevis && (
+                  <span className="px-2 py-0.5 rounded-full text-[10px] font-bold bg-amber-200 text-amber-950 border border-amber-300">
+                    {devisRecord.statutDevis}
+                  </span>
+                )}
+              </div>
+
+              <div className="space-y-2 text-xs">
+                <div className="grid grid-cols-2 gap-2">
+                  <div className="bg-white p-2.5 rounded-lg border border-amber-200">
+                    <span className="text-[10px] font-bold uppercase text-slate-400 block">
+                      N° Devis
+                    </span>
+                    <strong className="text-slate-800 font-mono font-bold">
+                      {devisRecord?.numeroDevis || "-"}
+                    </strong>
+                  </div>
+                  <div className="bg-white p-2.5 rounded-lg border border-amber-200">
+                    <span className="text-[10px] font-bold uppercase text-slate-400 block">
+                      Date Demande
+                    </span>
+                    <span className="text-slate-700 font-mono">
+                      {devisRecord?.date || "-"}
+                    </span>
+                  </div>
+                </div>
+
+                {/* Date et heure de l'appel au client */}
+                <div className="bg-white p-2.5 rounded-lg border border-amber-200">
+                  <span className="text-[10px] font-bold uppercase text-amber-800 block flex items-center gap-1">
+                    <Clock className="w-3.5 h-3.5 text-amber-600" />
+                    Quand ai-je appelé le client :
+                  </span>
+                  <div className="text-xs font-bold text-slate-900 mt-0.5">
+                    {devisRecord?.dateAppel ? (
+                      <span className="font-mono text-amber-900">
+                        {devisRecord.dateAppel}
+                        {devisRecord.appelant && (
+                          <span className="text-slate-500 font-normal ml-1 font-sans">
+                            (par {devisRecord.appelant})
+                          </span>
+                        )}
+                      </span>
+                    ) : (
+                      <span className="text-slate-400 italic font-normal">
+                        Client non encore appelé
+                      </span>
+                    )}
+                  </div>
+                </div>
+
+                {/* Date et heure d'acceptation du devis */}
+                <div className="bg-white p-2.5 rounded-lg border border-amber-200">
+                  <span className="text-[10px] font-bold uppercase text-emerald-800 block flex items-center gap-1">
+                    <CheckCircle2 className="w-3.5 h-3.5 text-emerald-600" />
+                    Date et Heure accord / acceptation devis :
+                  </span>
+                  <div className="text-xs font-bold text-slate-900 mt-0.5">
+                    {devisRecord?.dateDecision ? (
+                      <span className="text-emerald-800 font-bold font-mono">
+                        {devisRecord.dateDecision}
+                      </span>
+                    ) : (
+                      <span className="text-slate-400 italic font-normal">
+                        En attente d'accord client
+                      </span>
+                    )}
+                  </div>
+                </div>
+
+                {devisRecord?.pieces && (
+                  <div className="bg-white p-2.5 rounded-lg border border-amber-200">
+                    <span className="text-[10px] font-bold uppercase text-slate-400 block">
+                      Pièces en devis
+                    </span>
+                    <span className="text-slate-800 font-medium line-clamp-2">
+                      {devisRecord.pieces}
+                    </span>
+                  </div>
+                )}
+              </div>
+            </div>
+
+            {/* CARTE STATUT RÉAFFECTATION DU TECHNICIEN */}
+            <div className="bg-fuchsia-50/70 border border-fuchsia-200 rounded-xl p-4 space-y-3">
+              <div className="flex items-center justify-between pb-2 border-b border-fuchsia-200">
+                <h3 className="text-xs font-bold uppercase tracking-wider text-fuchsia-900 flex items-center gap-1.5">
+                  <Clock className="w-4 h-4 text-fuchsia-600" />
+                  Statut Réaffectation Technicien
+                </h3>
+                {reaffectationRecord && (
+                  <span
+                    className={`px-2 py-0.5 rounded-full text-[10px] font-bold border ${
+                      reaffectationRecord.isRepris
+                        ? "bg-emerald-100 text-emerald-800 border-emerald-300"
+                        : "bg-fuchsia-200 text-fuchsia-900 border-fuchsia-300"
+                    }`}
+                  >
+                    {reaffectationRecord.isRepris ? "Travail repris" : "Technicien réaffecté"}
+                  </span>
+                )}
+              </div>
+
+              <div className="space-y-2 text-xs">
+                {reaffectationRecord ? (
+                  <>
+                    <div className="grid grid-cols-2 gap-2">
+                      <div className="bg-white p-2.5 rounded-lg border border-fuchsia-200">
+                        <span className="text-[10px] font-bold uppercase text-slate-400 block">
+                          Technicien
+                        </span>
+                        <strong className="text-slate-800 font-bold">
+                          {reaffectationRecord.technicienNom || "-"}
+                        </strong>
+                      </div>
+                      <div className="bg-white p-2.5 rounded-lg border border-fuchsia-200">
+                        <span className="text-[10px] font-bold uppercase text-slate-400 block">
+                          Équipe
+                        </span>
+                        <span className="text-slate-800 font-bold">
+                          {reaffectationRecord.equipe || "-"}
+                        </span>
+                      </div>
+                    </div>
+
+                    {/* Date & Heure Réaffectation */}
+                    <div className="bg-white p-2.5 rounded-lg border border-fuchsia-200">
+                      <span className="text-[10px] font-bold uppercase text-fuchsia-800 block flex items-center gap-1">
+                        <Clock className="w-3.5 h-3.5 text-fuchsia-600" />
+                        Date et Heure quand le technicien a été réaffecté :
+                      </span>
+                      <div className="text-xs font-bold text-fuchsia-950 mt-0.5 font-mono">
+                        {reaffectationRecord.dateReaffectation}
+                      </div>
+                    </div>
+
+                    {/* Date & Heure Reprise du travail */}
+                    <div className="bg-white p-2.5 rounded-lg border border-fuchsia-200">
+                      <span className="text-[10px] font-bold uppercase text-emerald-800 block flex items-center gap-1">
+                        <CheckCircle2 className="w-3.5 h-3.5 text-emerald-600" />
+                        Date et Heure quand retourné pour travailler :
+                      </span>
+                      <div className="text-xs font-bold mt-0.5 font-mono">
+                        {reaffectationRecord.dateReprise ? (
+                          <span className="text-emerald-800 font-bold">
+                            {reaffectationRecord.dateReprise}
+                          </span>
+                        ) : (
+                          <span className="text-amber-700 italic font-normal">
+                            Pas encore repris (en attente)
+                          </span>
+                        )}
+                      </div>
+                    </div>
+                  </>
+                ) : (
+                  <div className="bg-white p-4 rounded-lg border border-fuchsia-200 text-center text-slate-500">
+                    <span className="text-xs">Aucune réaffectation de technicien enregistrée sur ce véhicule.</span>
+                  </div>
+                )}
               </div>
             </div>
           </div>
@@ -734,6 +1071,14 @@ export default function DetailVehiculeModal({
           </div>
         </div>
       </div>
+      {/* Modal Chronométrie détaillée */}
+      {isChronoModalOpen && vehicule && (
+        <ChronoTimelineModal
+          isOpen={isChronoModalOpen}
+          onClose={() => setIsChronoModalOpen(false)}
+          vehicle={vehicule}
+        />
+      )}
     </div>,
     document.body
   );

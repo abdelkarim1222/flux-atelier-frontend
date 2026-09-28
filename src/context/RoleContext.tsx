@@ -18,7 +18,12 @@ export const ROLES_META: Record<RoleType, RoleInfo> = {
       canAddEntree: true,
       canEditEmplacement: true,
       canEditEtat: true,
+      canEditAvancement: true,
       canViewMap: true,
+      canViewAttenteAchat: true,
+      canViewDevis: true,
+      canViewSuiviTemps: true,
+      canViewEssai: true,
       defaultTab: "chargement",
     },
   },
@@ -35,24 +40,34 @@ export const ROLES_META: Record<RoleType, RoleInfo> = {
       canAddEntree: true,
       canEditEmplacement: true,
       canEditEtat: true,
+      canEditAvancement: true,
       canViewMap: true,
+      canViewAttenteAchat: true,
+      canViewDevis: true,
+      canViewSuiviTemps: true,
+      canViewEssai: true,
       defaultTab: "chargement",
     },
   },
   reception: {
     id: "reception",
     title: "Réception",
-    description: "Ajout et gestion du Suivi des entrées véhicules",
+    description: "Ajout et gestion du Suivi des entrées véhicules, Devis & Avancement Atelier",
     badgeBg: "bg-emerald-100 text-emerald-800 border-emerald-300",
     badgeText: "Réception",
     accentColor: "#059669",
     permissions: {
-      canViewAll: true,
+      canViewAll: false,
       canEditChargement: false,
       canAddEntree: true,
       canEditEmplacement: false,
       canEditEtat: false,
+      canEditAvancement: false,  // Réception ne peut pas modifier l'avancement atelier
       canViewMap: false,
+      canViewAttenteAchat: false, // Interdit pour Réception
+      canViewDevis: true,        // Consultable & géré par Réception (appels clients, relance 24h, refus)
+      canViewSuiviTemps: false,   // Interdit pour Réception (Réservé Administration & Chef Atelier)
+      canViewEssai: false,        // Réception ne peut pas consulter
       defaultTab: "suivi_entrees",
     },
   },
@@ -69,7 +84,12 @@ export const ROLES_META: Record<RoleType, RoleInfo> = {
       canAddEntree: false,
       canEditEmplacement: true,
       canEditEtat: true,
+      canEditAvancement: true,
       canViewMap: false,
+      canViewAttenteAchat: false, // Interdit pour Chef d'Équipe (Masqué du menu + Redirection)
+      canViewDevis: false,       // Masqué du menu Chef d'Équipe (géré par Réception/Admin)
+      canViewSuiviTemps: false,  // Interdit pour Chef d'Équipe (Réservé Administration & Chef Atelier)
+      canViewEssai: true,        // Consultable par Chef d'Équipe
       defaultTab: "chargement",
     },
   },

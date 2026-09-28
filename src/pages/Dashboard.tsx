@@ -18,6 +18,7 @@ import {
   Save,
   Search,
   Shield,
+  ShieldAlert,
   ShoppingCart,
   Users,
   Wrench,
@@ -30,6 +31,9 @@ import {
   UserCheck,
   ArrowRightLeft,
   FileSignature,
+  Timer,
+  PhoneCall,
+  XCircle,
 } from "lucide-react";
 import type { CSSProperties, MouseEvent, ReactNode } from "react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
@@ -49,10 +53,11 @@ import MoyennesView from "../components/MoyennesView";
 import EssaiView from "../components/EssaiView";
 import AcheterView from "../components/AcheterView";
 import DetailVehiculeModal from "../components/DetailVehiculeModal";
-import AffecterTechnicienModal from "../components/AffecterTechnicienModal";
+import AffecterTechnicienModal, { getActiveVehicleForTech } from "../components/AffecterTechnicienModal";
 import DemandeAchatModal from "../components/DemandeAchatModal";
 import DemandeDevisModal from "../components/DemandeDevisModal";
-import DevisView from "../components/DevisView";
+import DevisView, { isDevisDepassee24h } from "../components/DevisView";
+import SuiviTempsView from "../components/SuiviTempsView";
 import { useAuth } from "../context/AuthContext";
 import { useRole } from "../context/RoleContext";
 import {
@@ -65,6 +70,8 @@ import {
   DELIVERED_EMPLACEMENT,
   DEFAULT_EQUIPE_MAPPINGS,
   fetchEquipeSheetData,
+  getCustomEquipeMembers,
+  normalizePersonName,
   fetchGoogleSheetFluxData,
   synchroniserTableauxDeChargement,
   getTeamForChefEquipe,
@@ -84,11 +91,32 @@ import {
   saveEssaiControleLocal,
   saveDemandeDevisLocal,
   getDemandesDevisLocal,
+  marquerDevisAppele,
+  marquerDevisAccepte,
+  marquerDevisRefuse,
+  marquerDevisRelance,
+  updateGoogleSheetStatutDevis,
   type DemandeDevis,
+  type ReaffectationRecord,
+  getReaffectationsLocal,
+  marquerVehiculeReaffecte,
+  marquerVehiculeReprise,
+  type DevisAccordNotification,
+  getDevisAccordNotifications,
+  saveDevisAccordNotification,
+  removeDevisAccordNotification,
   VEHICLE_SHEET_URL,
   type EquipeSheetResult,
   mergeRecentAddedVehicles,
+  getNowFormatted,
+  marquerDebutTransfertVR,
+  marquerDebutEssai,
+  marquerFinEssai,
 } from "../services/googleSheets";
+import {
+  recordAvancementStatusChange,
+  saveVehicleTimeLog,
+} from "../services/timeTracking";
 import type { EssaiValidationPayload } from "../components/ValidationEssaiModal";
 import { normalizeTeamName, isVehicleMatchingTeam } from "../config/teams";
 
@@ -170,7 +198,12 @@ function isAttenteReparation(etat?: string) {
   );
 }
 
-function isEnCours(etat?: string, avancement?: string, technicien?: string): boolean {
+function isEnCours(
+  etat?: string,
+  avancement?: string,
+  technicien?: string,
+  isReaffecteActive?: boolean
+): boolean {
   const normEtat = (etat || "").trim().toLowerCase();
   const normAv = (avancement || "").trim().toLowerCase();
   const hasTech = Boolean(technicien && technicien !== "-" && technicien.trim() !== "");
@@ -181,6 +214,15 @@ function isEnCours(etat?: string, avancement?: string, technicien?: string): boo
   if (normEtat.includes("livr") || normAv.includes("livr")) return false;
   if (normEtat === "terminer" || normAv === "terminer") return false;
   if (normEtat.includes("attente client") || normAv.includes("attente client")) return false;
+
+  // Technicien réaffecté : reste OBLIGATOIREMENT dans le tableau Interventions En cours
+  if (
+    isReaffecteActive ||
+    normAv.includes("réaffect") ||
+    normAv.includes("reaffect")
+  ) {
+    return true;
+  }
 
   // Inclusions : si l'avancement indique un travail en cours ou pourcentage
   if (normAv.startsWith("en cours") || normAv.includes("%") || normAv.includes("devis")) return true;
@@ -262,6 +304,27 @@ function getAvancementStyle(val?: string): CSSProperties {
       backgroundColor: "#f5f3ff",
       color: "#6d28d9",
       borderColor: "#ddd6fe",
+    };
+  }
+  if (lower.includes("pdr")) {
+    return {
+      backgroundColor: "#fff7ed",
+      color: "#c2410c",
+      borderColor: "#fed7aa",
+    };
+  }
+  if (lower.includes("réaffect") || lower.includes("reaffect")) {
+    return {
+      backgroundColor: "#fdf4ff",
+      color: "#86198f",
+      borderColor: "#f0abfc",
+    };
+  }
+  if (lower.includes("attente réparation") || lower.includes("attente reparation")) {
+    return {
+      backgroundColor: "#fdf2f8",
+      color: "#9d174d",
+      borderColor: "#fbcfe8",
     };
   }
   if (lower.includes("achet")) {
@@ -413,7 +476,7 @@ function MetricCard({
 export default function Dashboard() {
   const { currentUser, logout } = useAuth();
   const { role, roleInfo, permissions } = useRole();
-  type TabType = "chargement" | "en_cours" | "essai" | "attente_achat" | "devis" | "plan_atelier" | "suivi_entrees" | "gestion_acces" | "gestion_equipes" | "moyennes";
+  type TabType = "chargement" | "en_cours" | "essai" | "attente_achat" | "devis" | "plan_atelier" | "suivi_entrees" | "suivi_temps" | "gestion_acces" | "gestion_equipes" | "moyennes";
 
   const [activeTab, setActiveTabState] = useState<TabType>(() => {
     try {
@@ -428,26 +491,63 @@ export default function Dashboard() {
         saved === "devis" ||
         saved === "plan_atelier" ||
         saved === "suivi_entrees" ||
+        saved === "suivi_temps" ||
         saved === "gestion_acces" ||
         saved === "gestion_equipes" ||
         saved === "moyennes"
       ) {
+        // Sécurité sur les onglets restreints
+        if (
+          role === "reception" &&
+          (saved === "attente_achat" ||
+            saved === "essai" ||
+            saved === "suivi_temps")
+        ) {
+          return "suivi_entrees";
+        }
+        if (
+          role === "chef_equipe" &&
+          (saved === "attente_achat" || saved === "devis" || saved === "suivi_temps")
+        ) {
+          return "chargement";
+        }
         return saved;
       }
-    } catch {}
+    } catch { }
     return permissions.defaultTab;
   });
 
-  const setActiveTab = useCallback((tab: TabType) => {
-    setActiveTabState(tab);
-    if (typeof window !== "undefined" && window.innerWidth < 768) {
-      setIsSidebarOpen(false);
-    }
-    try {
-      sessionStorage.setItem("flux_atelier_dashboard_tab", tab);
-      localStorage.setItem("flux_atelier_dashboard_tab", tab);
-    } catch {}
-  }, []);
+  const setActiveTab = useCallback(
+    (tab: TabType) => {
+      // Sécurité : la réception ne peut pas consulter Attente Achat, Essai ou Suivi Temps (Devis est autorisé)
+      if (
+        role === "reception" &&
+        (tab === "attente_achat" ||
+          tab === "essai" ||
+          tab === "suivi_temps")
+      ) {
+        setActiveTabState("suivi_entrees");
+        return;
+      }
+      // Sécurité : le chef d'équipe ne peut pas consulter Attente Achat, Devis ou Suivi Temps
+      if (
+        role === "chef_equipe" &&
+        (tab === "attente_achat" || tab === "devis" || tab === "suivi_temps")
+      ) {
+        setActiveTabState("chargement");
+        return;
+      }
+      setActiveTabState(tab);
+      if (typeof window !== "undefined" && window.innerWidth < 768) {
+        setIsSidebarOpen(false);
+      }
+      try {
+        sessionStorage.setItem("flux_atelier_dashboard_tab", tab);
+        localStorage.setItem("flux_atelier_dashboard_tab", tab);
+      } catch { }
+    },
+    [role]
+  );
 
   const [isSidebarOpen, setIsSidebarOpen] = useState(() => {
     if (typeof window !== "undefined") {
@@ -457,6 +557,24 @@ export default function Dashboard() {
   });
 
   useEffect(() => {
+    // Redirection automatique si le rôle actuel est sur un onglet non autorisé
+    if (
+      role === "reception" &&
+      (activeTab === "attente_achat" ||
+        activeTab === "essai" ||
+        activeTab === "suivi_temps")
+    ) {
+      setActiveTab("suivi_entrees");
+      return;
+    }
+    if (
+      role === "chef_equipe" &&
+      (activeTab === "attente_achat" || activeTab === "devis" || activeTab === "suivi_temps")
+    ) {
+      setActiveTab("chargement");
+      return;
+    }
+
     const saved = sessionStorage.getItem("flux_atelier_dashboard_tab");
     if (!saved) {
       if (role === "reception") {
@@ -470,7 +588,7 @@ export default function Dashboard() {
     } else if (saved === "chargement" && (role === "administration" || role === "chef_atelier")) {
       setActiveFilter("Tous");
     }
-  }, [role, setActiveTab]);
+  }, [role, activeTab, setActiveTab]);
 
   const mapRef = useRef<HTMLDivElement>(null);
   const planStageRef = useRef<HTMLElement>(null);
@@ -532,6 +650,8 @@ export default function Dashboard() {
   const [pendingAchatVehicle, setPendingAchatVehicle] = useState<Flux | null>(null);
   const [pendingDevisVehicle, setPendingDevisVehicle] = useState<Flux | null>(null);
   const [demandesDevisMap, setDemandesDevisMap] = useState<Record<string, DemandeDevis>>(getDemandesDevisLocal);
+  const [reaffectationsMap, setReaffectationsMap] = useState<Record<string, ReaffectationRecord>>(getReaffectationsLocal);
+  const [devisAccordNotifications, setDevisAccordNotifications] = useState<DevisAccordNotification[]>(getDevisAccordNotifications);
   const [deliveredAchatNotifications, setDeliveredAchatNotifications] = useState<
     Array<{ vehicle: Flux; demande: DemandeAchat; timestamp: string }>
   >([]);
@@ -540,13 +660,38 @@ export default function Dashboard() {
     const handleDevisUpdate = () => {
       setDemandesDevisMap(getDemandesDevisLocal());
     };
+    const handleReaffectationUpdate = () => {
+      setReaffectationsMap(getReaffectationsLocal());
+    };
+    const handleDevisAccordUpdate = () => {
+      setDevisAccordNotifications(getDevisAccordNotifications());
+    };
     window.addEventListener("demandes_devis_updated", handleDevisUpdate);
+    window.addEventListener("reaffectations_updated", handleReaffectationUpdate);
+    window.addEventListener("devis_accord_updated", handleDevisAccordUpdate);
     window.addEventListener("storage", handleDevisUpdate);
+    window.addEventListener("storage", handleReaffectationUpdate);
+    window.addEventListener("storage", handleDevisAccordUpdate);
     return () => {
       window.removeEventListener("demandes_devis_updated", handleDevisUpdate);
+      window.removeEventListener("reaffectations_updated", handleReaffectationUpdate);
+      window.removeEventListener("devis_accord_updated", handleDevisAccordUpdate);
       window.removeEventListener("storage", handleDevisUpdate);
+      window.removeEventListener("storage", handleReaffectationUpdate);
+      window.removeEventListener("storage", handleDevisAccordUpdate);
     };
   }, []);
+
+  const getReaffectationForVehicle = useCallback(
+    (v: Flux): ReaffectationRecord | undefined => {
+      return (
+        reaffectationsMap[String(v.id)] ||
+        (v.no && reaffectationsMap[v.no.trim()]) ||
+        (v.chassis && reaffectationsMap[v.chassis.trim()])
+      );
+    },
+    [reaffectationsMap]
+  );
   const [isTechModalOpen, setIsTechModalOpen] = useState(false);
   const [isOnlyTechChange, setIsOnlyTechChange] = useState(false);
 
@@ -554,6 +699,21 @@ export default function Dashboard() {
     fetchEquipeSheetData()
       .then((data) => setEquipeData(data))
       .catch((err) => console.warn("Erreur chargement EQUIPE:", err));
+  }, []);
+
+  // Écouter les modifications des équipes en temps réel
+  useEffect(() => {
+    const handleEquipesUpdated = () => {
+      fetchEquipeSheetData()
+        .then((data) => setEquipeData(data))
+        .catch(() => {});
+    };
+    window.addEventListener("flux_equipes_updated", handleEquipesUpdated);
+    window.addEventListener("storage", handleEquipesUpdated);
+    return () => {
+      window.removeEventListener("flux_equipes_updated", handleEquipesUpdated);
+      window.removeEventListener("storage", handleEquipesUpdated);
+    };
   }, []);
 
   const [selectedChefEquipeName, setSelectedChefEquipeName] = useState<string>(() => {
@@ -574,8 +734,21 @@ export default function Dashboard() {
       return currentUser.assignedTeam.trim();
     }
     const nameToMatch = selectedChefEquipeName || currentUser?.name || "WAJIH TOUIL";
+    const custom = getCustomEquipeMembers();
+    if (custom && custom.length > 0) {
+      const map = new Map<string, string>();
+      custom.forEach((m) => map.set(normalizePersonName(m.name), m.team));
+      return getTeamForChefEquipe(nameToMatch, map);
+    }
     return getTeamForChefEquipe(nameToMatch, equipeData?.teamByMemberName);
   }, [currentUser, selectedChefEquipeName, equipeData]);
+
+  const resolvedEquipeMembers = useMemo(() => {
+    const custom = getCustomEquipeMembers();
+    if (custom && custom.length > 0) return custom;
+    if (equipeData?.members && equipeData.members.length > 0) return equipeData.members;
+    return DEFAULT_EQUIPE_MAPPINGS;
+  }, [equipeData?.members]);
 
   // Helper pour extraire l'équipe d'origine d'un véhicule transféré
   const getOriginTeam = useCallback((v: Flux): string => {
@@ -878,12 +1051,12 @@ export default function Dashboard() {
         current.map((item) =>
           item.id === row.id
             ? {
-                ...item,
-                etatIntervention: nextEtat,
-                statut: nextEtat,
-                emplacement: nextEmplacement,
-                ...(isGoingToEnCours && assignedTeam ? { equipe: assignedTeam } : {}),
-              }
+              ...item,
+              etatIntervention: nextEtat,
+              statut: nextEtat,
+              emplacement: nextEmplacement,
+              ...(isGoingToEnCours && assignedTeam ? { equipe: assignedTeam } : {}),
+            }
             : item
         )
       );
@@ -919,12 +1092,12 @@ export default function Dashboard() {
           current.map((item) =>
             item.id === row.id
               ? {
-                  ...item,
-                  etatIntervention: previousEtat,
-                  statut: previousEtat,
-                  emplacement: previousEmplacement,
-                  equipe: previousEquipe,
-                }
+                ...item,
+                etatIntervention: previousEtat,
+                statut: previousEtat,
+                emplacement: previousEmplacement,
+                equipe: previousEquipe,
+              }
               : item
           )
         );
@@ -967,13 +1140,13 @@ export default function Dashboard() {
         current.map((item) =>
           item.id === row.id
             ? {
-                ...item,
-                etatIntervention: nextEtat,
-                statut: nextEtat,
-                equipe: assignedTeam,
-                technicien: technicien !== "-" ? technicien : item.technicien,
-                nomTechnicien: nomTechnicien !== "-" ? nomTechnicien : item.nomTechnicien,
-              }
+              ...item,
+              etatIntervention: nextEtat,
+              statut: nextEtat,
+              equipe: assignedTeam,
+              technicien: technicien !== "-" ? technicien : item.technicien,
+              nomTechnicien: nomTechnicien !== "-" ? nomTechnicien : item.nomTechnicien,
+            }
             : item
         )
       );
@@ -982,8 +1155,7 @@ export default function Dashboard() {
       if (!canWriteToSheet) {
         setSavingVehicleId(null);
         setWriteNotice(
-          `Véhicule ${row.serie || row.no} passé en cours. Équipe : ${assignedTeam}${
-            technicien && technicien !== "-" ? ` • Technicien : [${technicien}] ${nomTechnicien}` : ""
+          `Véhicule ${row.serie || row.no} passé en cours. Équipe : ${assignedTeam}${technicien && technicien !== "-" ? ` • Technicien : [${technicien}] ${nomTechnicien}` : ""
           }.`
         );
         return;
@@ -1003,8 +1175,7 @@ export default function Dashboard() {
         setSheetStatus("ready");
         setSheetError("");
         setWriteNotice(
-          `Véhicule ${row.serie || row.no} passé en cours. Équipe : ${assignedTeam}${
-            technicien && technicien !== "-" ? ` • Technicien : [${technicien}] ${nomTechnicien}` : ""
+          `Véhicule ${row.serie || row.no} passé en cours. Équipe : ${assignedTeam}${technicien && technicien !== "-" ? ` • Technicien : [${technicien}] ${nomTechnicien}` : ""
           }.`
         );
       } catch (error) {
@@ -1016,8 +1187,7 @@ export default function Dashboard() {
 
         if (isValidationRuleError) {
           setWriteNotice(
-            `Véhicule ${row.serie || row.no} pris en charge : Équipe ${assignedTeam}${
-              technicien && technicien !== "-" ? ` • Technicien : [${technicien}] ${nomTechnicien}` : ""
+            `Véhicule ${row.serie || row.no} pris en charge : Équipe ${assignedTeam}${technicien && technicien !== "-" ? ` • Technicien : [${technicien}] ${nomTechnicien}` : ""
             }. (Enregistré dans l'application. Déployez le nouveau Code.gs pour débloquer la cellule dans Google Sheets).`
           );
         } else {
@@ -1025,14 +1195,14 @@ export default function Dashboard() {
             current.map((item) =>
               item.id === row.id
                 ? {
-                    ...item,
-                    etatIntervention: previousEtat,
-                    statut: previousEtat,
-                    emplacement: previousEmplacement,
-                    equipe: previousEquipe,
-                    technicien: previousTech,
-                    nomTechnicien: previousNomTech,
-                  }
+                  ...item,
+                  etatIntervention: previousEtat,
+                  statut: previousEtat,
+                  emplacement: previousEmplacement,
+                  equipe: previousEquipe,
+                  technicien: previousTech,
+                  nomTechnicien: previousNomTech,
+                }
                 : item
             )
           );
@@ -1075,22 +1245,22 @@ export default function Dashboard() {
       const nextAvancement = isTransferInit
         ? "En cours - 10%"
         : row.avancement && row.avancement !== "-"
-        ? row.avancement
-        : "En cours - 10%";
+          ? row.avancement
+          : "En cours - 10%";
       const finalTeam = assignedTeam || row.equipe || (activeChefEquipeTeam || "Daily1");
 
       setVehicles((current) =>
         current.map((item) =>
           item.id === row.id
             ? {
-                ...item,
-                technicien: technicien !== "-" ? technicien : item.technicien,
-                nomTechnicien: nomTechnicien !== "-" ? nomTechnicien : item.nomTechnicien,
-                equipe: finalTeam,
-                etatIntervention: "En cours",
-                statut: "En cours",
-                avancement: nextAvancement,
-              }
+              ...item,
+              technicien: technicien !== "-" ? technicien : item.technicien,
+              nomTechnicien: nomTechnicien !== "-" ? nomTechnicien : item.nomTechnicien,
+              equipe: finalTeam,
+              etatIntervention: "En cours",
+              statut: "En cours",
+              avancement: nextAvancement,
+            }
             : item
         )
       );
@@ -1133,14 +1303,14 @@ export default function Dashboard() {
             current.map((item) =>
               item.id === row.id
                 ? {
-                    ...item,
-                    technicien: previousTech,
-                    nomTechnicien: previousNomTech,
-                    equipe: previousEquipe,
-                    etatIntervention: previousEtat,
-                    statut: previousStatut,
-                    avancement: previousAvancement,
-                  }
+                  ...item,
+                  technicien: previousTech,
+                  nomTechnicien: previousNomTech,
+                  equipe: previousEquipe,
+                  etatIntervention: previousEtat,
+                  statut: previousStatut,
+                  avancement: previousAvancement,
+                }
                 : item
             )
           );
@@ -1165,8 +1335,9 @@ export default function Dashboard() {
       extraParams?: Record<string, string>,
       demandeDevis?: DemandeDevis
     ) => {
-      if (!permissions.canEditEtat) {
-        setWriteError("Votre profil ne vous permet pas de modifier l'avancement.");
+      const isDevisTransition = Boolean(extraParams?.etat || demandeDevis);
+      if (!permissions.canEditEtat && !permissions.canEditAvancement && !isDevisTransition) {
+        setWriteError("Votre profil ne vous permet pas de modifier l'avancement atelier.");
         return;
       }
 
@@ -1177,6 +1348,9 @@ export default function Dashboard() {
       ) {
         return;
       }
+
+      const nowFormatted = getNowFormatted();
+      const currentUserName = currentUser?.name || selectedChefEquipeName || "Chef d'équipe";
 
       // Si le chef d'équipe choisit "attends acheter" sans formulaire de demande, ouvrir le modal
       if (nextAvancement === "attends acheter" && !demandeAchat) {
@@ -1190,33 +1364,134 @@ export default function Dashboard() {
         return;
       }
 
-      // Si une demande de pièces/achat est transmise, l'enregistrer localement
-      if (demandeAchat) {
-        saveDemandeAchatLocal(demandeAchat);
+      let activeDemandeAchat = demandeAchat;
+      // Si "Attente PDR" est choisi sans formulaire, créer la demande PDR horodatée à maintenant
+      if (nextAvancement === "Attente PDR" && !activeDemandeAchat) {
+        activeDemandeAchat = {
+          date: nowFormatted,
+          or: row.no || row.ordre || "",
+          chassis: row.chassis || "",
+          client: row.client || "",
+          ref: "PDR",
+          designation: "Attente Pièces de Rechange (PDR)",
+          qt: 1,
+          commentaire: "Attente pièces en magasin",
+          equipe: row.equipe || "",
+          statutAchat: "Attente",
+          createdAtTimestamp: Date.now(),
+        };
+        saveDemandeAchatLocal(activeDemandeAchat);
+      } else if (activeDemandeAchat) {
+        activeDemandeAchat.date = activeDemandeAchat.date || nowFormatted;
+        saveDemandeAchatLocal(activeDemandeAchat);
       }
 
-      // Si une demande de devis est transmise, l'enregistrer localement
+      // Si une demande de devis est transmise, l'enregistrer localement avec la date de maintenant
       if (demandeDevis) {
+        demandeDevis.date = demandeDevis.date || nowFormatted;
         saveDemandeDevisLocal(demandeDevis);
       }
 
       const previousAvancement = row.avancement;
       const previousEtat = row.etatIntervention;
+      const previousEmplacement = row.emplacement;
+
+      let effectiveAvancement = nextAvancement;
+      if (nextAvancement === "Technicien réaffecté") {
+        const record = marquerVehiculeReaffecte(row, currentUserName);
+        effectiveAvancement = "Attente réparation";
+        setWriteNotice(
+          `🔄 Technicien réaffecté pour ${row.serie || row.no} le ${record.dateReaffectation}. L'avancement devient "Attente réparation" (reste dans Interventions En cours).`
+        );
+      } else if (
+        nextAvancement.startsWith("En cours") ||
+        nextAvancement.includes("%")
+      ) {
+        const existingReaff = getReaffectationForVehicle(row);
+        if (existingReaff && !existingReaff.isRepris) {
+          const rec = marquerVehiculeReprise(row, currentUserName);
+          setWriteNotice(
+            `✅ Travail repris sur ${row.serie || row.no} le ${rec.dateReprise} !`
+          );
+        }
+      }
+
+      // Essai routier : démarrer le contrôle horodaté à maintenant
+      if (nextAvancement === "Essai") {
+        marquerDebutEssai(row, currentUserName);
+      }
+
+      // Terminer : clôturer l'essai si ouvert et enregistrer la date de fin effective de réparation
+      if (nextAvancement === "Terminer") {
+        marquerFinEssai(row, { dateControle: nowFormatted, resultat: "CONFORME" });
+        saveVehicleTimeLog({
+          vehicleKey: row.no || row.chassis || String(row.id),
+          noOr: row.no || row.ordre || "",
+          chassis: row.chassis || "",
+          immatriculation: row.serie || row.immatriculation || "",
+          client: row.client || "",
+          equipe: row.equipe || "",
+          dateFinReparation: nowFormatted,
+        });
+      }
 
       // Déduire l'état d'intervention selon la valeur d'avancement
-      const nextEtat: WorkshopStatus = nextAvancement === "Terminer"
+      const nextEtat: WorkshopStatus = effectiveAvancement === "Terminer"
         ? "Attente Client"
-        : nextAvancement === "Essai"
-        ? "Essai"
-        : nextAvancement === "attends acheter"
-        ? "attends acheter"
-        : nextAvancement === "Attente client"
-        ? "Attente Client"
-        : nextAvancement.startsWith("vr")
-        ? "En cours"
-        : nextAvancement.startsWith("En cours") || nextAvancement.toLowerCase().includes("devis")
-        ? "En cours"
-        : row.etatIntervention;
+        : effectiveAvancement === "Essai"
+          ? "Essai"
+          : effectiveAvancement === "attends acheter"
+            ? "attends acheter"
+            : effectiveAvancement === "Attente client"
+              ? "Attente Client"
+              : effectiveAvancement.startsWith("vr")
+                ? "En cours"
+                : nextAvancement === "Technicien réaffecté"
+                  ? "En cours"
+                  : effectiveAvancement === "Attente réparation" || effectiveAvancement === "Attente Réparation"
+                    ? ((extraParams?.etat as WorkshopStatus) || "Attente Réparation")
+                    : effectiveAvancement.startsWith("En cours") || effectiveAvancement.toLowerCase().includes("devis")
+                      ? "En cours"
+                      : row.etatIntervention;
+
+      // Emplacement automatique : quand l'équipe met ATENDE DEVIS, l'emplacement bascule automatiquement en "P" (Parking)
+      const isDevis = nextAvancement === "ATENDE DEVIS" || nextAvancement.toLowerCase().includes("devis");
+      const nextEmplacement = isDevis ? "P" : row.emplacement;
+      const targetEquipe = (extraParams?.equipe || demandeDevis?.equipeOrigine || row.equipe || "").trim() || row.equipe;
+      const targetTech = extraParams?.technicien !== undefined ? extraParams.technicien : (demandeDevis?.technicien || row.technicien);
+      const targetNomTech = extraParams?.nomTechnicien !== undefined ? extraParams.nomTechnicien : (demandeDevis?.nomTechnicien || row.nomTechnicien);
+
+      // Transferts VR : enregistrer le début du transfert vers l'équipe cible horodaté à maintenant
+      if (nextAvancement.startsWith("vr")) {
+        marquerDebutTransfertVR(row, nextAvancement, targetEquipe, currentUserName);
+      }
+
+      // Enregistrer chaque modification dans la chronométrie pour affichage et calcul précis des temps
+      recordAvancementStatusChange(row, nextAvancement, nowFormatted, currentUserName);
+
+      // Si l'avancement cible est En cours, vérifier que le technicien n'est pas déjà occupé sur un autre véhicule
+      const isTryingEnCours =
+        effectiveAvancement.startsWith("En cours") ||
+        effectiveAvancement.includes("%") ||
+        effectiveAvancement.startsWith("vr") ||
+        nextEtat === "En cours";
+
+      if (isTryingEnCours && ((targetTech && targetTech !== "-") || (targetNomTech && targetNomTech !== "-"))) {
+        const busyCar = getActiveVehicleForTech(
+          targetTech || "",
+          targetNomTech || "",
+          vehicles,
+          row.id,
+          row.no,
+          reaffectationsMap
+        );
+        if (busyCar) {
+          setWriteError(
+            `⛔ Impossible de passer En cours : Le technicien [${targetTech}] ${targetNomTech || ""} est actuellement occupé sur le véhicule OR ${busyCar.no || busyCar.serie || busyCar.id} (${busyCar.marque || ""} ${busyCar.modele || ""}). Il doit obligatoirement terminer ce nouveau travail avant de reprendre ce véhicule !`
+          );
+          return;
+        }
+      }
 
       setWriteNotice("");
       setWriteError("");
@@ -1225,21 +1500,31 @@ export default function Dashboard() {
         current.map((item) =>
           item.id === row.id
             ? {
-                ...item,
-                avancement: nextAvancement,
-                etatIntervention: nextEtat,
-                statut: nextEtat,
-              }
+              ...item,
+              avancement: effectiveAvancement,
+              etatIntervention: nextEtat,
+              statut: nextEtat,
+              emplacement: nextEmplacement,
+              equipe: targetEquipe,
+              technicien: targetTech !== undefined ? targetTech : item.technicien,
+              nomTechnicien: targetNomTech !== undefined ? targetNomTech : item.nomTechnicien,
+              dateModification: nowFormatted,
+              dateFinRep: effectiveAvancement === "Terminer" ? nowFormatted : item.dateFinRep,
+            }
             : item
         )
       );
 
-      // Basculer automatiquement vers la page correspondante selon la demande de l'utilisateur
-      if (nextAvancement === "Essai") {
+      if (isDevis) {
+        setSelectedZone("P");
+      }
+
+      // Basculer automatiquement vers la page correspondante selon les permissions
+      if (nextAvancement === "Essai" && permissions.canViewEssai) {
         setActiveTab("essai");
-      } else if (nextAvancement === "attends acheter") {
+      } else if (nextAvancement === "attends acheter" && permissions.canViewAttenteAchat) {
         setActiveTab("attente_achat");
-      } else if (nextAvancement === "ATENDE DEVIS") {
+      } else if (nextAvancement === "ATENDE DEVIS" && permissions.canViewDevis) {
         setActiveTab("devis");
       }
 
@@ -1251,16 +1536,60 @@ export default function Dashboard() {
         return;
       }
 
+      const extraPayload: Record<string, string> = {
+        ...(extraParams || {}),
+        etat: nextEtat,
+        dateModification: nowFormatted,
+      };
+      if (isDevis) {
+        extraPayload.emplacement = "P";
+        extraPayload.dateDevis = nowFormatted;
+      }
+      if (nextAvancement === "Attente PDR" || nextAvancement === "attends acheter") {
+        extraPayload.dateDemande = nowFormatted;
+      }
+      if (nextAvancement === "Technicien réaffecté") {
+        extraPayload.dateReaffectation = nowFormatted;
+      }
+      if (nextAvancement === "Essai") {
+        extraPayload.dateControle = nowFormatted;
+        extraPayload.dateDebutEssai = nowFormatted;
+      }
+      if (nextAvancement === "Terminer") {
+        extraPayload.dateFin = nowFormatted;
+      }
+      if (nextAvancement.startsWith("vr")) {
+        extraPayload.dateTransfert = nowFormatted;
+      }
+      if (targetTech) {
+        extraPayload.technicien = targetTech;
+      }
+      if (targetNomTech) {
+        extraPayload.nomTechnicien = targetNomTech;
+      }
+
       try {
         await updateGoogleSheetAvancement(
           row,
-          nextAvancement,
-          row.equipe,
+          effectiveAvancement,
+          targetEquipe,
           row.bloc,
-          demandeAchat,
-          extraParams,
+          activeDemandeAchat,
+          extraPayload,
           demandeDevis
         );
+        // Garantir la mise à jour immédiate de l'emplacement en P dans Google Sheets
+        if (isDevis && row.emplacement !== "P") {
+          updateGoogleSheetEmplacement(row, "P").catch(() => { });
+        }
+        // Si un technicien est réaffecté ou spécifié, synchroniser aussi la colonne technicien
+        if (extraParams?.technicien || extraParams?.nomTechnicien) {
+          updateGoogleSheetTechnicien(
+            row,
+            targetTech || "",
+            targetNomTech || ""
+          ).catch(() => {});
+        }
         setLastRefresh(formatRefreshDate());
         setSheetStatus("ready");
         setSheetError("");
@@ -1268,33 +1597,38 @@ export default function Dashboard() {
           nextAvancement === "Essai"
             ? `Véhicule ${row.serie || row.no} mis à jour : Essai (transféré vers la Page Essai).`
             : nextAvancement === "attends acheter"
-            ? `Véhicule ${row.serie || row.no} mis à jour : attends acheter (transféré vers la Page Acheter).`
-            : nextAvancement === "ATENDE DEVIS"
-            ? `Véhicule ${row.serie || row.no} mis à jour : ATENDE DEVIS (transféré vers la Page Devis).`
-            : nextAvancement === "Terminer"
-            ? `Essai CONFORME validé pour ${row.serie || row.no} : intervention Terminer (transféré en Attente Client).`
-            : nextAvancement === "Attente client"
-            ? `Essai NON-CONFORME pour ${row.serie || row.no} : placé en Attente Client (accord requis pour la nouvelle panne).`
-            : nextAvancement.startsWith("vr")
-            ? `Essai NON-CONFORME pour ${row.serie || row.no} : retourné à l'équipe ${nextAvancement}.`
-            : `Avancement ${row.serie || row.no} mis à jour : ${nextAvancement}.`;
+              ? `Véhicule ${row.serie || row.no} mis à jour : attends acheter (transféré vers la Page Acheter).`
+              : nextAvancement === "ATENDE DEVIS"
+                ? `Véhicule ${row.serie || row.no} mis à jour : ATENDE DEVIS (Emplacement basculé automatiquement en P).`
+                : nextAvancement === "Technicien réaffecté"
+                  ? `🔄 Technicien réaffecté pour ${row.serie || row.no} : avancement passé en "Attente réparation" (reste dans Interventions En cours).`
+                  : nextAvancement === "Terminer"
+                    ? `Essai CONFORME validé pour ${row.serie || row.no} : intervention Terminer (transféré en Attente Client).`
+                    : nextAvancement === "Attente client"
+                      ? `Essai NON-CONFORME pour ${row.serie || row.no} : placé en Attente Client (accord requis pour la nouvelle panne).`
+                      : nextAvancement.startsWith("vr")
+                        ? `Essai NON-CONFORME pour ${row.serie || row.no} : retourné à l'équipe ${nextAvancement}.`
+                        : `Avancement ${row.serie || row.no} mis à jour : ${nextAvancement}.`;
         setWriteNotice(noticeMsg);
       } catch (error) {
         if (
           nextAvancement === "attends acheter" ||
           nextAvancement === "Essai" ||
           nextAvancement === "Terminer" ||
-          nextAvancement === "Attente client"
+          nextAvancement === "Attente client" ||
+          nextAvancement === "ATENDE DEVIS"
         ) {
           // Pour ces statuts, on conserve le véhicule dans l'état et la page cible
           setWriteNotice(
             nextAvancement === "attends acheter"
               ? `Véhicule ${row.serie || row.no} enregistré dans l'application en attente d'achat.`
               : nextAvancement === "Essai"
-              ? `Véhicule ${row.serie || row.no} transféré en essai dans l'application.`
-              : nextAvancement === "Terminer"
-              ? `Contrôle conforme pour ${row.serie || row.no} enregistré dans l'application.`
-              : `Véhicule ${row.serie || row.no} placé en attente client dans l'application.`
+                ? `Véhicule ${row.serie || row.no} transféré en essai dans l'application.`
+                : nextAvancement === "ATENDE DEVIS"
+                  ? `Véhicule ${row.serie || row.no} enregistré en ATENDE DEVIS (Emplacement P) dans l'application.`
+                  : nextAvancement === "Terminer"
+                    ? `Contrôle conforme pour ${row.serie || row.no} enregistré dans l'application.`
+                    : `Véhicule ${row.serie || row.no} placé en attente client dans l'application.`
           );
           setWriteError(
             error instanceof Error
@@ -1317,11 +1651,12 @@ export default function Dashboard() {
               current.map((item) =>
                 item.id === row.id
                   ? {
-                      ...item,
-                      avancement: previousAvancement,
-                      etatIntervention: previousEtat,
-                      statut: previousEtat,
-                    }
+                    ...item,
+                    avancement: previousAvancement,
+                    etatIntervention: previousEtat,
+                    statut: previousEtat,
+                    emplacement: previousEmplacement,
+                  }
                   : item
               )
             );
@@ -1336,7 +1671,38 @@ export default function Dashboard() {
         setSavingVehicleId((current) => (current === row.id ? null : current));
       }
     },
-    [canWriteToSheet, permissions.canEditEtat, setActiveTab]
+    [canWriteToSheet, permissions.canEditEtat, permissions.canEditAvancement, setActiveTab, role]
+  );
+
+  const handleReprendreTravail = useCallback(
+    async (row: Flux) => {
+      // Vérifier si le technicien est actuellement occupé sur un autre véhicule
+      const tech = row.technicien || "";
+      const nomTech = row.nomTechnicien || "";
+      if ((tech && tech !== "-") || (nomTech && nomTech !== "-")) {
+        const busyCar = getActiveVehicleForTech(
+          tech,
+          nomTech,
+          vehicles,
+          row.id,
+          row.no,
+          reaffectationsMap
+        );
+        if (busyCar) {
+          setWriteError(
+            `⛔ Impossible de reprendre le travail : Le technicien [${tech}] ${nomTech} est actuellement occupé sur le véhicule OR ${busyCar.no || busyCar.serie || busyCar.id} (${busyCar.marque || ""} ${busyCar.modele || ""}). Il doit obligatoirement terminer ce nouveau travail avant de reprendre l'ancien véhicule !`
+          );
+          return;
+        }
+      }
+
+      const rec = marquerVehiculeReprise(row, currentUser?.name);
+      await saveVehicleAvancement(row, "En cours - 10%");
+      setWriteNotice(
+        `✅ Travail repris sur ${row.serie || row.no || row.chassis} le ${rec.dateReprise} !`
+      );
+    },
+    [currentUser?.name, saveVehicleAvancement, vehicles, reaffectationsMap]
   );
 
   // Validation du contrôle d'essai depuis la Page Essai (modal essayeur)
@@ -1344,19 +1710,23 @@ export default function Dashboard() {
     async (payload: EssaiValidationPayload) => {
       const vehicle = payload.vehicle;
       let nextAvancement: string;
+      const nowFormatted = getNowFormatted();
       const extraParams: Record<string, string> = {
         essayeur: payload.essayeur,
         resultatEssai: payload.resultat,
-        dateControle: payload.dateControle,
+        dateControle: payload.dateControle || nowFormatted,
+        dateModification: nowFormatted,
       };
 
       if (payload.resultat === "CONFORME") {
         nextAvancement = "Terminer";
+        extraParams.dateFin = payload.dateControle || nowFormatted;
       } else {
         if (payload.actionNonConforme === "transfert_vr" && payload.targetVr) {
           nextAvancement = payload.targetVr;
           extraParams.actionNonConforme = "transfert_vr";
           extraParams.targetVr = payload.targetVr;
+          extraParams.dateTransfert = payload.dateControle || nowFormatted;
         } else {
           nextAvancement = "Attente client";
           extraParams.actionNonConforme = "attente_client";
@@ -1483,14 +1853,21 @@ export default function Dashboard() {
 
   const enCoursCount = useMemo(() => {
     if (role === "chef_equipe" && activeChefEquipeTeam) {
-      return vehicles.filter(
-        (v) =>
-          isEnCours(v.etatIntervention, v.avancement, v.technicien) &&
+      return vehicles.filter((v) => {
+        const r = getReaffectationForVehicle(v);
+        const isReaffActive = Boolean(r && !r.isRepris);
+        return (
+          isEnCours(v.etatIntervention, v.avancement, v.technicien, isReaffActive) &&
           isVehicleMatchingTeam(v.equipe || "", activeChefEquipeTeam)
-      ).length;
+        );
+      }).length;
     }
-    return vehicles.filter((v) => isEnCours(v.etatIntervention, v.avancement, v.technicien)).length;
-  }, [vehicles, role, activeChefEquipeTeam]);
+    return vehicles.filter((v) => {
+      const r = getReaffectationForVehicle(v);
+      const isReaffActive = Boolean(r && !r.isRepris);
+      return isEnCours(v.etatIntervention, v.avancement, v.technicien, isReaffActive);
+    }).length;
+  }, [vehicles, role, activeChefEquipeTeam, getReaffectationForVehicle]);
 
   const essaiCount = useMemo(() => {
     if (role === "chef_equipe" && activeChefEquipeTeam) {
@@ -1525,6 +1902,219 @@ export default function Dashboard() {
     return vehicles.filter((v) => isAttenteDevis(v, demandesDevisMap)).length;
   }, [vehicles, role, activeChefEquipeTeam, demandesDevisMap]);
 
+  const devisAAppelerCount = useMemo(() => {
+    return vehicles.filter((v) => {
+      const d =
+        demandesDevisMap[String(v.id)] ||
+        (v.no && demandesDevisMap[v.no.trim()]) ||
+        (v.chassis && demandesDevisMap[v.chassis.trim()]);
+      const av = (v.avancement || "").toLowerCase();
+      const isEnDevis = av.includes("devis") || (v.etatIntervention || "").toLowerCase().includes("devis");
+      return isEnDevis && (!d || !d.statutDevis || d.statutDevis === "En attente accord");
+    }).length;
+  }, [vehicles, demandesDevisMap]);
+
+  const devisRelanceCount = useMemo(() => {
+    return vehicles.filter((v) => {
+      const d =
+        demandesDevisMap[String(v.id)] ||
+        (v.no && demandesDevisMap[v.no.trim()]) ||
+        (v.chassis && demandesDevisMap[v.chassis.trim()]);
+      const av = (v.avancement || "").toLowerCase();
+      const isEnDevis = av.includes("devis") || (v.etatIntervention || "").toLowerCase().includes("devis");
+      return isEnDevis && isDevisDepassee24h(d);
+    }).length;
+  }, [vehicles, demandesDevisMap]);
+
+  const [dismissedDevisNotifIds, setDismissedDevisNotifIds] = useState<Set<string>>(new Set());
+
+  const activeDevisAppelerNotifications = useMemo(() => {
+    if (role !== "reception" && role !== "administration" && role !== "chef_atelier") {
+      return [];
+    }
+    return vehicles
+      .map((v) => {
+        const d =
+          demandesDevisMap[String(v.id)] ||
+          (v.no && demandesDevisMap[v.no.trim()]) ||
+          (v.chassis && demandesDevisMap[v.chassis.trim()]);
+        return { vehicle: v, devis: d };
+      })
+      .filter(({ vehicle, devis }) => {
+        const notifId = `appeler-${vehicle.id}`;
+        if (dismissedDevisNotifIds.has(notifId)) return false;
+        if (!devis) return false;
+        if (devis.statutDevis === "Accepté" || devis.statutDevis === "Refusé") return false;
+        const av = (vehicle.avancement || "").toLowerCase();
+        const isEnDevis = av.includes("devis") || (vehicle.etatIntervention || "").toLowerCase().includes("devis");
+        return isEnDevis && (!devis.statutDevis || devis.statutDevis === "En attente accord");
+      });
+  }, [vehicles, demandesDevisMap, role, dismissedDevisNotifIds]);
+
+  const activeDevisRelanceNotifications = useMemo(() => {
+    if (role !== "reception" && role !== "administration" && role !== "chef_atelier") {
+      return [];
+    }
+    return vehicles
+      .map((v) => {
+        const d =
+          demandesDevisMap[String(v.id)] ||
+          (v.no && demandesDevisMap[v.no.trim()]) ||
+          (v.chassis && demandesDevisMap[v.chassis.trim()]);
+        return { vehicle: v, devis: d };
+      })
+      .filter(({ vehicle, devis }) => {
+        const notifId = `relance-${vehicle.id}`;
+        if (dismissedDevisNotifIds.has(notifId)) return false;
+        if (!devis) return false;
+        if (devis.statutDevis === "Accepté" || devis.statutDevis === "Refusé") return false;
+        const av = (vehicle.avancement || "").toLowerCase();
+        const isEnDevis = av.includes("devis") || (vehicle.etatIntervention || "").toLowerCase().includes("devis");
+        return isEnDevis && isDevisDepassee24h(devis);
+      });
+  }, [vehicles, demandesDevisMap, role, dismissedDevisNotifIds]);
+
+  const handleAppelerClientFromNotif = useCallback((item: { vehicle: Flux; devis: DemandeDevis }) => {
+    const key = (item.vehicle.no || item.vehicle.ordre || item.vehicle.chassis || String(item.vehicle.id)).trim();
+    const updated = marquerDevisAppele(key, currentUser?.name || "Réception", undefined, item.vehicle);
+    if (updated) {
+      void updateGoogleSheetStatutDevis(item.vehicle, updated, "Client appelé");
+    }
+    const dateHeureAppel = updated?.dateAppel || "";
+    setWriteNotice(`📞 Client appelé le ${dateHeureAppel} pour le devis N° DV ${item.devis.numeroDevis} (${item.vehicle.no || item.vehicle.ordre}).`);
+  }, [currentUser?.name]);
+
+  const handleAccepterDevisFromNotif = useCallback(async (item: { vehicle: Flux; devis: DemandeDevis }) => {
+    const key = (item.vehicle.no || item.vehicle.ordre || item.vehicle.chassis || String(item.vehicle.id)).trim();
+    const updated = marquerDevisAccepte(key);
+    if (updated) {
+      void updateGoogleSheetStatutDevis(item.vehicle, updated, "Accepté");
+    }
+    const targetEquipe = item.devis.equipeOrigine || item.devis.equipe || item.vehicle.equipe || "Daily1";
+    const targetTech =
+      item.vehicle.technicien && item.vehicle.technicien !== "-"
+        ? item.vehicle.technicien
+        : item.devis.technicien && item.devis.technicien !== "-"
+        ? item.devis.technicien
+        : "";
+    const targetNomTech =
+      item.vehicle.nomTechnicien && item.vehicle.nomTechnicien !== "-"
+        ? item.vehicle.nomTechnicien
+        : item.devis.nomTechnicien && item.devis.nomTechnicien !== "-"
+        ? item.devis.nomTechnicien
+        : "";
+
+    const now = new Date();
+    const dd = String(now.getDate()).padStart(2, "0");
+    const mm = String(now.getMonth() + 1).padStart(2, "0");
+    const yyyy = now.getFullYear();
+    const hh = String(now.getHours()).padStart(2, "0");
+    const min = String(now.getMinutes()).padStart(2, "0");
+    const dateAccord = `${dd}/${mm}/${yyyy} ${hh}:${min}`;
+
+    saveDevisAccordNotification({
+      id: `devis-accord-${item.vehicle.id || item.vehicle.no || item.vehicle.chassis}`,
+      vehicleId: item.vehicle.id,
+      or: item.vehicle.no || item.vehicle.ordre || "-",
+      chassis: item.vehicle.chassis || "-",
+      client: item.vehicle.client || item.devis.client || "Client",
+      marque: item.vehicle.marque || "IVECO",
+      modele: item.vehicle.modele || item.devis.modele || "-",
+      immatriculation: item.vehicle.serie || item.vehicle.immatriculation || "-",
+      equipeCible: targetEquipe,
+      numeroDevis: item.devis.numeroDevis || "-",
+      dateAccord,
+      timestamp: `${hh}:${min}`,
+      timestampMs: Date.now(),
+      technicien: targetTech,
+      nomTechnicien: targetNomTech,
+    });
+
+    await saveVehicleAvancement(
+      item.vehicle,
+      "Attente réparation",
+      undefined,
+      {
+        equipe: targetEquipe,
+        etat: "Attente Réparation",
+        technicien: targetTech,
+        nomTechnicien: targetNomTech,
+      },
+      updated || item.devis
+    );
+    const techDisplay = targetNomTech
+      ? `👨‍🔧 Technicien : ${targetNomTech}${targetTech ? ` (${targetTech})` : ""}`
+      : targetTech
+      ? `👨‍🔧 Tech : ${targetTech}`
+      : "";
+    setWriteNotice(`✅ Devis N° DV ${item.devis.numeroDevis} accepté ! Véhicule retourné à l'équipe ${targetEquipe} ${techDisplay ? `[${techDisplay}] ` : ""}dans "Tableaux de chargement (Attente Réparation)" (notification transmise au Chef d'Équipe).`);
+  }, [saveVehicleAvancement]);
+
+  const handleRefuserDevisFromNotif = useCallback(async (item: { vehicle: Flux; devis: DemandeDevis }) => {
+    const key = (item.vehicle.no || item.vehicle.ordre || item.vehicle.chassis || String(item.vehicle.id)).trim();
+    const updated = marquerDevisRefuse(key);
+    if (updated) {
+      void updateGoogleSheetStatutDevis(item.vehicle, updated, "Refusé");
+    }
+    await saveVehicleAvancement(
+      item.vehicle,
+      "Terminer",
+      undefined,
+      { etatIntervention: "Attente Client" },
+      updated || item.devis
+    );
+    setWriteNotice(`❌ Devis N° DV ${item.devis.numeroDevis} refusé par le client : Véhicule passé automatiquement en "Terminer" (Attente Client).`);
+  }, [saveVehicleAvancement]);
+
+  const handleRelancerClientFromNotif = useCallback((item: { vehicle: Flux; devis: DemandeDevis }) => {
+    const key = (item.vehicle.no || item.vehicle.ordre || item.vehicle.chassis || String(item.vehicle.id)).trim();
+    const updated = marquerDevisRelance(key, currentUser?.name || "Réception");
+    if (updated) {
+      void updateGoogleSheetStatutDevis(item.vehicle, updated, "Client appelé");
+    }
+    setWriteNotice(`⚠️ Relance client effectuée pour le devis N° DV ${item.devis.numeroDevis} (${item.vehicle.no || item.vehicle.ordre}).`);
+  }, [currentUser?.name]);
+
+  const handleDismissDevisNotif = useCallback((notifId: string) => {
+    setDismissedDevisNotifIds((prev) => new Set([...prev, notifId]));
+  }, []);
+
+  const activeDevisAccordNotificationsForUser = useMemo(() => {
+    return devisAccordNotifications.filter((notif) => {
+      if (role === "chef_equipe") {
+        if (!activeChefEquipeTeam) return false;
+        return isVehicleMatchingTeam(notif.equipeCible, activeChefEquipeTeam);
+      }
+      return role === "chef_atelier" || role === "administration";
+    });
+  }, [devisAccordNotifications, role, activeChefEquipeTeam]);
+
+  const handlePrendreEnChargeDevisAccord = useCallback(
+    (notif: DevisAccordNotification, vehicle: Flux) => {
+      removeDevisAccordNotification(notif.id);
+      setPendingEnCoursVehicle(vehicle);
+      setIsTechModalOpen(true);
+    },
+    []
+  );
+
+  const handleVoirDansChargement = useCallback(
+    (notif: DevisAccordNotification, vehicle?: Flux) => {
+      removeDevisAccordNotification(notif.id);
+      setActiveTab("chargement");
+      setActiveFilter("Attente Réparation");
+      if (vehicle) {
+        setSelectedVehicleId(vehicle.id);
+      }
+    },
+    []
+  );
+
+  const handleDismissDevisAccord = useCallback((notifId: string) => {
+    removeDevisAccordNotification(notifId);
+  }, []);
+
+
   const filteredRows = useMemo(() => {
     const query = search.trim().toLowerCase();
 
@@ -1532,7 +2122,9 @@ export default function Dashboard() {
       .filter((row) => {
         // 1. Si on est sur l'onglet 'en_cours' : uniquement les véhicules 'En cours'
         if (activeTab === "en_cours") {
-          if (!isEnCours(row.etatIntervention, row.avancement, row.technicien)) {
+          const r = getReaffectationForVehicle(row);
+          const isReaffActive = Boolean(r && !r.isRepris);
+          if (!isEnCours(row.etatIntervention, row.avancement, row.technicien, isReaffActive)) {
             return false;
           }
           // Si rôle 'chef_equipe' : trouver seulement les véhicules de son équipe
@@ -1553,6 +2145,11 @@ export default function Dashboard() {
 
         // 2. Si on est sur 'chargement' ET rôle 'chef_equipe' : uniquement 'Attente Réparation' de son équipe
         if (activeTab === "chargement" && role === "chef_equipe") {
+          const r = getReaffectationForVehicle(row);
+          const isReaffActive = Boolean(r && !r.isRepris);
+          if (isReaffActive) {
+            return false;
+          }
           if (!isAttenteReparation(row.etatIntervention)) {
             return false;
           }
@@ -1620,14 +2217,14 @@ export default function Dashboard() {
           typeof a.sheetRowNumber === "number" && a.sheetRowNumber > 0
             ? a.sheetRowNumber
             : typeof a.id === "number"
-            ? a.id
-            : Infinity;
+              ? a.id
+              : Infinity;
         const rowB =
           typeof b.sheetRowNumber === "number" && b.sheetRowNumber > 0
             ? b.sheetRowNumber
             : typeof b.id === "number"
-            ? b.id
-            : Infinity;
+              ? b.id
+              : Infinity;
 
         if (rowA !== rowB) {
           return rowA - rowB;
@@ -1674,8 +2271,8 @@ export default function Dashboard() {
 
   const selectedVehicle = selectedZone
     ? vehicles.find((row) => row.id === selectedVehicleId) ??
-      rowsByZone.get(selectedZone)?.[0] ??
-      null
+    rowsByZone.get(selectedZone)?.[0] ??
+    null
     : null;
 
   const selectedRows = selectedZone
@@ -1998,9 +2595,8 @@ export default function Dashboard() {
               {activeTab === "chargement" && role !== "chef_equipe" && (
                 <button
                   aria-pressed={showStatusDashboard}
-                  className={`monitor-button ${
-                    showStatusDashboard ? "monitor-button-active" : ""
-                  }`}
+                  className={`monitor-button ${showStatusDashboard ? "monitor-button-active" : ""
+                    }`}
                   onClick={() =>
                     setShowStatusDashboard((current) => !current)
                   }
@@ -2012,11 +2608,10 @@ export default function Dashboard() {
               )}
 
               <button
-                className={`monitor-button monitor-button-accent ${
-                  (role === "administration" || role === "chef_atelier") && activeTab === "chargement"
+                className={`monitor-button monitor-button-accent ${(role === "administration" || role === "chef_atelier") && activeTab === "chargement"
                     ? "!bg-amber-600 hover:!bg-amber-700 !text-white !font-bold shadow-xs"
                     : ""
-                }`}
+                  }`}
                 disabled={sheetStatus === "loading" || isInstantSyncing}
                 onClick={() => {
                   if ((role === "administration" || role === "chef_atelier") && activeTab === "chargement") {
@@ -2082,11 +2677,10 @@ export default function Dashboard() {
       <div className="dashboard-layout">
         {/* Collapsible Sidebar */}
         <aside
-          className={`dashboard-sidebar ${
-            isSidebarOpen
+          className={`dashboard-sidebar ${isSidebarOpen
               ? "w-64 min-w-[16rem]"
               : "w-0 min-w-0 opacity-0 overflow-hidden border-r-0 pointer-events-none"
-          }`}
+            }`}
           aria-label="Navigation latérale"
         >
           {/* Sidebar Header */}
@@ -2116,6 +2710,36 @@ export default function Dashboard() {
             }}
             className="flex-1 px-3 py-3 space-y-1.5 overflow-y-auto"
           >
+            {/* ══════════════════════════════════════════════════════ */}
+            {/* Suivi des Entrées & Avancement Atelier — EN TÊTE DE MENU */}
+            {/* ══════════════════════════════════════════════════════ */}
+            {(permissions.canViewAll || role === "reception" || role === "chef_atelier" || role === "administration") && (
+              <button
+                type="button"
+                onClick={() => setActiveTab("suivi_entrees")}
+                className={`w-full flex items-center justify-between px-3.5 py-2.5 rounded-xl text-xs font-bold transition-all cursor-pointer text-left ${activeTab === "suivi_entrees"
+                    ? "bg-emerald-600 text-white shadow-sm"
+                    : "text-slate-600 hover:text-emerald-700 hover:bg-slate-100/90"
+                  }`}
+              >
+                <div className="flex items-center gap-2.5">
+                  <ClipboardList size={16} className={activeTab === "suivi_entrees" ? "text-white" : "text-emerald-600"} />
+                  <div>
+                    <div className="leading-tight">Suivi des Entrées</div>
+                    <div className={`text-[10px] font-medium ${activeTab === "suivi_entrees" ? "text-emerald-100" : "text-slate-400"}`}>
+                      Avancement Atelier
+                    </div>
+                  </div>
+                </div>
+                <span className={`px-2 py-0.5 rounded-full text-[10px] font-bold shrink-0 ${activeTab === "suivi_entrees"
+                    ? "bg-white/25 text-white"
+                    : "bg-emerald-50 text-emerald-700 border border-emerald-200"
+                  }`}>
+                  Réception
+                </span>
+              </button>
+            )}
+
             {(permissions.canViewAll || role === "reception" || role === "chef_equipe" || role === "chef_atelier" || role === "administration") && (
               <button
                 type="button"
@@ -2129,11 +2753,10 @@ export default function Dashboard() {
                     void loadVehicles(true);
                   }
                 }}
-                className={`w-full flex items-center justify-between px-3.5 py-2.5 rounded-xl text-xs font-bold transition-all cursor-pointer text-left ${
-                  activeTab === "chargement"
+                className={`w-full flex items-center justify-between px-3.5 py-2.5 rounded-xl text-xs font-bold transition-all cursor-pointer text-left ${activeTab === "chargement"
                     ? "bg-amber-500 text-white shadow-sm"
                     : "text-slate-600 hover:text-slate-900 hover:bg-slate-100/90"
-                }`}
+                  }`}
               >
                 <div className="flex items-center gap-2.5">
                   <Clock size={16} className={activeTab === "chargement" ? "text-white" : "text-amber-600"} />
@@ -2146,11 +2769,10 @@ export default function Dashboard() {
                     )}
                   </div>
                 </div>
-                <span className={`px-2 py-0.5 rounded-full text-[10px] font-bold shrink-0 ${
-                  activeTab === "chargement"
+                <span className={`px-2 py-0.5 rounded-full text-[10px] font-bold shrink-0 ${activeTab === "chargement"
                     ? "bg-white/25 text-white"
                     : "bg-slate-100 text-slate-600 border border-slate-200"
-                }`}>
+                  }`}>
                   {role === "chef_equipe" ? attenteReparationCount : vehicles.length}
                 </span>
               </button>
@@ -2163,11 +2785,10 @@ export default function Dashboard() {
                   setActiveTab("en_cours");
                   setActiveFilter("En cours");
                 }}
-                className={`w-full flex items-center justify-between px-3.5 py-2.5 rounded-xl text-xs font-bold transition-all cursor-pointer text-left ${
-                  activeTab === "en_cours"
+                className={`w-full flex items-center justify-between px-3.5 py-2.5 rounded-xl text-xs font-bold transition-all cursor-pointer text-left ${activeTab === "en_cours"
                     ? "bg-blue-600 text-white shadow-sm"
                     : "text-slate-600 hover:text-slate-900 hover:bg-slate-100/90"
-                }`}
+                  }`}
               >
                 <div className="flex items-center gap-2.5">
                   <Wrench size={16} className={activeTab === "en_cours" ? "text-white" : "text-blue-600"} />
@@ -2178,25 +2799,23 @@ export default function Dashboard() {
                     </div>
                   </div>
                 </div>
-                <span className={`px-2 py-0.5 rounded-full text-[10px] font-bold shrink-0 ${
-                  activeTab === "en_cours"
+                <span className={`px-2 py-0.5 rounded-full text-[10px] font-bold shrink-0 ${activeTab === "en_cours"
                     ? "bg-white/25 text-white"
                     : "bg-blue-50 text-blue-700 border border-blue-200"
-                }`}>
+                  }`}>
                   {enCoursCount}
                 </span>
               </button>
             )}
 
-            {(permissions.canViewAll || role === "chef_equipe" || role === "chef_atelier" || role === "administration") && (
+            {permissions.canViewEssai && (
               <button
                 type="button"
                 onClick={() => setActiveTab("essai")}
-                className={`w-full flex items-center justify-between px-3.5 py-2.5 rounded-xl text-xs font-bold transition-all cursor-pointer text-left ${
-                  activeTab === "essai"
+                className={`w-full flex items-center justify-between px-3.5 py-2.5 rounded-xl text-xs font-bold transition-all cursor-pointer text-left ${activeTab === "essai"
                     ? "bg-indigo-600 text-white shadow-sm"
                     : "text-slate-600 hover:text-slate-900 hover:bg-slate-100/90"
-                }`}
+                  }`}
               >
                 <div className="flex items-center gap-2.5">
                   <Gauge size={16} className={activeTab === "essai" ? "text-white" : "text-indigo-600"} />
@@ -2207,25 +2826,23 @@ export default function Dashboard() {
                     </div>
                   </div>
                 </div>
-                <span className={`px-2 py-0.5 rounded-full text-[10px] font-bold shrink-0 ${
-                  activeTab === "essai"
+                <span className={`px-2 py-0.5 rounded-full text-[10px] font-bold shrink-0 ${activeTab === "essai"
                     ? "bg-white/25 text-white"
                     : "bg-indigo-50 text-indigo-700 border border-indigo-200"
-                }`}>
+                  }`}>
                   {essaiCount}
                 </span>
               </button>
             )}
 
-            {(permissions.canViewAll || role === "chef_equipe" || role === "chef_atelier" || role === "administration") && (
+            {permissions.canViewAttenteAchat && (
               <button
                 type="button"
                 onClick={() => setActiveTab("attente_achat")}
-                className={`w-full flex items-center justify-between px-3.5 py-2.5 rounded-xl text-xs font-bold transition-all cursor-pointer text-left ${
-                  activeTab === "attente_achat"
+                className={`w-full flex items-center justify-between px-3.5 py-2.5 rounded-xl text-xs font-bold transition-all cursor-pointer text-left ${activeTab === "attente_achat"
                     ? "bg-amber-600 text-white shadow-sm"
                     : "text-slate-600 hover:text-slate-900 hover:bg-slate-100/90"
-                }`}
+                  }`}
               >
                 <div className="flex items-center gap-2.5">
                   <ShoppingCart size={16} className={activeTab === "attente_achat" ? "text-white" : "text-amber-600"} />
@@ -2236,25 +2853,23 @@ export default function Dashboard() {
                     </div>
                   </div>
                 </div>
-                <span className={`px-2 py-0.5 rounded-full text-[10px] font-bold shrink-0 ${
-                  activeTab === "attente_achat"
+                <span className={`px-2 py-0.5 rounded-full text-[10px] font-bold shrink-0 ${activeTab === "attente_achat"
                     ? "bg-white/25 text-white"
                     : "bg-amber-50 text-amber-700 border border-amber-200"
-                }`}>
+                  }`}>
                   {attenteAchatCount}
                 </span>
               </button>
             )}
 
-            {(permissions.canViewAll || role === "chef_equipe" || role === "chef_atelier" || role === "administration") && (
+            {permissions.canViewDevis && (
               <button
                 type="button"
                 onClick={() => setActiveTab("devis")}
-                className={`w-full flex items-center justify-between px-3.5 py-2.5 rounded-xl text-xs font-bold transition-all cursor-pointer text-left ${
-                  activeTab === "devis"
+                className={`w-full flex items-center justify-between px-3.5 py-2.5 rounded-xl text-xs font-bold transition-all cursor-pointer text-left ${activeTab === "devis"
                     ? "bg-orange-600 text-white shadow-sm"
                     : "text-slate-600 hover:text-slate-900 hover:bg-slate-100/90"
-                }`}
+                  }`}
               >
                 <div className="flex items-center gap-2.5">
                   <FileSignature size={16} className={activeTab === "devis" ? "text-white" : "text-orange-600"} />
@@ -2265,13 +2880,22 @@ export default function Dashboard() {
                     </div>
                   </div>
                 </div>
-                <span className={`px-2 py-0.5 rounded-full text-[10px] font-bold shrink-0 ${
-                  activeTab === "devis"
-                    ? "bg-white/25 text-white"
-                    : "bg-orange-50 text-orange-700 border border-orange-200"
-                }`}>
-                  {devisCount}
-                </span>
+                <div className="flex items-center gap-1">
+                  {(devisAAppelerCount > 0 || devisRelanceCount > 0) && (
+                    <span
+                      className="px-1.5 py-0.5 rounded-full text-[9px] font-black bg-rose-500 text-white animate-pulse"
+                      title={`${devisAAppelerCount} à appeler, ${devisRelanceCount} relance(s)`}
+                    >
+                      {devisAAppelerCount + devisRelanceCount} !
+                    </span>
+                  )}
+                  <span className={`px-2 py-0.5 rounded-full text-[10px] font-bold shrink-0 ${activeTab === "devis"
+                      ? "bg-white/25 text-white"
+                      : "bg-orange-50 text-orange-700 border border-orange-200"
+                    }`}>
+                    {devisCount}
+                  </span>
+                </div>
               </button>
             )}
 
@@ -2279,11 +2903,10 @@ export default function Dashboard() {
               <button
                 type="button"
                 onClick={() => setActiveTab("plan_atelier")}
-                className={`w-full flex items-center justify-between px-3.5 py-2.5 rounded-xl text-xs font-bold transition-all cursor-pointer text-left ${
-                  activeTab === "plan_atelier"
+                className={`w-full flex items-center justify-between px-3.5 py-2.5 rounded-xl text-xs font-bold transition-all cursor-pointer text-left ${activeTab === "plan_atelier"
                     ? "bg-amber-600 text-white shadow-sm"
                     : "text-slate-600 hover:text-amber-700 hover:bg-slate-100/90"
-                }`}
+                  }`}
               >
                 <div className="flex items-center gap-2.5">
                   <MapPin size={16} className={activeTab === "plan_atelier" ? "text-white" : "text-amber-600"} />
@@ -2294,41 +2917,39 @@ export default function Dashboard() {
                     </div>
                   </div>
                 </div>
-                <span className={`px-2 py-0.5 rounded-full text-[10px] font-bold shrink-0 ${
-                  activeTab === "plan_atelier"
+                <span className={`px-2 py-0.5 rounded-full text-[10px] font-bold shrink-0 ${activeTab === "plan_atelier"
                     ? "bg-white/25 text-white"
                     : "bg-amber-100 text-amber-800 border border-amber-200"
-                }`}>
+                  }`}>
                   Synoptique
                 </span>
               </button>
             )}
 
-            {(permissions.canViewAll || role === "reception" || role === "chef_atelier" || role === "administration") && (
+
+            {permissions.canViewSuiviTemps && (
               <button
                 type="button"
-                onClick={() => setActiveTab("suivi_entrees")}
-                className={`w-full flex items-center justify-between px-3.5 py-2.5 rounded-xl text-xs font-bold transition-all cursor-pointer text-left ${
-                  activeTab === "suivi_entrees"
-                    ? "bg-emerald-600 text-white shadow-sm"
-                    : "text-slate-600 hover:text-emerald-700 hover:bg-slate-100/90"
-                }`}
+                onClick={() => setActiveTab("suivi_temps")}
+                className={`w-full flex items-center justify-between px-3.5 py-2.5 rounded-xl text-xs font-bold transition-all cursor-pointer text-left ${activeTab === "suivi_temps"
+                    ? "bg-indigo-600 text-white shadow-sm"
+                    : "text-slate-600 hover:text-indigo-700 hover:bg-slate-100/90"
+                  }`}
               >
                 <div className="flex items-center gap-2.5">
-                  <ClipboardList size={16} className={activeTab === "suivi_entrees" ? "text-white" : "text-emerald-600"} />
+                  <Timer size={16} className={activeTab === "suivi_temps" ? "text-white" : "text-indigo-600"} />
                   <div>
-                    <div className="leading-tight">Suivi des entrées</div>
-                    <div className={`text-[10px] font-medium ${activeTab === "suivi_entrees" ? "text-emerald-100" : "text-slate-400"}`}>
-                      Réception & flux
+                    <div className="leading-tight">Calcul des Temps</div>
+                    <div className={`text-[10px] font-medium ${activeTab === "suivi_temps" ? "text-indigo-100" : "text-slate-400"}`}>
+                      Attentes & Travail net
                     </div>
                   </div>
                 </div>
-                <span className={`px-2 py-0.5 rounded-full text-[10px] font-bold shrink-0 ${
-                  activeTab === "suivi_entrees"
+                <span className={`px-2 py-0.5 rounded-full text-[10px] font-bold shrink-0 ${activeTab === "suivi_temps"
                     ? "bg-white/25 text-white"
-                    : "bg-emerald-50 text-emerald-700 border border-emerald-200"
-                }`}>
-                  Réception
+                    : "bg-indigo-50 text-indigo-700 border border-indigo-200"
+                  }`}>
+                  Chrono
                 </span>
               </button>
             )}
@@ -2337,11 +2958,10 @@ export default function Dashboard() {
               <button
                 type="button"
                 onClick={() => setActiveTab("gestion_acces")}
-                className={`w-full flex items-center justify-between px-3.5 py-2.5 rounded-xl text-xs font-bold transition-all cursor-pointer text-left ${
-                  activeTab === "gestion_acces"
+                className={`w-full flex items-center justify-between px-3.5 py-2.5 rounded-xl text-xs font-bold transition-all cursor-pointer text-left ${activeTab === "gestion_acces"
                     ? "bg-purple-600 text-white shadow-sm"
                     : "text-slate-600 hover:text-purple-700 hover:bg-slate-100/90"
-                }`}
+                  }`}
               >
                 <div className="flex items-center gap-2.5">
                   <Shield size={16} className={activeTab === "gestion_acces" ? "text-white" : "text-purple-600"} />
@@ -2352,11 +2972,10 @@ export default function Dashboard() {
                     </div>
                   </div>
                 </div>
-                <span className={`px-2 py-0.5 rounded-full text-[10px] font-bold shrink-0 ${
-                  activeTab === "gestion_acces"
+                <span className={`px-2 py-0.5 rounded-full text-[10px] font-bold shrink-0 ${activeTab === "gestion_acces"
                     ? "bg-white/25 text-white"
                     : "bg-purple-50 text-purple-700 border border-purple-200"
-                }`}>
+                  }`}>
                   Admin
                 </span>
               </button>
@@ -2366,11 +2985,10 @@ export default function Dashboard() {
               <button
                 type="button"
                 onClick={() => setActiveTab("gestion_equipes")}
-                className={`w-full flex items-center justify-between px-3.5 py-2.5 rounded-xl text-xs font-bold transition-all cursor-pointer text-left ${
-                  activeTab === "gestion_equipes"
+                className={`w-full flex items-center justify-between px-3.5 py-2.5 rounded-xl text-xs font-bold transition-all cursor-pointer text-left ${activeTab === "gestion_equipes"
                     ? "bg-rose-600 text-white shadow-sm"
                     : "text-slate-600 hover:text-rose-700 hover:bg-slate-100/90"
-                }`}
+                  }`}
               >
                 <div className="flex items-center gap-2.5">
                   <Users size={16} className={activeTab === "gestion_equipes" ? "text-white" : "text-rose-600"} />
@@ -2381,11 +2999,10 @@ export default function Dashboard() {
                     </div>
                   </div>
                 </div>
-                <span className={`px-2 py-0.5 rounded-full text-[10px] font-bold shrink-0 ${
-                  activeTab === "gestion_equipes"
+                <span className={`px-2 py-0.5 rounded-full text-[10px] font-bold shrink-0 ${activeTab === "gestion_equipes"
                     ? "bg-white/25 text-white"
                     : "bg-rose-50 text-rose-700 border border-rose-200"
-                }`}>
+                  }`}>
                   Admin
                 </span>
               </button>
@@ -2395,11 +3012,10 @@ export default function Dashboard() {
               <button
                 type="button"
                 onClick={() => setActiveTab("moyennes")}
-                className={`w-full flex items-center justify-between px-3.5 py-2.5 rounded-xl text-xs font-bold transition-all cursor-pointer text-left ${
-                  activeTab === "moyennes"
+                className={`w-full flex items-center justify-between px-3.5 py-2.5 rounded-xl text-xs font-bold transition-all cursor-pointer text-left ${activeTab === "moyennes"
                     ? "bg-teal-600 text-white shadow-sm"
                     : "text-slate-600 hover:text-teal-700 hover:bg-slate-100/90"
-                }`}
+                  }`}
               >
                 <div className="flex items-center gap-2.5">
                   <BarChart3 size={16} className={activeTab === "moyennes" ? "text-white" : "text-teal-600"} />
@@ -2410,11 +3026,10 @@ export default function Dashboard() {
                     </div>
                   </div>
                 </div>
-                <span className={`px-2 py-0.5 rounded-full text-[10px] font-bold shrink-0 ${
-                  activeTab === "moyennes"
+                <span className={`px-2 py-0.5 rounded-full text-[10px] font-bold shrink-0 ${activeTab === "moyennes"
                     ? "bg-white/25 text-white"
                     : "bg-teal-50 text-teal-700 border border-teal-200"
-                }`}>
+                  }`}>
                   KPI
                 </span>
               </button>
@@ -2442,1246 +3057,1677 @@ export default function Dashboard() {
 
         {/* Main Content Area */}
         <div className="dashboard-content-area">
-
-      {activeTab === "suivi_entrees" ? (
-        <SuiviEntreesTable />
-      ) : activeTab === "gestion_acces" ? (
-        <GestionAccesView />
-      ) : activeTab === "gestion_equipes" ? (
-        <GestionEquipesView />
-      ) : activeTab === "moyennes" ? (
-        <MoyennesView />
-      ) : activeTab === "essai" ? (
-        <EssaiView
-          vehicles={vehicles}
-          onUpdateAvancement={saveVehicleAvancement}
-          onValidateEssai={handleValidateEssai}
-          onSelectVehicle={(v) => {
-            setSelectedVehicleId(v.id);
-            setVehiculeModalData(v);
-          }}
-          savingVehicleId={savingVehicleId}
-          canEdit={permissions.canEditEtat}
-          userTeam={role === "chef_equipe" ? activeChefEquipeTeam : undefined}
-          isChefEquipe={role === "chef_equipe"}
-          onRefresh={() => void loadVehicles()}
-          isRefreshing={sheetStatus === "loading" || isInstantSyncing}
-        />
-      ) : activeTab === "attente_achat" ? (
-        <AcheterView
-          vehicles={vehicles}
-          onUpdateAvancement={saveVehicleAvancement}
-          onSelectVehicle={(v) => {
-            setSelectedVehicleId(v.id);
-            setVehiculeModalData(v);
-          }}
-          savingVehicleId={savingVehicleId}
-          canEdit={permissions.canEditEtat}
-          userTeam={role === "chef_equipe" ? activeChefEquipeTeam : undefined}
-          isChefEquipe={role === "chef_equipe"}
-          onMarquerLivrer={handleMarquerAchatLivrer}
-          onMarquerAttente={handleMarquerAchatAttente}
-          onRefresh={() => void loadVehicles()}
-          isRefreshing={sheetStatus === "loading" || isInstantSyncing}
-        />
-      ) : activeTab === "devis" ? (
-        <DevisView
-          vehicles={vehicles}
-          onUpdateAvancement={saveVehicleAvancement}
-          onSelectVehicle={(v) => {
-            setSelectedVehicleId(v.id);
-            setVehiculeModalData(v);
-          }}
-          savingVehicleId={savingVehicleId}
-          canEdit={permissions.canEditEtat}
-          userTeam={role === "chef_equipe" ? activeChefEquipeTeam : undefined}
-          isChefEquipe={role === "chef_equipe"}
-          onRefresh={() => void loadVehicles()}
-          isRefreshing={sheetStatus === "loading" || isInstantSyncing}
-        />
-      ) : activeTab === "plan_atelier" ? (
-        <main className="plan-stage" ref={planStageRef}>
-          <section className="map-panel" aria-label="Plan d'Atelier Mécanique">
-            <div className="map-toolbar">
-              <div className="map-toolbar-brand">
-                <p className="panel-kicker">Synoptique Atelier Mécanique</p>
-                <h2>Plan d'Atelier Haute Précision</h2>
-              </div>
-
-              <div className="map-toolbar-divider" />
-
-              {/* Statuts Horizontaux */}
-              <div className="map-statuses-bar">
-                {statusMeta.map((status) => {
-                  const isActive = activeFilter === status.label;
-                  return (
-                    <button
-                      key={status.label}
-                      type="button"
-                      onClick={() =>
-                        setActiveFilter((current) =>
-                          current === status.label ? "Tous" : status.label
-                        )
-                      }
-                      className={`map-status-btn ${isActive ? "status-btn-active" : ""}`}
-                      title={`Filtrer par : ${formatStatusLabel(status.label)}`}
-                    >
-                      <span
-                        className="status-dot"
-                        style={{ backgroundColor: status.color }}
-                      />
-                      <span>{formatStatusLabel(status.label)}</span>
-                    </button>
-                  );
-                })}
-
-                <button
-                  type="button"
-                  onClick={resetFilters}
-                  className={`map-status-btn ${activeFilter === "Tous" && !selectedZone ? "status-btn-active" : ""}`}
-                  title="Tous les emplacements / Libre"
-                >
-                  <span className="status-dot" style={{ backgroundColor: "#94a3b8" }} />
-                  <span>Libre</span>
-                </button>
-              </div>
-
-              {(activeFilter !== "Tous" || selectedZone) && (
-                <div className="map-chips">
-                  {activeFilter !== "Tous" && (
-                    <button
-                      className="map-chip"
-                      onClick={() => setActiveFilter("Tous")}
-                      type="button"
-                      title="Effacer le filtre"
-                    >
-                      {formatStatusFilter(activeFilter)}
-                      <span aria-hidden="true">×</span>
-                    </button>
-                  )}
-
-                  {selectedZone && (
-                    <button
-                      className="map-chip"
-                      onClick={() => {
-                        setSelectedZone(null);
-                        setSelectedVehicleId(null);
-                        setIsDetailPinned(false);
-                      }}
-                      type="button"
-                      title="Désélectionner le poste"
-                    >
-                      {selectedZone}
-                      <span aria-hidden="true">×</span>
-                    </button>
-                  )}
-                </div>
-              )}
-            </div>
-
-            {/* Plein écran à droite */}
-            <div className="map-controls">
-              <button
-                className="map-ctrl-btn"
-                onClick={() => void toggleFullscreen()}
-                title={isFullscreen ? "Quitter le plein écran" : "Afficher en plein écran"}
-                type="button"
-              >
-                {isFullscreen ? <Minimize2 size={14} /> : <Maximize2 size={14} />}
-                <span className="hidden sm:inline">{isFullscreen ? "Quitter" : "Plein écran"}</span>
-              </button>
-            </div>
-
-            <div
-              className="atelier-map"
-              dangerouslySetInnerHTML={{ __html: atelierMapDisplaySvg }}
-              onClick={handleMapClick}
-              onMouseLeave={hideVehicleDetails}
-              onMouseMove={handleMapHover}
-              ref={mapRef}
-            />
-          </section>
-
-          <aside
-            className={`panel detail-panel ${
-              selectedVehicle ? "detail-open" : ""
-            } ${isDetailPinned ? "detail-pinned" : ""}`}
-            aria-label="Fiche synoptique du véhicule"
-          >
-            {selectedVehicle && (
-              <>
-                <div className="panel-head">
-                  <div>
-                    <p className="panel-kicker">Détail Poste</p>
-                    <h2>Emplacement {selectedZone}</h2>
-                  </div>
-
-                  <div className="flex items-center gap-2">
-                    <span
-                      className="detail-badge"
-                      style={badgeStyle(selectedVehicle.etatIntervention)}
-                    >
-                      {formatStatusLabel(selectedVehicle.etatIntervention)}
-                    </span>
-                    <button
-                      type="button"
-                      onClick={() => {
-                        setSelectedZone(null);
-                        setSelectedVehicleId(null);
-                        setIsDetailPinned(false);
-                      }}
-                      className="p-1 rounded-lg text-slate-400 hover:text-slate-700 hover:bg-slate-100 transition-colors cursor-pointer"
-                      title="Fermer la fiche"
-                    >
-                      <X size={16} />
-                    </button>
-                  </div>
-                </div>
-
-                <div className="serie-card">
-                  <Car size={18} />
-                  <span>{selectedVehicle.serie}</span>
-                </div>
-
-                <button
-                  type="button"
-                  onClick={() => setVehiculeModalData(selectedVehicle)}
-                  className="w-full my-2.5 py-2 px-3 bg-gradient-to-r from-blue-600 to-indigo-600 hover:from-blue-700 hover:to-indigo-700 text-white rounded-xl text-xs font-bold flex items-center justify-center gap-2 shadow-xs transition-all cursor-pointer"
-                  title="Consulter les détails techniques et la condition complète du véhicule"
-                >
-                  <Eye size={14} />
-                  <span>Voir détails & condition</span>
-                </button>
-
-                <div className="detail-grid">
-                  <div>
-                    <span>OR</span>
-                    <strong>
-                      {displayText(selectedVehicle.l2n2500 || selectedVehicle.no)}
-                    </strong>
-                  </div>
-                  <div>
-                    <span>CS</span>
-                    <strong>{displayText(selectedVehicle.cs)}</strong>
-                  </div>
-                  <div>
-                    <span>Client</span>
-                    <strong>{displayText(selectedVehicle.client)}</strong>
-                  </div>
-                  <div>
-                    <span>Date entrée</span>
-                    <strong>{displayText(selectedVehicle.dateEntree)}</strong>
-                  </div>
-                  <div>
-                    <span>Heure entrée</span>
-                    <strong>{displayText(selectedVehicle.heureEntree)}</strong>
-                  </div>
-                  <div>
-                    <span>Marque</span>
-                    <strong>{displayText(selectedVehicle.marque)}</strong>
-                  </div>
-                  <div>
-                    <span>Modèle</span>
-                    <strong>
-                      {displayText(selectedVehicle.modele || selectedVehicle.modelePowerBI)}
-                    </strong>
-                  </div>
-                  <div>
-                    <span>N° Chassis</span>
-                    <strong>{displayText(selectedVehicle.chassis)}</strong>
-                  </div>
-                  <div>
-                    <span>Catégorie</span>
-                    <strong>{displayText(selectedVehicle.categorie)}</strong>
-                  </div>
-                  <div>
-                    <span>Technicien</span>
-                    <strong>{displayText(selectedVehicle.technicien)}</strong>
-                  </div>
-                  <div>
-                    <span>NOM DE Technicien</span>
-                    <strong>{displayText(selectedVehicle.nomTechnicien)}</strong>
-                  </div>
-                  <div>
-                    <span>Equipe</span>
-                    {selectedVehicle.equipe && selectedVehicle.equipe !== "-" ? (
-                      <span className="inline-flex items-center px-2 py-0.5 rounded-md text-xs font-bold bg-blue-50 text-blue-700 border border-blue-200">
-                        {selectedVehicle.equipe}
-                      </span>
-                    ) : (
-                      <strong>-</strong>
-                    )}
-                  </div>
-                  <div>
-                    <span>Etat</span>
-                    <strong>
-                      {formatStatusLabel(selectedVehicle.etatIntervention)}
-                    </strong>
-                  </div>
-                  <div>
-                    <span>Emplacement</span>
-                    <strong>{displayText(selectedVehicle.emplacement)}</strong>
-                  </div>
-                </div>
-
-                {selectedRows.length > 1 && (
-                  <p className="detail-note">
-                    {selectedRows.length} véhicules occupent cette zone.
-                  </p>
-                )}
-              </>
-            )}
-          </aside>
-        </main>
-      ) : (
-        <>
-          <main className="chargement-stage">
-            {showStatusDashboard && (
-              <section className="metric-grid" aria-label="Indicateurs atelier">
-                {kpis.map((kpi) => (
-                  <MetricCard
-                    active={activeFilter === kpi.filter}
-                    accent={kpi.accent}
-                    helper={kpi.helper}
-                    icon={kpi.icon}
-                    key={kpi.label}
-                    label={kpi.label}
-                    onClick={() =>
-                      setActiveFilter((current) =>
-                        current === kpi.filter ? "Tous" : kpi.filter
-                      )
-                    }
-                    value={kpi.value}
-                  />
-                ))}
-              </section>
-            )}
-
-            <div className="chargement-body">
-              {showStatusDashboard && (
-                <section className="panel pie-panel" aria-label="Répartition des statuts">
-                  <div className="panel-head">
-                    <div>
-                      <p className="panel-kicker">Répartition</p>
-                      <h2>Etat intervention</h2>
+          {/* Notifications Devis : Réception, Relances & Devis Accepté par le client */}
+          {(activeDevisAppelerNotifications.length > 0 ||
+            activeDevisRelanceNotifications.length > 0 ||
+            activeDevisAccordNotificationsForUser.length > 0) && (
+            <div className="p-3 sm:p-4 space-y-2.5 bg-gradient-to-r from-emerald-50/95 via-amber-50/90 to-rose-50/90 border-b border-emerald-200 shadow-2xs animate-in slide-in-from-top-1 duration-200">
+              {/* Notification 1 : Nouveau devis créé => Appeler le client */}
+              {activeDevisAppelerNotifications.map((item) => {
+                const notifId = `appeler-${item.vehicle.id}`;
+                return (
+                  <div
+                    key={notifId}
+                    className="p-3 bg-white/95 rounded-xl border border-orange-300/80 shadow-xs flex flex-col md:flex-row md:items-center justify-between gap-3"
+                  >
+                    <div className="flex items-start gap-3 min-w-0">
+                      <div className="w-8 h-8 rounded-lg bg-orange-100 text-orange-700 flex items-center justify-center shrink-0 border border-orange-300">
+                        <PhoneCall size={16} className="animate-pulse" />
+                      </div>
+                      <div className="min-w-0 space-y-0.5">
+                        <div className="flex items-center gap-2 flex-wrap">
+                          <span className="px-2 py-0.5 rounded text-[10px] font-extrabold uppercase bg-orange-500 text-white tracking-wide">
+                            Nouveau Devis Créé
+                          </span>
+                          <span className="font-mono font-bold text-xs text-orange-950">
+                            N° DV : {item.devis.numeroDevis}
+                          </span>
+                          <span className="text-[11px] text-slate-500">
+                            • Créé par équipe <strong className="text-slate-700">{item.devis.equipeOrigine || item.vehicle.equipe || "-"}</strong>
+                          </span>
+                        </div>
+                        <div className="text-xs text-slate-800 font-semibold flex items-center gap-2 flex-wrap">
+                          <span>OR : <strong className="font-mono text-slate-900">{item.vehicle.no || item.vehicle.ordre}</strong></span>
+                          <span>•</span>
+                          <span>Immat : <strong>{item.vehicle.immatriculation || item.vehicle.serie || "-"}</strong> ({item.vehicle.modele || "-"})</span>
+                          <span>•</span>
+                          <span>Client : <strong className="text-slate-900">{item.vehicle.client || "-"}</strong></span>
+                        </div>
+                        {item.devis.pieces && (
+                          <div className="flex items-center gap-1.5 text-xs text-amber-900 bg-amber-50 px-2 py-1 rounded-lg border border-amber-200/80 w-fit mt-1">
+                            <Wrench size={13} className="text-amber-700 shrink-0" />
+                            <span>Pièces identifiées à remplacer : <strong>{item.devis.pieces}</strong></span>
+                          </div>
+                        )}
+                        {item.devis.commentaire && !item.devis.pieces && (
+                          <p className="text-[11px] text-slate-500 truncate max-w-xl">
+                            Note : {item.devis.commentaire}
+                          </p>
+                        )}
+                      </div>
                     </div>
 
-                    <span className="panel-total">{vehicles.length} véh.</span>
+                    <div className="flex items-center gap-2 shrink-0 self-end md:self-center">
+                      <button
+                        type="button"
+                        onClick={() => handleAppelerClientFromNotif(item)}
+                        className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-bold text-white bg-blue-600 hover:bg-blue-700 active:scale-95 rounded-lg shadow-2xs transition-all cursor-pointer"
+                        title="Indiquer que la réception a appelé le client pour présenter le devis"
+                      >
+                        <PhoneCall size={13} />
+                        <span>Appel fait</span>
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setActiveTab("devis")}
+                        className="inline-flex items-center gap-1 px-2.5 py-1.5 text-xs font-semibold text-orange-800 bg-orange-100 hover:bg-orange-200 border border-orange-300 rounded-lg transition-colors cursor-pointer"
+                        title="Consulter ce dossier dans la Page Devis"
+                      >
+                        <FileSignature size={13} />
+                        <span>Page Devis</span>
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => handleDismissDevisNotif(notifId)}
+                        className="p-1 rounded-lg text-slate-400 hover:text-slate-600 hover:bg-slate-100 transition-colors cursor-pointer"
+                        title="Masquer cette alerte"
+                      >
+                        <X size={15} />
+                      </button>
+                    </div>
                   </div>
+                );
+              })}
 
-                  <div className="pie-wrap">
-                    <ResponsiveContainer width="100%" height="100%">
-                      <PieChart>
-                        <Pie
-                          cx="50%"
-                          cy="50%"
-                          data={statusRows}
-                          dataKey="count"
-                          innerRadius={38}
-                          nameKey="label"
-                          outerRadius={64}
-                          paddingAngle={2}
-                          stroke="#fff"
-                          strokeWidth={3}
+              {/* Notification 2 : Relance client requise (> 24h sans réponse) */}
+              {activeDevisRelanceNotifications.map((item) => {
+                const notifId = `relance-${item.vehicle.id}`;
+                return (
+                  <div
+                    key={notifId}
+                    className="p-3 bg-white/95 rounded-xl border border-rose-300 shadow-xs flex flex-col md:flex-row md:items-center justify-between gap-3 animate-in slide-in-from-top-1"
+                  >
+                    <div className="flex items-start gap-3 min-w-0">
+                      <div className="w-8 h-8 rounded-lg bg-rose-100 text-rose-700 flex items-center justify-center shrink-0 border border-rose-300">
+                        <AlertTriangle size={16} className="animate-bounce" />
+                      </div>
+                      <div className="min-w-0 space-y-0.5">
+                        <div className="flex items-center gap-2 flex-wrap">
+                          <span className="px-2 py-0.5 rounded text-[10px] font-extrabold uppercase bg-rose-600 text-white tracking-wide">
+                            ⚠️ Relance Client Requise (&gt; 24h sans réponse)
+                          </span>
+                          <span className="font-mono font-bold text-xs text-rose-950">
+                            N° DV : {item.devis.numeroDevis}
+                          </span>
+                          <span className="text-[11px] text-slate-500">
+                            • Véhicule : {item.vehicle.no || item.vehicle.ordre} ({item.vehicle.immatriculation || item.vehicle.serie || "-"})
+                          </span>
+                        </div>
+                        <div className="text-xs text-slate-800 font-semibold">
+                          Client : <strong className="text-slate-900">{item.vehicle.client || "-"}</strong> — Devis sans réponse depuis plus de 24h.
+                        </div>
+                        {item.devis.pieces && (
+                          <div className="flex items-center gap-1.5 text-xs text-rose-900 bg-rose-50 px-2 py-0.5 rounded border border-rose-200/70 w-fit">
+                            <Wrench size={12} className="text-rose-700 shrink-0" />
+                            <span>Pièces : <strong>{item.devis.pieces}</strong></span>
+                          </div>
+                        )}
+                      </div>
+                    </div>
+
+                    <div className="flex items-center gap-1.5 shrink-0 self-end md:self-center flex-wrap">
+                      <button
+                        type="button"
+                        onClick={() => handleRelancerClientFromNotif(item)}
+                        className="inline-flex items-center gap-1 px-2.5 py-1.5 text-xs font-bold text-white bg-amber-600 hover:bg-amber-700 active:scale-95 rounded-lg shadow-2xs transition-all cursor-pointer"
+                        title="Enregistrer que le client a été relancé"
+                      >
+                        <PhoneCall size={12} />
+                        <span>Relance faite</span>
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => void handleAccepterDevisFromNotif(item)}
+                        className="inline-flex items-center gap-1 px-2.5 py-1.5 text-xs font-bold text-white bg-emerald-600 hover:bg-emerald-700 active:scale-95 rounded-lg shadow-2xs transition-all cursor-pointer"
+                        title="Le client a accepté le devis : retour automatique à l'équipe en atelier"
+                      >
+                        <CheckCircle2 size={12} />
+                        <span>Accepter</span>
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => void handleRefuserDevisFromNotif(item)}
+                        className="inline-flex items-center gap-1 px-2.5 py-1.5 text-xs font-bold text-rose-700 bg-rose-50 hover:bg-rose-100 border border-rose-300 active:scale-95 rounded-lg shadow-2xs transition-all cursor-pointer"
+                        title="Le client refuse le devis : marquer comme annulé et passer en Terminer"
+                      >
+                        <XCircle size={12} />
+                        <span>Refuser (Annulé)</span>
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => handleDismissDevisNotif(notifId)}
+                        className="p-1 rounded-lg text-slate-400 hover:text-slate-600 hover:bg-slate-100 transition-colors cursor-pointer"
+                        title="Masquer cette alerte"
+                      >
+                        <X size={15} />
+                      </button>
+                    </div>
+                  </div>
+                );
+              })}
+
+              {/* Notification 3 : Devis Client Accepté => Pour Chef d'Équipe de l'équipe d'origine (et Chef d'Atelier / Admin) */}
+              {activeDevisAccordNotificationsForUser.map((item) => {
+                const matchingVehicle = vehicles.find(
+                  (v) =>
+                    v.id === item.vehicleId ||
+                    (item.or && (v.no === item.or || v.ordre === item.or)) ||
+                    (item.chassis && v.chassis === item.chassis)
+                );
+                return (
+                  <div
+                    key={`banner-${item.id}`}
+                    className="p-3.5 bg-white/95 rounded-xl border-2 border-emerald-500 shadow-xs flex flex-col md:flex-row md:items-center justify-between gap-3 animate-in fade-in duration-200"
+                  >
+                    <div className="flex items-start gap-3 min-w-0">
+                      <div className="w-9 h-9 rounded-xl bg-gradient-to-br from-emerald-500 to-teal-600 text-white flex items-center justify-center shrink-0 shadow-xs">
+                        <CheckCircle2 size={18} className="animate-pulse" />
+                      </div>
+                      <div className="min-w-0 space-y-0.5">
+                        <div className="flex items-center gap-2 flex-wrap">
+                          <span className="px-2 py-0.5 rounded text-[10px] font-extrabold uppercase bg-emerald-600 text-white tracking-wide">
+                            Devis Accepté par le Client
+                          </span>
+                          <span className="font-mono font-bold text-xs text-emerald-950">
+                            N° DV : {item.numeroDevis}
+                          </span>
+                          <span className="text-[11px] text-slate-600">
+                            • Retourné à l'équipe <strong className="text-emerald-700 font-bold">{item.equipeCible}</strong>
+                          </span>
+                          <span className="px-2 py-0.5 rounded-full text-[10px] font-bold bg-orange-100 text-orange-800 border border-orange-200">
+                            Tableaux de chargement (Attente réparation)
+                          </span>
+                          {(item.nomTechnicien || item.technicien || matchingVehicle?.nomTechnicien || matchingVehicle?.technicien) && (
+                            <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md bg-emerald-100/80 text-emerald-900 border border-emerald-300 text-[11px] font-bold">
+                              <Wrench size={11} className="text-emerald-700" />
+                              <span>
+                                Tech : {item.nomTechnicien || matchingVehicle?.nomTechnicien || item.technicien || matchingVehicle?.technicien}
+                                {(item.technicien || matchingVehicle?.technicien) ? ` (${item.technicien || matchingVehicle?.technicien})` : ""}
+                              </span>
+                            </span>
+                          )}
+                        </div>
+                        <div className="text-xs text-slate-800 font-semibold flex items-center gap-2 flex-wrap">
+                          <span>OR : <strong className="font-mono text-slate-900">{item.or}</strong></span>
+                          <span>•</span>
+                          <span>Châssis : <strong className="font-mono text-slate-700">{item.chassis}</strong></span>
+                          <span>•</span>
+                          <span>Véhicule : <strong>{item.marque} {item.modele}</strong> ({item.immatriculation || "-"})</span>
+                          <span>•</span>
+                          <span>Client : <strong className="text-slate-900">{item.client}</strong></span>
+                        </div>
+                        <p className="text-[11px] text-emerald-800 font-medium">
+                          Accord client confirmé le {item.dateAccord}. Le véhicule est de retour dans votre équipe ({item.equipeCible}) assigné au même technicien dans Tableaux de chargement (Attente réparation).
+                        </p>
+                      </div>
+                    </div>
+
+                    <div className="flex items-center gap-2 shrink-0 self-end md:self-center flex-wrap">
+                      <button
+                        type="button"
+                        onClick={() => handleVoirDansChargement(item, matchingVehicle)}
+                        className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-bold text-white bg-slate-900 hover:bg-slate-800 active:scale-95 rounded-lg shadow-sm transition-all cursor-pointer"
+                        title="Consulter le véhicule dans Tableaux de chargement (Attente Réparation)"
+                      >
+                        <ClipboardList size={13} />
+                        <span>Voir dans Tableaux de chargement</span>
+                      </button>
+                      {matchingVehicle && (permissions.canEditEtat || permissions.canEditChargement) && (
+                        <button
+                          type="button"
+                          onClick={() => handlePrendreEnChargeDevisAccord(item, matchingVehicle)}
+                          className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-bold text-emerald-800 bg-emerald-50 hover:bg-emerald-100 border border-emerald-300 active:scale-95 rounded-lg shadow-2xs transition-all cursor-pointer"
+                          title="Affecter ou démarrer l'intervention"
                         >
-                          {statusRows.map((entry) => (
-                            <Cell fill={entry.color} key={entry.label} />
-                          ))}
-                        </Pie>
+                          <UserCheck size={13} />
+                          <span>Démarrer / Affecter</span>
+                        </button>
+                      )}
+                      <button
+                        type="button"
+                        onClick={() => handleDismissDevisAccord(item.id)}
+                        className="p-1 rounded-lg text-slate-400 hover:text-slate-600 hover:bg-slate-100 transition-colors cursor-pointer"
+                        title="Masquer cette notification"
+                      >
+                        <X size={15} />
+                      </button>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          )}
 
-                        <Tooltip
-                          contentStyle={{
-                            border: "1px solid #e8e2d9",
-                            borderRadius: 10,
-                            boxShadow: "0 16px 42px rgba(0,0,0,.12)",
-                            fontSize: 12,
-                          }}
-                        />
-                      </PieChart>
-                    </ResponsiveContainer>
+          {activeTab === "suivi_temps" ? (
+            permissions.canViewSuiviTemps ? (
+              <SuiviTempsView userTeam={role === "chef_equipe" ? activeChefEquipeTeam : undefined} />
+            ) : (
+              <div className="p-8 text-center bg-white rounded-2xl m-4 sm:m-6 border border-slate-200 shadow-sm">
+                <div className="w-12 h-12 rounded-xl bg-amber-100 text-amber-700 flex items-center justify-center mx-auto mb-3">
+                  <ShieldAlert className="w-6 h-6" />
+                </div>
+                <h2 className="text-base font-bold text-slate-800">Accès Restreint</h2>
+                <p className="text-xs text-slate-500 mt-1 max-w-md mx-auto">
+                  La page Suivi des Voitures & Calcul des Temps Atelier est exclusivement réservée à l'Administration et à la Direction Atelier.
+                </p>
+              </div>
+            )
+          ) : activeTab === "suivi_entrees" ? (
+            <SuiviEntreesTable />
+          ) : activeTab === "gestion_acces" ? (
+            <GestionAccesView />
+          ) : activeTab === "gestion_equipes" ? (
+            <GestionEquipesView />
+          ) : activeTab === "moyennes" ? (
+            <MoyennesView />
+          ) : activeTab === "essai" ? (
+            permissions.canViewEssai ? (
+              <EssaiView
+                vehicles={vehicles}
+                onUpdateAvancement={saveVehicleAvancement}
+                onValidateEssai={handleValidateEssai}
+                onSelectVehicle={(v) => {
+                  setSelectedVehicleId(v.id);
+                  setVehiculeModalData(v);
+                }}
+                savingVehicleId={savingVehicleId}
+                canEdit={permissions.canEditEtat || permissions.canEditAvancement}
+                userTeam={role === "chef_equipe" ? activeChefEquipeTeam : undefined}
+                isChefEquipe={role === "chef_equipe"}
+                onRefresh={() => void loadVehicles()}
+                isRefreshing={sheetStatus === "loading" || isInstantSyncing}
+              />
+            ) : (
+              <div className="p-8 text-center bg-white rounded-2xl m-4 sm:m-6 border border-slate-200 shadow-sm">
+                <div className="w-12 h-12 rounded-xl bg-amber-100 text-amber-700 flex items-center justify-center mx-auto mb-3">
+                  <ShieldAlert className="w-6 h-6" />
+                </div>
+                <h2 className="text-base font-bold text-slate-800">Accès Restreint</h2>
+                <p className="text-xs text-slate-500 mt-1 max-w-md mx-auto">
+                  La page Véhicules en Essai & Contrôle est réservée à l'Administration et aux Chefs d'équipe.
+                </p>
+              </div>
+            )
+          ) : activeTab === "attente_achat" ? (
+            permissions.canViewAttenteAchat ? (
+              <AcheterView
+                vehicles={vehicles}
+                onUpdateAvancement={saveVehicleAvancement}
+                onSelectVehicle={(v) => {
+                  setSelectedVehicleId(v.id);
+                  setVehiculeModalData(v);
+                }}
+                savingVehicleId={savingVehicleId}
+                canEdit={permissions.canEditEtat || permissions.canEditAvancement}
+                userTeam={role === "chef_equipe" ? activeChefEquipeTeam : undefined}
+                isChefEquipe={role === "chef_equipe"}
+                onMarquerLivrer={handleMarquerAchatLivrer}
+                onMarquerAttente={handleMarquerAchatAttente}
+                onRefresh={() => void loadVehicles()}
+                isRefreshing={sheetStatus === "loading" || isInstantSyncing}
+              />
+            ) : (
+              <div className="p-8 text-center bg-white rounded-2xl m-4 sm:m-6 border border-slate-200 shadow-sm">
+                <div className="w-12 h-12 rounded-xl bg-amber-100 text-amber-700 flex items-center justify-center mx-auto mb-3">
+                  <ShieldAlert className="w-6 h-6" />
+                </div>
+                <h2 className="text-base font-bold text-slate-800">Accès Restreint</h2>
+                <p className="text-xs text-slate-500 mt-1 max-w-md mx-auto">
+                  La page Véhicules en Attente Achat (Pièces / Devis) est réservée à l'Administration.
+                </p>
+              </div>
+            )
+          ) : activeTab === "devis" ? (
+            permissions.canViewDevis ? (
+              <DevisView
+                vehicles={vehicles}
+                onUpdateAvancement={saveVehicleAvancement}
+                onSelectVehicle={(v) => {
+                  setSelectedVehicleId(v.id);
+                  setVehiculeModalData(v);
+                }}
+                savingVehicleId={savingVehicleId}
+                canEdit={permissions.canEditEtat || permissions.canEditAvancement || role === "reception"}
+                userTeam={role === "chef_equipe" ? activeChefEquipeTeam : undefined}
+                isChefEquipe={role === "chef_equipe"}
+                role={role}
+                currentUser={currentUser}
+                onRefresh={() => void loadVehicles()}
+                isRefreshing={sheetStatus === "loading" || isInstantSyncing}
+                onNavigateToTab={(tab, filter, vehicleId) => {
+                  setActiveTab(tab as any);
+                  if (filter) setActiveFilter(filter as any);
+                  if (vehicleId) setSelectedVehicleId(vehicleId);
+                }}
+              />
+            ) : (
+              <div className="p-8 text-center bg-white rounded-2xl m-4 sm:m-6 border border-slate-200 shadow-sm">
+                <div className="w-12 h-12 rounded-xl bg-amber-100 text-amber-700 flex items-center justify-center mx-auto mb-3">
+                  <ShieldAlert className="w-6 h-6" />
+                </div>
+                <h2 className="text-base font-bold text-slate-800">Accès Restreint</h2>
+                <p className="text-xs text-slate-500 mt-1 max-w-md mx-auto">
+                  La page Devis est réservée à la Réception et à l'Administration.
+                </p>
+              </div>
+            )
+          ) : activeTab === "plan_atelier" ? (
+            <main className="plan-stage" ref={planStageRef}>
+              <section className="map-panel" aria-label="Plan d'Atelier Mécanique">
+                <div className="map-toolbar">
+                  <div className="map-toolbar-brand">
+                    <p className="panel-kicker">Synoptique Atelier Mécanique</p>
+                    <h2>Plan d'Atelier Haute Précision</h2>
                   </div>
 
-                  <div className="status-stack">
-                    {statusRows.map((status) => {
-                      const pct = Math.round(
-                        vehicles.length > 0
-                          ? (status.count / vehicles.length) * 100
-                          : 0
-                      );
+                  <div className="map-toolbar-divider" />
 
+                  {/* Statuts Horizontaux */}
+                  <div className="map-statuses-bar">
+                    {statusMeta.map((status) => {
+                      const isActive = activeFilter === status.label;
                       return (
                         <button
-                          className={`status-row ${
-                            activeFilter === status.label ? "status-row-active" : ""
-                          }`}
                           key={status.label}
+                          type="button"
                           onClick={() =>
                             setActiveFilter((current) =>
                               current === status.label ? "Tous" : status.label
                             )
                           }
-                          style={{ "--accent": status.color } as CSSProperties}
-                          type="button"
+                          className={`map-status-btn ${isActive ? "status-btn-active" : ""}`}
+                          title={`Filtrer par : ${formatStatusLabel(status.label)}`}
                         >
-                          <span className="status-dot" />
-                          <span className="status-name">
-                            {formatStatusLabel(status.label)}
-                          </span>
-                          <span className="status-bar">
-                            <span style={{ width: `${pct}%` }} />
-                          </span>
-                          <span className="status-count">{status.count}</span>
+                          <span
+                            className="status-dot"
+                            style={{ backgroundColor: status.color }}
+                          />
+                          <span>{formatStatusLabel(status.label)}</span>
                         </button>
                       );
                     })}
-                  </div>
-                </section>
-              )}
 
-              <section className="panel table-panel" aria-label="Tableau détail">
-          <div className="panel-head">
-            <div>
-              <p className="panel-kicker">
-                {activeTab === "en_cours"
-                  ? "Atelier Mécanique"
-                  : role === "chef_equipe"
-                    ? "Planning & Chargement"
-                    : "Tableaux de chargement"}
-              </p>
-              <h2>
-                {activeTab === "en_cours"
-                  ? "Interventions En cours"
-                  : role === "chef_equipe"
-                    ? "Tableaux de chargement (Attente Réparation)"
-                    : "Tableaux de chargement complet (Tous les véhicules)"}
-              </h2>
-            </div>
-
-            <div className="table-source flex items-center gap-2">
-              {(role === "administration" || role === "chef_atelier") && activeTab === "chargement" && (
-                <button
-                  type="button"
-                  onClick={() => void handleInstantSync()}
-                  disabled={isInstantSyncing || sheetStatus === "loading"}
-                  className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-bold text-amber-900 bg-amber-100 hover:bg-amber-200 border border-amber-300 rounded-lg shadow-2xs transition-all cursor-pointer active:scale-95 disabled:opacity-50"
-                  title="Synchroniser et actualiser à l'instant tout le tableau de chargement"
-                >
-                  <RefreshCw size={13} className={isInstantSyncing ? "animate-spin text-amber-700" : "text-amber-700"} />
-                  {isInstantSyncing ? "Actualisation..." : "Actualiser à l'instant"}
-                </button>
-              )}
-              <a
-                className="sheet-link"
-                href={VEHICLE_SHEET_URL}
-                rel="noreferrer"
-                target="_blank"
-              >
-                Google Sheets
-              </a>
-              <span
-                className={`sheet-state sheet-state-${sheetStatus}`}
-                title={sheetError}
-              >
-                {sheetStatus === "loading"
-                  ? "Chargement"
-                  : sheetStatus === "ready"
-                    ? "Connecté"
-                    : "Secours"}
-              </span>
-              <span className="panel-total">{filteredRows.length}</span>
-            </div>
-          </div>
-
-          {/* Bannière de notification des transferts pour Chef d'Équipe */}
-          {role === "chef_equipe" && incomingTransfers.length > 0 && (
-            <div className="mx-6 mt-4 mb-2 p-4 bg-gradient-to-r from-amber-500/15 via-orange-500/10 to-amber-500/15 border-2 border-amber-400 rounded-2xl shadow-sm flex flex-wrap items-center justify-between gap-4">
-              <div className="flex items-center gap-3">
-                <div className="p-2.5 bg-amber-500 text-white rounded-xl shadow-sm animate-bounce shrink-0">
-                  <Bell size={20} />
-                </div>
-                <div>
-                  <div className="flex items-center gap-2">
-                    <h3 className="text-sm font-black text-amber-950">
-                      {incomingTransfers.length} {incomingTransfers.length > 1 ? "nouveaux travaux transférés reçus" : "nouveau travail transféré reçu"}
-                    </h3>
-                    <span className="px-2 py-0.5 text-[10px] font-black bg-amber-200 text-amber-900 rounded-full border border-amber-300">
-                      Action requise
-                    </span>
-                  </div>
-                  <p className="text-xs text-amber-800 mt-0.5">
-                    Des véhicules ont été envoyés à votre équipe ({activeChefEquipeTeam}). Acceptez le travail pour affecter immédiatement un technicien.
-                  </p>
-                </div>
-              </div>
-
-              <div className="flex flex-wrap items-center gap-2">
-                {incomingTransfers.map((v) => {
-                  const fromTeam = getOriginTeam(v);
-                  return (
-                    <div
-                      key={v.id}
-                      className="flex items-center gap-2 px-3 py-1.5 bg-white rounded-xl border border-amber-300 shadow-2xs"
-                    >
-                      <span className="text-xs font-bold text-slate-900 font-mono">
-                        {v.serie || v.no}
-                      </span>
-                      <span className="text-[11px] text-slate-600">
-                        (de <strong className="text-slate-800">{fromTeam}</strong>)
-                      </span>
-                      <button
-                        type="button"
-                        onClick={() => handleAcceptTransfer(v)}
-                        className="inline-flex items-center gap-1.5 px-3 py-1 bg-emerald-600 hover:bg-emerald-700 active:scale-95 text-white rounded-lg text-xs font-bold shadow-2xs transition-all cursor-pointer"
-                        title="Accepter le travail et affecter un technicien"
-                      >
-                        <UserCheck size={13} />
-                        <span>Accepter le travail</span>
-                      </button>
-                    </div>
-                  );
-                })}
-
-                {allTransferredToMyTeam.some((v) => isEnCours(v.etatIntervention, v.avancement, v.technicien)) && (
-                  <button
-                    type="button"
-                    onClick={() => {
-                      setActiveTab("en_cours");
-                      setActiveFilter("En cours");
-                      setEnCoursTransferOnly(true);
-                    }}
-                    className="inline-flex items-center gap-1.5 px-3 py-1 bg-amber-100 hover:bg-amber-200 active:scale-95 text-amber-900 rounded-lg text-xs font-bold transition-all cursor-pointer border border-amber-300 shadow-2xs"
-                    title="Voir les travaux transférés déjà acceptés et en cours d'intervention"
-                  >
-                    <ArrowRightLeft size={13} />
-                    <span>Voir les transferts acceptés ({allTransferredToMyTeam.filter((v) => isEnCours(v.etatIntervention, v.avancement, v.technicien)).length})</span>
-                  </button>
-                )}
-              </div>
-            </div>
-          )}
-
-          <div className="table-controls">
-            <label className="search-shell">
-              <Search size={14} />
-              <input
-                onChange={(event) => setSearch(event.target.value)}
-                placeholder="Rechercher OR, CS, client, chassis..."
-                type="search"
-                value={search}
-              />
-            </label>
-
-            <label className="state-filter date-filter">
-              <span>Date</span>
-              <select
-                aria-label="Filtrer par date d'entrée"
-                onChange={(event) => {
-                  setDateFilter(event.target.value);
-                  setSelectedZone(null);
-                  setSelectedVehicleId(null);
-                  setIsDetailPinned(false);
-                }}
-                value={dateFilter}
-              >
-                <option value={ALL_DATES}>Toutes</option>
-                {dateOptions.map((date) => (
-                  <option key={date} value={date}>
-                    {date}
-                  </option>
-                ))}
-              </select>
-            </label>
-
-            {activeTab === "en_cours" ? (
-              <div className="flex flex-wrap items-center gap-2">
-                <div className="state-filter flex items-center gap-1.5 px-3 py-1.5 bg-blue-50 border border-blue-200 rounded-lg text-xs font-semibold text-blue-800 shadow-2xs">
-                  <span className="text-slate-500 font-normal">Etat :</span>
-                  <span className="flex items-center gap-1">
-                    <span className="w-2 h-2 rounded-full bg-blue-600 animate-pulse"></span>
-                    En cours
-                  </span>
-                </div>
-
-                {role === "chef_equipe" && (
-                  <div className="flex items-center gap-1 bg-slate-100 p-0.5 rounded-lg border border-slate-200">
                     <button
                       type="button"
-                      onClick={() => setEnCoursTransferOnly(false)}
-                      className={`px-2.5 py-1 text-xs font-bold rounded-md transition-all cursor-pointer ${
-                        !enCoursTransferOnly
-                          ? "bg-white text-blue-700 shadow-2xs"
-                          : "text-slate-600 hover:text-slate-900"
-                      }`}
+                      onClick={resetFilters}
+                      className={`map-status-btn ${activeFilter === "Tous" && !selectedZone ? "status-btn-active" : ""}`}
+                      title="Tous les emplacements / Libre"
                     >
-                      Tous ({vehicles.filter((v) => isEnCours(v.etatIntervention, v.avancement, v.technicien) && isVehicleMatchingTeam(v.equipe || "", activeChefEquipeTeam)).length})
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => setEnCoursTransferOnly(true)}
-                      className={`px-2.5 py-1 text-xs font-bold rounded-md transition-all cursor-pointer flex items-center gap-1 ${
-                        enCoursTransferOnly
-                          ? "bg-amber-500 text-white shadow-2xs"
-                          : "text-slate-600 hover:text-slate-900"
-                      }`}
-                      title="Afficher uniquement les travaux reçus par transfert d'une autre équipe"
-                    >
-                      <ArrowRightLeft size={12} />
-                      <span>Transférés reçus ({allTransferredToMyTeam.filter((v) => isEnCours(v.etatIntervention, v.avancement, v.technicien)).length})</span>
+                      <span className="status-dot" style={{ backgroundColor: "#94a3b8" }} />
+                      <span>Libre</span>
                     </button>
                   </div>
-                )}
-              </div>
-            ) : role === "chef_equipe" ? (
-              <div className="state-filter flex items-center gap-1.5 px-3 py-1.5 bg-amber-50 border border-amber-200 rounded-lg text-xs font-semibold text-amber-800 shadow-2xs">
-                <span className="text-slate-500 font-normal">Etat :</span>
-                <span className="flex items-center gap-1">
-                  <span className="w-2 h-2 rounded-full bg-amber-600"></span>
-                  Attente Réparation
-                </span>
-              </div>
-            ) : (
-              <label className="state-filter">
-                <span>Etat</span>
-                <select
-                  aria-label="Filtrer par état"
-                  onChange={(event) => {
-                    setActiveFilter(event.target.value as StatusFilter);
-                    setSelectedZone(null);
-                    setSelectedVehicleId(null);
-                    setIsDetailPinned(false);
-                  }}
-                  value={activeFilter}
-                >
-                  {tableStatusOptions.map((option) => (
-                    <option key={option.value} value={option.value}>
-                      {option.label}
-                    </option>
-                  ))}
-                </select>
-              </label>
-            )}
-          </div>
 
-          {sheetStatus === "fallback" && (
-            <div className="table-alert">
-              Google Sheets n'est pas accessible. Partage la feuille en lecture
-              avec toute personne ayant le lien.
-            </div>
-          )}
-
-          {sheetStatus === "ready" && missingMapZones.length > 0 && (
-            <div className="table-alert table-alert-info">
-              Emplacements absents du plan:{" "}
-              {missingMapZones.slice(0, 8).join(", ")}
-              {missingMapZones.length > 8 ? "..." : ""}
-            </div>
-          )}
-
-          {!canWriteToSheet && !writeError && (
-            <div className="table-alert table-alert-info">
-              Écriture Sheets à configurer: déploie le script Apps Script puis
-              ajoute VITE_SHEET_WRITE_URL dans .env.local.
-            </div>
-          )}
-
-          {writeError && (
-            <div className="table-alert">{writeError}</div>
-          )}
-
-          {writeNotice && (
-            <div className="table-alert table-alert-success">
-              {writeNotice}
-            </div>
-          )}
-
-          <datalist id="atelier-zone-options">
-            {editableMapZoneIds.map((zone) => (
-              <option key={zone} value={zone} />
-            ))}
-          </datalist>
-
-          {(() => {
-            const isChefEquipeChargement = activeTab === "chargement" && role === "chef_equipe";
-            const isEnCoursTab = activeTab === "en_cours";
-
-            return (
-              <div className="table-scroll">
-                <table
-                  className={`monitor-table vehicle-detail-table ${
-                    isChefEquipeChargement
-                      ? "table-chargement-chef"
-                      : isEnCoursTab
-                      ? "table-encours"
-                      : ""
-                  }`}
-                >
-                  {isChefEquipeChargement ? (
-                    <colgroup>
-                      <col className="col-or" />
-                      <col className="col-client" />
-                      <col className="col-marque" />
-                      <col className="col-modele" />
-                      <col className="col-chassis" />
-                      <col className="col-state" />
-                      <col className="col-emplacement" />
-                      <col className="col-action" />
-                    </colgroup>
-                  ) : isEnCoursTab ? (
-                    <colgroup>
-                      <col className="col-or" />
-                      <col className="col-client" />
-                      <col className="col-marque" />
-                      <col className="col-modele" />
-                      <col className="col-chassis" />
-                      <col className="col-state" />
-                      <col className="col-tech" />
-                      <col className="col-tech-name" />
-                      {role !== "chef_equipe" && <col className="col-team" />}
-                      <col className="col-avancement" />
-                      <col className="col-emplacement" />
-                      <col className="col-action" />
-                    </colgroup>
-                  ) : (
-                    <colgroup>
-                      <col className="col-or" />
-                      <col className="col-cs" />
-                      <col className="col-client" />
-                      <col className="col-date" />
-                      <col className="col-time" />
-                      <col className="col-marque" />
-                      <col className="col-modele" />
-                      <col className="col-chassis" />
-                      <col className="col-categorie" />
-                      <col className="col-tech" />
-                      <col className="col-tech-name" />
-                      <col className="col-team" />
-                      <col className="col-avancement" />
-                      <col className="col-state" />
-                      <col className="col-emplacement" />
-                      <col className="col-action" />
-                    </colgroup>
-                  )}
-
-                  <thead>
-                    {isChefEquipeChargement ? (
-                      <tr>
-                        <th>OR</th>
-                        <th>Client</th>
-                        <th>Marque</th>
-                        <th>Modèle</th>
-                        <th>N° Chassis</th>
-                        <th>Etat</th>
-                        <th>Emplacement</th>
-                        <th>Fiche</th>
-                      </tr>
-                    ) : isEnCoursTab ? (
-                      <tr>
-                        <th>OR</th>
-                        <th>Client</th>
-                        <th>Marque</th>
-                        <th>Modèle</th>
-                        <th>N° Chassis</th>
-                        <th>Etat</th>
-                        <th>Technicien</th>
-                        <th>NOM DE Technicien</th>
-                        {role !== "chef_equipe" && <th>Équipe</th>}
-                        <th>Avancement</th>
-                        <th>Emplacement</th>
-                        <th>Fiche</th>
-                      </tr>
-                    ) : (
-                      <tr>
-                        <th>OR</th>
-                        <th>CS</th>
-                        <th>Client</th>
-                        <th>Date Entrée</th>
-                        <th>Heure Entrée</th>
-                        <th>Marque</th>
-                        <th>Modèle</th>
-                        <th>N° Chassis</th>
-                        <th>Catégorie</th>
-                        <th>Technicien</th>
-                        <th>NOM DE Technicien</th>
-                        <th>Équipe</th>
-                        <th>Avancement</th>
-                        <th>Etat</th>
-                        <th>Emplacement</th>
-                        <th>Fiche</th>
-                      </tr>
-                    )}
-                  </thead>
-
-                  <tbody>
-                    {filteredRows.map((row) => {
-                      const draftValue =
-                        draftEmplacements[row.id] ?? row.emplacement;
-                      const normalizedDraft =
-                        normalizeSheetEmplacement(draftValue);
-                      const hasDraftChange =
-                        normalizedDraft !== row.emplacement;
-                      const isSaving = savingVehicleId === row.id;
-                      const hasEditableStatus = editableStatusSet.has(
-                        row.etatIntervention
-                      );
-
-                      const teamForOptions =
-                        row.equipe && row.equipe !== "-"
-                          ? row.equipe
-                          : activeChefEquipeTeam || "Daily1";
-                      const allowedAvancementOptions =
-                        getAvancementOptionsForTeam(teamForOptions, row);
-                      const pct = parseAvancementPct(row.avancement);
-
-                      const isTransferPending =
-                        Boolean(row.bloc && row.bloc > 1) &&
-                        (!row.technicien || row.technicien === "-") &&
-                        normalizeTeamName(row.equipe || "") === normalizeTeamName(activeChefEquipeTeam || "");
-
-                      // Sous-blocs réutilisables de cellules
-                      const renderCellEtat = () => (
-                        <td>
-                          <div className="flex items-center gap-1.5">
-                            <select
-                              aria-label={`Modifier Etat ${row.no}`}
-                              className="state-editor"
-                              disabled={isSaving || !permissions.canEditEtat}
-                              title={!permissions.canEditEtat ? "Modification de l'état réservée au Chef Atelier ou Chef d'équipe" : undefined}
-                              onChange={(event) => {
-                                const nextEtat = event.target.value as WorkshopStatus;
-                                if (nextEtat === "En cours") {
-                                  setPendingEnCoursVehicle(row);
-                                  setIsOnlyTechChange(false);
-                                  setIsTechModalOpen(true);
-                                } else {
-                                  void saveVehicleEtat(row, nextEtat);
-                                }
-                              }}
-                              onFocus={() => {
-                                setSelectedVehicleId(row.id);
-                                setSelectedZone(row.emplacement);
-                              }}
-                              style={badgeStyle(row.etatIntervention)}
-                              value={row.etatIntervention}
-                            >
-                              {!hasEditableStatus && (
-                                <option hidden value={row.etatIntervention}>
-                                  {formatStatusLabel(row.etatIntervention)}
-                                </option>
-                              )}
-
-                              {editableStatusOptions.map((status) => (
-                                <option key={status} value={status}>
-                                  {status}
-                                </option>
-                              ))}
-                            </select>
-
-                            {permissions.canEditEtat && isAttenteReparation(row.etatIntervention) && (
-                              <button
-                                type="button"
-                                onClick={() => {
-                                  setPendingEnCoursVehicle(row);
-                                  setIsOnlyTechChange(false);
-                                  setIsTechModalOpen(true);
-                                }}
-                                className="inline-flex items-center gap-1 px-2.5 py-1 text-[11px] font-bold text-white bg-blue-600 hover:bg-blue-700 active:scale-95 rounded-lg shadow-2xs transition-all cursor-pointer whitespace-nowrap shrink-0"
-                                title="Affecter un technicien de l'équipe et passer En cours"
-                              >
-                                <Play size={10} className="fill-white" />
-                                <span>En cours</span>
-                              </button>
-                            )}
-                          </div>
-                        </td>
-                      );
-
-                      const renderCellTech = () => (
-                        <td
-                          className={permissions.canEditEtat ? "cursor-pointer hover:bg-blue-50/70 transition-colors" : ""}
-                          onClick={() => {
-                            if (!permissions.canEditEtat) return;
-                            if (isTransferPending) {
-                              handleAcceptTransfer(row);
-                            } else {
-                              setPendingEnCoursVehicle(row);
-                              setIsOnlyTechChange(true);
-                              setIsTechModalOpen(true);
-                            }
-                          }}
-                          title={permissions.canEditEtat ? (isTransferPending ? "Transfert reçu : Cliquez pour choisir le technicien" : "Cliquer pour affecter ou modifier le technicien") : undefined}
+                  {(activeFilter !== "Tous" || selectedZone) && (
+                    <div className="map-chips">
+                      {activeFilter !== "Tous" && (
+                        <button
+                          className="map-chip"
+                          onClick={() => setActiveFilter("Tous")}
+                          type="button"
+                          title="Effacer le filtre"
                         >
-                          {isTransferPending ? (
-                            <span className="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-extrabold bg-amber-100 text-amber-900 border border-amber-300">
-                              À affecter
-                            </span>
-                          ) : (
-                            <span className="font-mono font-semibold text-slate-800">
-                              {displayText(row.technicien)}
-                            </span>
-                          )}
-                        </td>
-                      );
+                          {formatStatusFilter(activeFilter)}
+                          <span aria-hidden="true">×</span>
+                        </button>
+                      )}
 
-                      const renderCellNomTech = () => {
-                        if (isTransferPending && permissions.canEditEtat) {
-                          return (
-                            <td
-                              className="cursor-pointer bg-amber-50/80 hover:bg-amber-100 transition-colors"
-                              onClick={() => handleAcceptTransfer(row)}
-                              title="Transfert reçu : Cliquez pour affecter un technicien de votre équipe"
-                            >
-                              <div className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md text-[10px] font-bold bg-amber-200 text-amber-950 border border-amber-300 shadow-2xs animate-pulse whitespace-nowrap">
-                                <UserCheck size={11} className="text-amber-800 shrink-0" />
-                                <span>Choisir Tech</span>
-                              </div>
-                            </td>
-                          );
+                      {selectedZone && (
+                        <button
+                          className="map-chip"
+                          onClick={() => {
+                            setSelectedZone(null);
+                            setSelectedVehicleId(null);
+                            setIsDetailPinned(false);
+                          }}
+                          type="button"
+                          title="Désélectionner le poste"
+                        >
+                          {selectedZone}
+                          <span aria-hidden="true">×</span>
+                        </button>
+                      )}
+                    </div>
+                  )}
+                </div>
+
+                {/* Plein écran à droite */}
+                <div className="map-controls">
+                  <button
+                    className="map-ctrl-btn"
+                    onClick={() => void toggleFullscreen()}
+                    title={isFullscreen ? "Quitter le plein écran" : "Afficher en plein écran"}
+                    type="button"
+                  >
+                    {isFullscreen ? <Minimize2 size={14} /> : <Maximize2 size={14} />}
+                    <span className="hidden sm:inline">{isFullscreen ? "Quitter" : "Plein écran"}</span>
+                  </button>
+                </div>
+
+                <div
+                  className="atelier-map"
+                  dangerouslySetInnerHTML={{ __html: atelierMapDisplaySvg }}
+                  onClick={handleMapClick}
+                  onMouseLeave={hideVehicleDetails}
+                  onMouseMove={handleMapHover}
+                  ref={mapRef}
+                />
+              </section>
+
+              <aside
+                className={`panel detail-panel ${selectedVehicle ? "detail-open" : ""
+                  } ${isDetailPinned ? "detail-pinned" : ""}`}
+                aria-label="Fiche synoptique du véhicule"
+              >
+                {selectedVehicle && (
+                  <>
+                    <div className="panel-head">
+                      <div>
+                        <p className="panel-kicker">Détail Poste</p>
+                        <h2>Emplacement {selectedZone}</h2>
+                      </div>
+
+                      <div className="flex items-center gap-2">
+                        <span
+                          className="detail-badge"
+                          style={badgeStyle(selectedVehicle.etatIntervention)}
+                        >
+                          {formatStatusLabel(selectedVehicle.etatIntervention)}
+                        </span>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setSelectedZone(null);
+                            setSelectedVehicleId(null);
+                            setIsDetailPinned(false);
+                          }}
+                          className="p-1 rounded-lg text-slate-400 hover:text-slate-700 hover:bg-slate-100 transition-colors cursor-pointer"
+                          title="Fermer la fiche"
+                        >
+                          <X size={16} />
+                        </button>
+                      </div>
+                    </div>
+
+                    <div className="serie-card">
+                      <Car size={18} />
+                      <span>{selectedVehicle.serie}</span>
+                    </div>
+
+                    <button
+                      type="button"
+                      onClick={() => setVehiculeModalData(selectedVehicle)}
+                      className="w-full my-2.5 py-2 px-3 bg-gradient-to-r from-blue-600 to-indigo-600 hover:from-blue-700 hover:to-indigo-700 text-white rounded-xl text-xs font-bold flex items-center justify-center gap-2 shadow-xs transition-all cursor-pointer"
+                      title="Consulter les détails techniques et la condition complète du véhicule"
+                    >
+                      <Eye size={14} />
+                      <span>Voir détails & condition</span>
+                    </button>
+
+                    <div className="detail-grid">
+                      <div>
+                        <span>OR</span>
+                        <strong>
+                          {displayText(selectedVehicle.l2n2500 || selectedVehicle.no)}
+                        </strong>
+                      </div>
+                      <div>
+                        <span>CS</span>
+                        <strong>{displayText(selectedVehicle.cs)}</strong>
+                      </div>
+                      <div>
+                        <span>Client</span>
+                        <strong>{displayText(selectedVehicle.client)}</strong>
+                      </div>
+                      <div>
+                        <span>Date entrée</span>
+                        <strong>{displayText(selectedVehicle.dateEntree)}</strong>
+                      </div>
+                      <div>
+                        <span>Heure entrée</span>
+                        <strong>{displayText(selectedVehicle.heureEntree)}</strong>
+                      </div>
+                      <div>
+                        <span>Marque</span>
+                        <strong>{displayText(selectedVehicle.marque)}</strong>
+                      </div>
+                      <div>
+                        <span>Modèle</span>
+                        <strong>
+                          {displayText(selectedVehicle.modele || selectedVehicle.modelePowerBI)}
+                        </strong>
+                      </div>
+                      <div>
+                        <span>N° Chassis</span>
+                        <strong>{displayText(selectedVehicle.chassis)}</strong>
+                      </div>
+                      <div>
+                        <span>Catégorie</span>
+                        <strong>{displayText(selectedVehicle.categorie)}</strong>
+                      </div>
+                      <div>
+                        <span>Technicien</span>
+                        <strong>{displayText(selectedVehicle.technicien)}</strong>
+                      </div>
+                      <div>
+                        <span>NOM DE Technicien</span>
+                        <strong>{displayText(selectedVehicle.nomTechnicien)}</strong>
+                      </div>
+                      <div>
+                        <span>Equipe</span>
+                        {selectedVehicle.equipe && selectedVehicle.equipe !== "-" ? (
+                          <span className="inline-flex items-center px-2 py-0.5 rounded-md text-xs font-bold bg-blue-50 text-blue-700 border border-blue-200">
+                            {selectedVehicle.equipe}
+                          </span>
+                        ) : (
+                          <strong>-</strong>
+                        )}
+                      </div>
+                      <div>
+                        <span>Etat</span>
+                        <strong>
+                          {formatStatusLabel(selectedVehicle.etatIntervention)}
+                        </strong>
+                      </div>
+                      <div>
+                        <span>Emplacement</span>
+                        <strong>{displayText(selectedVehicle.emplacement)}</strong>
+                      </div>
+                    </div>
+
+                    {selectedRows.length > 1 && (
+                      <p className="detail-note">
+                        {selectedRows.length} véhicules occupent cette zone.
+                      </p>
+                    )}
+                  </>
+                )}
+              </aside>
+            </main>
+          ) : (
+            <>
+              <main className="chargement-stage">
+                {showStatusDashboard && (
+                  <section className="metric-grid" aria-label="Indicateurs atelier">
+                    {kpis.map((kpi) => (
+                      <MetricCard
+                        active={activeFilter === kpi.filter}
+                        accent={kpi.accent}
+                        helper={kpi.helper}
+                        icon={kpi.icon}
+                        key={kpi.label}
+                        label={kpi.label}
+                        onClick={() =>
+                          setActiveFilter((current) =>
+                            current === kpi.filter ? "Tous" : kpi.filter
+                          )
                         }
+                        value={kpi.value}
+                      />
+                    ))}
+                  </section>
+                )}
 
-                        return (
-                          <td
-                            title={row.nomTechnicien || (permissions.canEditEtat ? "Cliquer pour affecter ou modifier le technicien" : undefined)}
-                            className={permissions.canEditEtat ? "cursor-pointer hover:bg-blue-50/70 transition-colors" : ""}
-                            onClick={() => {
-                              if (!permissions.canEditEtat) return;
-                              setPendingEnCoursVehicle(row);
-                              setIsOnlyTechChange(true);
-                              setIsTechModalOpen(true);
-                            }}
-                          >
-                            <div className="flex items-center justify-between gap-1">
-                              <span className="truncate">{displayText(row.nomTechnicien)}</span>
-                              {permissions.canEditEtat && (
-                                <Wrench size={11} className="text-slate-300 hover:text-blue-600 shrink-0" />
-                              )}
-                            </div>
-                          </td>
-                        );
-                      };
+                <div className="chargement-body">
+                  {showStatusDashboard && (
+                    <section className="panel pie-panel" aria-label="Répartition des statuts">
+                      <div className="panel-head">
+                        <div>
+                          <p className="panel-kicker">Répartition</p>
+                          <h2>Etat intervention</h2>
+                        </div>
 
-                      const renderCellEquipe = () => (
-                        <td>
-                          <div className="flex flex-wrap items-center gap-1">
-                            {row.equipe && row.equipe !== "-" ? (
-                              <span
-                                className={`inline-flex items-center px-2 py-0.5 rounded-md text-[11px] font-bold border ${
-                                  row.equipe.toLowerCase().includes("daily1")
-                                    ? "bg-blue-50 text-blue-700 border-blue-200"
-                                    : row.equipe.toLowerCase().includes("daily2")
-                                    ? "bg-teal-50 text-teal-700 border-teal-200"
-                                    : row.equipe.toLowerCase().includes("changan")
-                                    ? "bg-amber-50 text-amber-700 border-amber-200"
-                                    : "bg-slate-100 text-slate-700 border-slate-200"
-                                }`}
-                              >
-                                {row.equipe}
-                              </span>
-                            ) : (
-                              <span className="text-slate-400">-</span>
-                            )}
-                            {Boolean(row.bloc && row.bloc > 1) && (
-                              <span
-                                className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-bold bg-amber-100 text-amber-900 border border-amber-300"
-                                title={`Travail transféré depuis : ${getOriginTeam(row)}`}
-                              >
-                                <ArrowRightLeft size={10} />
-                                <span>de {getOriginTeam(row)}</span>
-                              </span>
-                            )}
-                          </div>
-                        </td>
-                      );
+                        <span className="panel-total">{vehicles.length} véh.</span>
+                      </div>
 
-                      const renderCellAvancement = () => (
-                        <td>
-                          {permissions.canEditEtat ? (
-                            <div className="flex flex-col gap-1 min-w-[140px] max-w-[160px]">
-                              <select
-                                aria-label={`Modifier Avancement ${row.no}`}
-                                className="avancement-editor"
-                                disabled={isSaving || !permissions.canEditEtat}
-                                style={getAvancementStyle(row.avancement)}
-                                value={row.avancement && row.avancement !== "-" ? row.avancement : "-"}
-                                onChange={(e) => void saveVehicleAvancement(row, e.target.value)}
-                                title="Avancement - Choisissez l'avancement de 10% à 100%."
-                              >
-                                {(!row.avancement || row.avancement === "-") && (
-                                  <option value="-">- Définir -</option>
-                                )}
-                                {row.avancement &&
-                                  row.avancement !== "-" &&
-                                  !allowedAvancementOptions.includes(row.avancement) && (
-                                    <option value={row.avancement}>{row.avancement}</option>
-                                  )}
-                                {allowedAvancementOptions.map((opt) => (
-                                  <option key={opt} value={opt}>
-                                    {opt}
-                                  </option>
-                                ))}
-                              </select>
-                              {pct !== null && (
-                                <div className="w-full h-1.5 bg-slate-100 rounded-full overflow-hidden border border-slate-200/60">
-                                  <div
-                                    className={`h-full rounded-full transition-all duration-300 ${
-                                      pct === 100
-                                        ? "bg-emerald-500"
-                                        : pct > 40
-                                        ? "bg-blue-500"
-                                        : "bg-amber-500"
-                                    }`}
-                                    style={{ width: `${pct}%` }}
-                                  />
-                                </div>
-                              )}
-                            </div>
-                          ) : row.avancement && row.avancement !== "-" ? (
-                            <div className="flex flex-col gap-1 min-w-[120px] max-w-[135px]">
-                              <div className="flex items-center justify-between gap-1">
-                                <span
-                                  className={`inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-bold border truncate max-w-[95px] ${
-                                    row.avancement.toLowerCase().includes("termin")
-                                      ? "bg-emerald-50 text-emerald-700 border-emerald-200"
-                                      : row.avancement.toLowerCase().includes("devis")
-                                      ? "bg-orange-50 text-orange-700 border-orange-200"
-                                      : row.avancement.toLowerCase().includes("cours")
-                                      ? "bg-blue-50 text-blue-700 border-blue-200"
-                                      : "bg-slate-100 text-slate-700 border-slate-200"
-                                  }`}
-                                  title={row.avancement}
-                                >
-                                  {row.avancement}
-                                </span>
-                                {pct !== null && (
-                                  <span className="text-[10px] font-black text-slate-500 font-mono shrink-0">
-                                    {pct}%
-                                  </span>
-                                )}
-                              </div>
-                              {pct !== null && (
-                                <div className="w-full h-1 bg-slate-100 rounded-full overflow-hidden border border-slate-200/50">
-                                  <div
-                                    className={`h-full rounded-full transition-all duration-300 ${
-                                      pct === 100
-                                        ? "bg-emerald-500"
-                                        : pct > 40
-                                        ? "bg-blue-500"
-                                        : "bg-amber-500"
-                                    }`}
-                                    style={{ width: `${pct}%` }}
-                                  />
-                                </div>
-                              )}
-                            </div>
-                          ) : (
-                            <span className="text-slate-400 text-xs font-semibold">-</span>
-                          )}
-                        </td>
-                      );
+                      <div className="pie-wrap">
+                        <ResponsiveContainer width="100%" height="100%">
+                          <PieChart>
+                            <Pie
+                              cx="50%"
+                              cy="50%"
+                              data={statusRows}
+                              dataKey="count"
+                              innerRadius={38}
+                              nameKey="label"
+                              outerRadius={64}
+                              paddingAngle={2}
+                              stroke="#fff"
+                              strokeWidth={3}
+                            >
+                              {statusRows.map((entry) => (
+                                <Cell fill={entry.color} key={entry.label} />
+                              ))}
+                            </Pie>
 
-                      const renderCellEmplacement = () => (
-                        <td>
-                          <div className="emplacement-editor">
-                            <input
-                              aria-label={`Modifier emplacement ${row.no}`}
-                              disabled={isSaving || !permissions.canEditEmplacement}
-                              title={!permissions.canEditEmplacement ? "Modification de l'emplacement réservée au Chef Atelier ou Chef d'équipe" : undefined}
-                              list="atelier-zone-options"
-                              onBlur={(event) => {
-                                const nextValue = event.currentTarget.value;
-                                if (
-                                  normalizeSheetEmplacement(nextValue) !==
-                                  row.emplacement
-                                ) {
-                                  void saveVehicleEmplacement(row, nextValue);
-                                }
+                            <Tooltip
+                              contentStyle={{
+                                border: "1px solid #e8e2d9",
+                                borderRadius: 10,
+                                boxShadow: "0 16px 42px rgba(0,0,0,.12)",
+                                fontSize: 12,
                               }}
-                              onChange={(event) => {
-                                const nextValue = normalizeSheetEmplacement(
-                                  event.target.value
-                                );
-                                setDraftEmplacements((current) => ({
-                                  ...current,
-                                  [row.id]: nextValue,
-                                }));
-                              }}
-                              onFocus={() => {
-                                setSelectedVehicleId(row.id);
-                                setSelectedZone(row.emplacement);
-                              }}
-                              onKeyDown={(event) => {
-                                if (event.key === "Enter") {
-                                  event.preventDefault();
-                                  void saveVehicleEmplacement(
-                                    row,
-                                    event.currentTarget.value
-                                  );
-                                }
-                                if (event.key === "Escape") {
-                                  event.preventDefault();
-                                  setDraftEmplacements((current) =>
-                                    removeDraft(current, row.id)
-                                  );
-                                }
-                              }}
-                              value={draftValue}
                             />
+                          </PieChart>
+                        </ResponsiveContainer>
+                      </div>
 
+                      <div className="status-stack">
+                        {statusRows.map((status) => {
+                          const pct = Math.round(
+                            vehicles.length > 0
+                              ? (status.count / vehicles.length) * 100
+                              : 0
+                          );
+
+                          return (
                             <button
-                              aria-label={`Enregistrer emplacement ${row.no}`}
-                              className="emplacement-save"
-                              disabled={!hasDraftChange || isSaving || !permissions.canEditEmplacement}
-                              onClick={(event) => {
-                                event.stopPropagation();
-                                void saveVehicleEmplacement(row, draftValue);
-                              }}
-                              onMouseDown={(event) => {
-                                event.preventDefault();
-                              }}
-                              title="Enregistrer emplacement"
+                              className={`status-row ${activeFilter === status.label ? "status-row-active" : ""
+                                }`}
+                              key={status.label}
+                              onClick={() =>
+                                setActiveFilter((current) =>
+                                  current === status.label ? "Tous" : status.label
+                                )
+                              }
+                              style={{ "--accent": status.color } as CSSProperties}
                               type="button"
                             >
-                              <Save size={12} />
+                              <span className="status-dot" />
+                              <span className="status-name">
+                                {formatStatusLabel(status.label)}
+                              </span>
+                              <span className="status-bar">
+                                <span style={{ width: `${pct}%` }} />
+                              </span>
+                              <span className="status-count">{status.count}</span>
                             </button>
-                          </div>
-                        </td>
-                      );
+                          );
+                        })}
+                      </div>
+                    </section>
+                  )}
 
-                      const renderCellFiche = () => (
-                        <td className="text-center">
+                  <section className="panel table-panel" aria-label="Tableau détail">
+                    <div className="panel-head">
+                      <div>
+                        <p className="panel-kicker">
+                          {activeTab === "en_cours"
+                            ? "Atelier Mécanique"
+                            : role === "chef_equipe"
+                              ? "Planning & Chargement"
+                              : "Tableaux de chargement"}
+                        </p>
+                        <h2>
+                          {activeTab === "en_cours"
+                            ? "Interventions En cours"
+                            : role === "chef_equipe"
+                              ? "Tableaux de chargement (Attente Réparation)"
+                              : "Tableaux de chargement complet (Tous les véhicules)"}
+                        </h2>
+                      </div>
+
+                      <div className="table-source flex items-center gap-2">
+                        {(role === "administration" || role === "chef_atelier") && activeTab === "chargement" && (
                           <button
                             type="button"
-                            onClick={(event) => {
-                              event.stopPropagation();
-                              setVehiculeModalData(row);
-                            }}
-                            className="p-1 rounded-lg text-emerald-600 hover:text-emerald-800 hover:bg-emerald-50 border border-emerald-200 transition-colors cursor-pointer"
-                            title={`Voir la fiche détaillée et la condition du véhicule ${row.no}`}
+                            onClick={() => void handleInstantSync()}
+                            disabled={isInstantSyncing || sheetStatus === "loading"}
+                            className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-bold text-amber-900 bg-amber-100 hover:bg-amber-200 border border-amber-300 rounded-lg shadow-2xs transition-all cursor-pointer active:scale-95 disabled:opacity-50"
+                            title="Synchroniser et actualiser à l'instant tout le tableau de chargement"
                           >
-                            <Eye size={13} />
+                            <RefreshCw size={13} className={isInstantSyncing ? "animate-spin text-amber-700" : "text-amber-700"} />
+                            {isInstantSyncing ? "Actualisation..." : "Actualiser à l'instant"}
                           </button>
-                        </td>
-                      );
+                        )}
+                        <a
+                          className="sheet-link"
+                          href={VEHICLE_SHEET_URL}
+                          rel="noreferrer"
+                          target="_blank"
+                        >
+                          Google Sheets
+                        </a>
+                        <span
+                          className={`sheet-state sheet-state-${sheetStatus}`}
+                          title={sheetError}
+                        >
+                          {sheetStatus === "loading"
+                            ? "Chargement"
+                            : sheetStatus === "ready"
+                              ? "Connecté"
+                              : "Secours"}
+                        </span>
+                        <span className="panel-total">{filteredRows.length}</span>
+                      </div>
+                    </div>
+
+                    {/* Bannière de notification des transferts pour Chef d'Équipe */}
+                    {role === "chef_equipe" && incomingTransfers.length > 0 && (
+                      <div className="mx-6 mt-4 mb-2 p-4 bg-gradient-to-r from-amber-500/15 via-orange-500/10 to-amber-500/15 border-2 border-amber-400 rounded-2xl shadow-sm flex flex-wrap items-center justify-between gap-4">
+                        <div className="flex items-center gap-3">
+                          <div className="p-2.5 bg-amber-500 text-white rounded-xl shadow-sm animate-bounce shrink-0">
+                            <Bell size={20} />
+                          </div>
+                          <div>
+                            <div className="flex items-center gap-2">
+                              <h3 className="text-sm font-black text-amber-950">
+                                {incomingTransfers.length} {incomingTransfers.length > 1 ? "nouveaux travaux transférés reçus" : "nouveau travail transféré reçu"}
+                              </h3>
+                              <span className="px-2 py-0.5 text-[10px] font-black bg-amber-200 text-amber-900 rounded-full border border-amber-300">
+                                Action requise
+                              </span>
+                            </div>
+                            <p className="text-xs text-amber-800 mt-0.5">
+                              Des véhicules ont été envoyés à votre équipe ({activeChefEquipeTeam}). Acceptez le travail pour affecter immédiatement un technicien.
+                            </p>
+                          </div>
+                        </div>
+
+                        <div className="flex flex-wrap items-center gap-2">
+                          {incomingTransfers.map((v) => {
+                            const fromTeam = getOriginTeam(v);
+                            return (
+                              <div
+                                key={v.id}
+                                className="flex items-center gap-2 px-3 py-1.5 bg-white rounded-xl border border-amber-300 shadow-2xs"
+                              >
+                                <span className="text-xs font-bold text-slate-900 font-mono">
+                                  {v.serie || v.no}
+                                </span>
+                                <span className="text-[11px] text-slate-600">
+                                  (de <strong className="text-slate-800">{fromTeam}</strong>)
+                                </span>
+                                <button
+                                  type="button"
+                                  onClick={() => handleAcceptTransfer(v)}
+                                  className="inline-flex items-center gap-1.5 px-3 py-1 bg-emerald-600 hover:bg-emerald-700 active:scale-95 text-white rounded-lg text-xs font-bold shadow-2xs transition-all cursor-pointer"
+                                  title="Accepter le travail et affecter un technicien"
+                                >
+                                  <UserCheck size={13} />
+                                  <span>Accepter le travail</span>
+                                </button>
+                              </div>
+                            );
+                          })}
+
+                          {allTransferredToMyTeam.some((v) => isEnCours(v.etatIntervention, v.avancement, v.technicien)) && (
+                            <button
+                              type="button"
+                              onClick={() => {
+                                setActiveTab("en_cours");
+                                setActiveFilter("En cours");
+                                setEnCoursTransferOnly(true);
+                              }}
+                              className="inline-flex items-center gap-1.5 px-3 py-1 bg-amber-100 hover:bg-amber-200 active:scale-95 text-amber-900 rounded-lg text-xs font-bold transition-all cursor-pointer border border-amber-300 shadow-2xs"
+                              title="Voir les travaux transférés déjà acceptés et en cours d'intervention"
+                            >
+                              <ArrowRightLeft size={13} />
+                              <span>Voir les transferts acceptés ({allTransferredToMyTeam.filter((v) => isEnCours(v.etatIntervention, v.avancement, v.technicien)).length})</span>
+                            </button>
+                          )}
+                        </div>
+                      </div>
+                    )}
+
+                    <div className="table-controls">
+                      <label className="search-shell">
+                        <Search size={14} />
+                        <input
+                          onChange={(event) => setSearch(event.target.value)}
+                          placeholder="Rechercher OR, CS, client, chassis..."
+                          type="search"
+                          value={search}
+                        />
+                      </label>
+
+                      <label className="state-filter date-filter">
+                        <span>Date</span>
+                        <select
+                          aria-label="Filtrer par date d'entrée"
+                          onChange={(event) => {
+                            setDateFilter(event.target.value);
+                            setSelectedZone(null);
+                            setSelectedVehicleId(null);
+                            setIsDetailPinned(false);
+                          }}
+                          value={dateFilter}
+                        >
+                          <option value={ALL_DATES}>Toutes</option>
+                          {dateOptions.map((date) => (
+                            <option key={date} value={date}>
+                              {date}
+                            </option>
+                          ))}
+                        </select>
+                      </label>
+
+                      {activeTab === "en_cours" ? (
+                        <div className="flex flex-wrap items-center gap-2">
+                          <div className="state-filter flex items-center gap-1.5 px-3 py-1.5 bg-blue-50 border border-blue-200 rounded-lg text-xs font-semibold text-blue-800 shadow-2xs">
+                            <span className="text-slate-500 font-normal">Etat :</span>
+                            <span className="flex items-center gap-1">
+                              <span className="w-2 h-2 rounded-full bg-blue-600 animate-pulse"></span>
+                              En cours
+                            </span>
+                          </div>
+
+                          {role === "chef_equipe" && (
+                            <div className="flex items-center gap-1 bg-slate-100 p-0.5 rounded-lg border border-slate-200">
+                              <button
+                                type="button"
+                                onClick={() => setEnCoursTransferOnly(false)}
+                                className={`px-2.5 py-1 text-xs font-bold rounded-md transition-all cursor-pointer ${!enCoursTransferOnly
+                                    ? "bg-white text-blue-700 shadow-2xs"
+                                    : "text-slate-600 hover:text-slate-900"
+                                  }`}
+                              >
+                                Tous ({vehicles.filter((v) => isEnCours(v.etatIntervention, v.avancement, v.technicien) && isVehicleMatchingTeam(v.equipe || "", activeChefEquipeTeam)).length})
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => setEnCoursTransferOnly(true)}
+                                className={`px-2.5 py-1 text-xs font-bold rounded-md transition-all cursor-pointer flex items-center gap-1 ${enCoursTransferOnly
+                                    ? "bg-amber-500 text-white shadow-2xs"
+                                    : "text-slate-600 hover:text-slate-900"
+                                  }`}
+                                title="Afficher uniquement les travaux reçus par transfert d'une autre équipe"
+                              >
+                                <ArrowRightLeft size={12} />
+                                <span>Transférés reçus ({allTransferredToMyTeam.filter((v) => isEnCours(v.etatIntervention, v.avancement, v.technicien)).length})</span>
+                              </button>
+                            </div>
+                          )}
+                        </div>
+                      ) : role === "chef_equipe" ? (
+                        <div className="state-filter flex items-center gap-1.5 px-3 py-1.5 bg-amber-50 border border-amber-200 rounded-lg text-xs font-semibold text-amber-800 shadow-2xs">
+                          <span className="text-slate-500 font-normal">Etat :</span>
+                          <span className="flex items-center gap-1">
+                            <span className="w-2 h-2 rounded-full bg-amber-600"></span>
+                            Attente Réparation
+                          </span>
+                        </div>
+                      ) : (
+                        <label className="state-filter">
+                          <span>Etat</span>
+                          <select
+                            aria-label="Filtrer par état"
+                            onChange={(event) => {
+                              setActiveFilter(event.target.value as StatusFilter);
+                              setSelectedZone(null);
+                              setSelectedVehicleId(null);
+                              setIsDetailPinned(false);
+                            }}
+                            value={activeFilter}
+                          >
+                            {tableStatusOptions.map((option) => (
+                              <option key={option.value} value={option.value}>
+                                {option.label}
+                              </option>
+                            ))}
+                          </select>
+                        </label>
+                      )}
+                    </div>
+
+                    {sheetStatus === "fallback" && (
+                      <div className="table-alert">
+                        Google Sheets n'est pas accessible. Partage la feuille en lecture
+                        avec toute personne ayant le lien.
+                      </div>
+                    )}
+
+                    {sheetStatus === "ready" && missingMapZones.length > 0 && (
+                      <div className="table-alert table-alert-info">
+                        Emplacements absents du plan:{" "}
+                        {missingMapZones.slice(0, 8).join(", ")}
+                        {missingMapZones.length > 8 ? "..." : ""}
+                      </div>
+                    )}
+
+                    {!canWriteToSheet && !writeError && (
+                      <div className="table-alert table-alert-info">
+                        Écriture Sheets à configurer: déploie le script Apps Script puis
+                        ajoute VITE_SHEET_WRITE_URL dans .env.local.
+                      </div>
+                    )}
+
+                    {writeError && (
+                      <div className="table-alert">{writeError}</div>
+                    )}
+
+                    {writeNotice && (
+                      <div className="table-alert table-alert-success">
+                        {writeNotice}
+                      </div>
+                    )}
+
+                    <datalist id="atelier-zone-options">
+                      {editableMapZoneIds.map((zone) => (
+                        <option key={zone} value={zone} />
+                      ))}
+                    </datalist>
+
+                    {(() => {
+                      const isChefEquipeChargement = activeTab === "chargement" && role === "chef_equipe";
+                      const isEnCoursTab = activeTab === "en_cours";
 
                       return (
-                        <tr
-                          className={`${
-                            selectedVehicleId === row.id ? "table-row-selected" : ""
-                          } ${isTransferPending ? "bg-amber-50/40 border-l-4 border-l-amber-500" : ""}`.trim()}
-                          key={row.id}
-                          onClick={() => {
-                            setSelectedVehicleId(row.id);
-                            setSelectedZone(row.emplacement);
-                            setIsDetailPinned(true);
-                          }}
-                          onMouseEnter={() => {
-                            if (isDetailPinned) return;
+                        <div className="table-scroll">
+                          <table
+                            className={`monitor-table vehicle-detail-table ${isChefEquipeChargement
+                                ? "table-chargement-chef"
+                                : isEnCoursTab
+                                  ? "table-encours"
+                                  : ""
+                              }`}
+                          >
+                            {isChefEquipeChargement ? (
+                              <colgroup>
+                                <col className="col-or" />
+                                <col className="col-client" />
+                                <col className="col-marque" />
+                                <col className="col-modele" />
+                                <col className="col-chassis" />
+                                <col className="col-state" />
+                                <col className="col-emplacement" />
+                                <col className="col-action" />
+                              </colgroup>
+                            ) : isEnCoursTab ? (
+                              <colgroup>
+                                <col className="col-or" />
+                                <col className="col-client" />
+                                <col className="col-marque" />
+                                <col className="col-modele" />
+                                <col className="col-chassis" />
+                                <col className={role === "chef_equipe" ? "col-immat" : "col-state"} />
+                                <col className="col-tech" />
+                                <col className="col-tech-name" />
+                                {role !== "chef_equipe" && <col className="col-team" />}
+                                <col className="col-avancement" />
+                                <col className="col-emplacement" />
+                                <col className="col-action" />
+                              </colgroup>
+                            ) : (
+                              <colgroup>
+                                <col className="col-or" />
+                                <col className="col-cs" />
+                                <col className="col-client" />
+                                <col className="col-date" />
+                                <col className="col-time" />
+                                <col className="col-marque" />
+                                <col className="col-modele" />
+                                <col className="col-chassis" />
+                                <col className="col-categorie" />
+                                <col className="col-tech" />
+                                <col className="col-tech-name" />
+                                <col className="col-team" />
+                                <col className="col-avancement" />
+                                <col className="col-state" />
+                                <col className="col-emplacement" />
+                                <col className="col-action" />
+                              </colgroup>
+                            )}
 
-                            setSelectedVehicleId(row.id);
-                            setSelectedZone(row.emplacement);
-                          }}
-                          onMouseLeave={hideVehicleDetails}
-                        >
-                          {/* CAS 1 : Tableaux de chargement (Attente Réparation) pour Chef d'Équipe */}
-                          {isChefEquipeChargement ? (
-                            <>
-                              <td>{displayText(row.l2n2500 || row.no)}</td>
-                              <td title={row.client}>{displayText(row.client)}</td>
-                              <td>{displayText(row.marque)}</td>
-                              <td title={row.modele || row.modelePowerBI}>{displayText(row.modele || row.modelePowerBI)}</td>
-                              <td title={row.chassis}>{displayText(row.chassis)}</td>
-                              {renderCellEtat()}
-                              {renderCellEmplacement()}
-                              {renderCellFiche()}
-                            </>
-                          ) : isEnCoursTab ? (
-                            /* CAS 2 : Interventions En cours (OR, Client, Marque, Modèle, N° Chassis, Etat, Tech, Nom Tech, Avancement, Emplacement, Fiche) */
-                            <>
-                              <td>
-                                <div className="flex items-center gap-1.5 flex-wrap">
-                                  <span>{displayText(row.l2n2500 || row.no)}</span>
-                                  {(Boolean(row.bloc && row.bloc > 1) || Boolean(row.equipe1 && row.equipe1 !== "-" && normalizeTeamName(row.equipe1) !== normalizeTeamName(activeChefEquipeTeam || ""))) && (
-                                    <span
-                                      className="inline-flex items-center gap-0.5 px-1.5 py-0.5 rounded text-[10px] font-bold bg-amber-100 text-amber-900 border border-amber-300"
-                                      title={`Travail transféré depuis : ${getOriginTeam(row)}`}
-                                    >
-                                      <ArrowRightLeft size={10} />
-                                      <span>de {getOriginTeam(row)}</span>
-                                    </span>
+                            <thead>
+                              {isChefEquipeChargement ? (
+                                <tr>
+                                  <th>OR</th>
+                                  <th>Client</th>
+                                  <th>Marque</th>
+                                  <th>Modèle</th>
+                                  <th>N° Chassis</th>
+                                  <th>Etat</th>
+                                  <th>Emplacement</th>
+                                  <th>Fiche</th>
+                                </tr>
+                              ) : isEnCoursTab ? (
+                                <tr>
+                                  <th>OR</th>
+                                  <th>Client</th>
+                                  <th>Marque</th>
+                                  <th>Modèle</th>
+                                  <th>N° Chassis</th>
+                                  {role === "chef_equipe" ? (
+                                    <th>Matricule</th>
+                                  ) : (
+                                    <th>Etat</th>
                                   )}
-                                </div>
-                              </td>
-                              <td title={row.client}>{displayText(row.client)}</td>
-                              <td>{displayText(row.marque)}</td>
-                              <td title={row.modele || row.modelePowerBI}>{displayText(row.modele || row.modelePowerBI)}</td>
-                              <td title={row.chassis}>{displayText(row.chassis)}</td>
-                              {renderCellEtat()}
-                              {renderCellTech()}
-                              {renderCellNomTech()}
-                              {role !== "chef_equipe" && renderCellEquipe()}
-                              {renderCellAvancement()}
-                              {renderCellEmplacement()}
-                              {renderCellFiche()}
-                            </>
-                          ) : (
-                            /* CAS 3 : Tableaux de chargement complet (Tous les véhicules) - 16 colonnes */
-                            <>
-                              <td>{displayText(row.l2n2500 || row.no)}</td>
-                              <td>{displayText(row.cs)}</td>
-                              <td title={row.client}>{displayText(row.client)}</td>
-                              <td>{displayText(row.dateEntree)}</td>
-                              <td>{displayText(row.heureEntree)}</td>
-                              <td>{displayText(row.marque)}</td>
-                              <td title={row.modele || row.modelePowerBI}>{displayText(row.modele || row.modelePowerBI)}</td>
-                              <td title={row.chassis}>{displayText(row.chassis)}</td>
-                              <td>{displayText(row.categorie)}</td>
-                              {renderCellTech()}
-                              {renderCellNomTech()}
-                              {renderCellEquipe()}
-                              {renderCellAvancement()}
-                              {renderCellEtat()}
-                              {renderCellEmplacement()}
-                              {renderCellFiche()}
-                            </>
-                          )}
-                        </tr>
+                                  <th>Technicien</th>
+                                  <th>NOM DE Technicien</th>
+                                  {role !== "chef_equipe" && <th>Équipe</th>}
+                                  <th>Avancement</th>
+                                  <th>Emplacement</th>
+                                  <th>Fiche</th>
+                                </tr>
+                              ) : (
+                                <tr>
+                                  <th>OR</th>
+                                  <th>CS</th>
+                                  <th>Client</th>
+                                  <th>Date Entrée</th>
+                                  <th>Heure Entrée</th>
+                                  <th>Marque</th>
+                                  <th>Modèle</th>
+                                  <th>N° Chassis</th>
+                                  <th>Catégorie</th>
+                                  <th>Technicien</th>
+                                  <th>NOM DE Technicien</th>
+                                  <th>Équipe</th>
+                                  <th>Avancement</th>
+                                  <th>Etat</th>
+                                  <th>Emplacement</th>
+                                  <th>Fiche</th>
+                                </tr>
+                              )}
+                            </thead>
+
+                            <tbody>
+                              {filteredRows.map((row) => {
+                                const draftValue =
+                                  draftEmplacements[row.id] ?? row.emplacement;
+                                const normalizedDraft =
+                                  normalizeSheetEmplacement(draftValue);
+                                const hasDraftChange =
+                                  normalizedDraft !== row.emplacement;
+                                const isSaving = savingVehicleId === row.id;
+                                const hasEditableStatus = editableStatusSet.has(
+                                  row.etatIntervention
+                                );
+
+                                const teamForOptions =
+                                  row.equipe && row.equipe !== "-"
+                                    ? row.equipe
+                                    : activeChefEquipeTeam || "Daily1";
+                                const allowedAvancementOptions =
+                                  getAvancementOptionsForTeam(teamForOptions, row);
+                                const pct = parseAvancementPct(row.avancement);
+                                const reaff = getReaffectationForVehicle(row);
+                                const isReaffActive = Boolean(reaff && !reaff.isRepris);
+
+                                const isTransferPending =
+                                  Boolean(row.bloc && row.bloc > 1) &&
+                                  (!row.technicien || row.technicien === "-") &&
+                                  normalizeTeamName(row.equipe || "") === normalizeTeamName(activeChefEquipeTeam || "");
+
+                                // Sous-blocs réutilisables de cellules
+                                const renderCellEtat = () => (
+                                  <td>
+                                    <div className="flex items-center gap-1.5">
+                                      <select
+                                        aria-label={`Modifier Etat ${row.no}`}
+                                        className="state-editor"
+                                        disabled={isSaving || !permissions.canEditEtat}
+                                        title={!permissions.canEditEtat ? "Modification de l'état réservée au Chef Atelier ou Chef d'équipe" : undefined}
+                                        onChange={(event) => {
+                                          const nextEtat = event.target.value as WorkshopStatus;
+                                          if (nextEtat === "En cours") {
+                                            setPendingEnCoursVehicle(row);
+                                            setIsOnlyTechChange(false);
+                                            setIsTechModalOpen(true);
+                                          } else {
+                                            void saveVehicleEtat(row, nextEtat);
+                                          }
+                                        }}
+                                        onFocus={() => {
+                                          setSelectedVehicleId(row.id);
+                                          setSelectedZone(row.emplacement);
+                                        }}
+                                        style={badgeStyle(row.etatIntervention)}
+                                        value={row.etatIntervention}
+                                      >
+                                        {!hasEditableStatus && (
+                                          <option hidden value={row.etatIntervention}>
+                                            {formatStatusLabel(row.etatIntervention)}
+                                          </option>
+                                        )}
+
+                                        {editableStatusOptions.map((status) => (
+                                          <option key={status} value={status}>
+                                            {status}
+                                          </option>
+                                        ))}
+                                      </select>
+
+                                      {permissions.canEditEtat && isAttenteReparation(row.etatIntervention) && (
+                                        <button
+                                          type="button"
+                                          onClick={() => {
+                                            setPendingEnCoursVehicle(row);
+                                            setIsOnlyTechChange(false);
+                                            setIsTechModalOpen(true);
+                                          }}
+                                          className="inline-flex items-center gap-1 px-2.5 py-1 text-[11px] font-bold text-white bg-blue-600 hover:bg-blue-700 active:scale-95 rounded-lg shadow-2xs transition-all cursor-pointer whitespace-nowrap shrink-0"
+                                          title="Affecter un technicien de l'équipe et passer En cours"
+                                        >
+                                          <Play size={10} className="fill-white" />
+                                          <span>En cours</span>
+                                        </button>
+                                      )}
+                                    </div>
+                                  </td>
+                                );
+
+                                const renderCellTech = () => (
+                                  <td
+                                    className={permissions.canEditEtat ? "cursor-pointer hover:bg-blue-50/70 transition-colors" : ""}
+                                    onClick={() => {
+                                      if (!permissions.canEditEtat) return;
+                                      if (isTransferPending) {
+                                        handleAcceptTransfer(row);
+                                      } else {
+                                        setPendingEnCoursVehicle(row);
+                                        setIsOnlyTechChange(true);
+                                        setIsTechModalOpen(true);
+                                      }
+                                    }}
+                                    title={permissions.canEditEtat ? (isTransferPending ? "Transfert reçu : Cliquez pour choisir le technicien" : "Cliquer pour affecter ou modifier le technicien") : undefined}
+                                  >
+                                    {isTransferPending ? (
+                                      <span className="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-extrabold bg-amber-100 text-amber-900 border border-amber-300">
+                                        À affecter
+                                      </span>
+                                    ) : (
+                                      <span className="font-mono font-semibold text-slate-800">
+                                        {displayText(row.technicien)}
+                                      </span>
+                                    )}
+                                  </td>
+                                );
+
+                                const renderCellNomTech = () => {
+                                  if (isTransferPending && permissions.canEditEtat) {
+                                    return (
+                                      <td
+                                        className="cursor-pointer bg-amber-50/80 hover:bg-amber-100 transition-colors"
+                                        onClick={() => handleAcceptTransfer(row)}
+                                        title="Transfert reçu : Cliquez pour affecter un technicien de votre équipe"
+                                      >
+                                        <div className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md text-[10px] font-bold bg-amber-200 text-amber-950 border border-amber-300 shadow-2xs animate-pulse whitespace-nowrap">
+                                          <UserCheck size={11} className="text-amber-800 shrink-0" />
+                                          <span>Choisir Tech</span>
+                                        </div>
+                                      </td>
+                                    );
+                                  }
+
+                                  return (
+                                    <td
+                                      title={row.nomTechnicien || (permissions.canEditEtat ? "Cliquer pour affecter ou modifier le technicien" : undefined)}
+                                      className={permissions.canEditEtat ? "cursor-pointer hover:bg-blue-50/70 transition-colors" : ""}
+                                      onClick={() => {
+                                        if (!permissions.canEditEtat) return;
+                                        setPendingEnCoursVehicle(row);
+                                        setIsOnlyTechChange(true);
+                                        setIsTechModalOpen(true);
+                                      }}
+                                    >
+                                      <div className="flex flex-col gap-0.5">
+                                        <div className="flex items-center justify-between gap-1">
+                                          <span className="truncate">{displayText(row.nomTechnicien)}</span>
+                                          {permissions.canEditEtat && (
+                                            <Wrench size={11} className="text-slate-300 hover:text-blue-600 shrink-0" />
+                                          )}
+                                        </div>
+                                        {isReaffActive && (
+                                          <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-bold bg-fuchsia-100 text-fuchsia-800 border border-fuchsia-300 w-fit">
+                                            <Clock size={10} className="text-fuchsia-700 shrink-0" />
+                                            <span>Réaffecté ({reaff?.dateReaffectation.split(" ")[1] || "fait"})</span>
+                                          </span>
+                                        )}
+                                      </div>
+                                    </td>
+                                  );
+                                };
+
+                                const renderCellEquipe = () => (
+                                  <td>
+                                    <div className="flex flex-wrap items-center gap-1">
+                                      {row.equipe && row.equipe !== "-" ? (
+                                        <span
+                                          className={`inline-flex items-center px-2 py-0.5 rounded-md text-[11px] font-bold border ${row.equipe.toLowerCase().includes("daily1")
+                                              ? "bg-blue-50 text-blue-700 border-blue-200"
+                                              : row.equipe.toLowerCase().includes("daily2")
+                                                ? "bg-teal-50 text-teal-700 border-teal-200"
+                                                : row.equipe.toLowerCase().includes("changan")
+                                                  ? "bg-amber-50 text-amber-700 border-amber-200"
+                                                  : "bg-slate-100 text-slate-700 border-slate-200"
+                                            }`}
+                                        >
+                                          {row.equipe}
+                                        </span>
+                                      ) : (
+                                        <span className="text-slate-400">-</span>
+                                      )}
+                                      {Boolean(row.bloc && row.bloc > 1) && (
+                                        <span
+                                          className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-bold bg-amber-100 text-amber-900 border border-amber-300"
+                                          title={`Travail transféré depuis : ${getOriginTeam(row)}`}
+                                        >
+                                          <ArrowRightLeft size={10} />
+                                          <span>de {getOriginTeam(row)}</span>
+                                        </span>
+                                      )}
+                                    </div>
+                                  </td>
+                                );
+
+                                const canModifyAvancement =
+                                  permissions.canEditEtat ||
+                                  permissions.canEditAvancement;
+
+                                const renderCellAvancement = () => {
+                                  const techBusyCar = (row.technicien && row.technicien !== "-") || (row.nomTechnicien && row.nomTechnicien !== "-")
+                                    ? getActiveVehicleForTech(row.technicien || "", row.nomTechnicien || "", vehicles, row.id, row.no, reaffectationsMap)
+                                    : undefined;
+
+                                  return (
+                                    <td>
+                                      {canModifyAvancement ? (
+                                        <div className="flex flex-col gap-1 min-w-[140px] max-w-[170px]">
+                                          <select
+                                            aria-label={`Modifier Avancement ${row.no}`}
+                                            className="avancement-editor"
+                                            disabled={isSaving || !canModifyAvancement}
+                                            style={getAvancementStyle(row.avancement)}
+                                            value={row.avancement && row.avancement !== "-" ? row.avancement : "-"}
+                                            onChange={(e) => void saveVehicleAvancement(row, e.target.value)}
+                                            title="Avancement - Choisissez l'avancement"
+                                          >
+                                            {(!row.avancement || row.avancement === "-") && (
+                                              <option value="-">- Définir -</option>
+                                            )}
+                                            {row.avancement &&
+                                              row.avancement !== "-" &&
+                                              !allowedAvancementOptions.includes(row.avancement) && (
+                                                <option value={row.avancement}>{row.avancement}</option>
+                                              )}
+                                            {allowedAvancementOptions.map((opt) => {
+                                              const isEnCoursOpt = opt.startsWith("En cours") || opt.includes("%") || opt.startsWith("vr");
+                                              const isOptDisabled = Boolean(techBusyCar && isEnCoursOpt);
+                                              return (
+                                                <option
+                                                  key={opt}
+                                                  value={opt}
+                                                  disabled={isOptDisabled}
+                                                  title={isOptDisabled ? `Technicien actuellement occupé sur OR ${techBusyCar?.no || techBusyCar?.serie || techBusyCar?.id}` : undefined}
+                                                >
+                                                  {opt} {isOptDisabled ? "(⛔ Tech. occupé)" : ""}
+                                                </option>
+                                              );
+                                            })}
+                                          </select>
+                                          {pct !== null && (
+                                            <div className="w-full h-1.5 bg-slate-100 rounded-full overflow-hidden border border-slate-200/60">
+                                              <div
+                                                className={`h-full rounded-full transition-all duration-300 ${pct === 100
+                                                    ? "bg-emerald-500"
+                                                    : pct > 40
+                                                      ? "bg-blue-500"
+                                                      : "bg-amber-500"
+                                                  }`}
+                                                style={{ width: `${pct}%` }}
+                                              />
+                                            </div>
+                                          )}
+                                          {isReaffActive && (
+                                            <div className={`mt-1 flex flex-col gap-1 p-1.5 rounded text-[10px] border ${
+                                              techBusyCar ? "bg-amber-50/80 border-amber-200" : "bg-fuchsia-50 border-fuchsia-200"
+                                            }`}>
+                                              <span className={`font-bold flex items-center gap-1 ${
+                                                techBusyCar ? "text-amber-900" : "text-fuchsia-900"
+                                              }`}>
+                                                <Clock size={11} className={techBusyCar ? "text-amber-700 shrink-0" : "text-fuchsia-700 shrink-0"} />
+                                                <span>Réaffecté : {reaff?.dateReaffectation}</span>
+                                              </span>
+                                              {techBusyCar ? (
+                                                <div className="flex flex-col gap-1">
+                                                  <div
+                                                    className="text-[9px] font-bold text-amber-900 bg-amber-100/90 px-1.5 py-0.5 rounded border border-amber-300 flex items-center gap-1 truncate"
+                                                    title={`Occupé sur OR ${techBusyCar.no || techBusyCar.serie || techBusyCar.id} (${techBusyCar.marque || ""})`}
+                                                  >
+                                                    <AlertTriangle size={10} className="text-amber-700 shrink-0" />
+                                                    <span className="truncate">
+                                                      {row.nomTechnicien || row.technicien} : Occupé sur OR {techBusyCar.no || techBusyCar.serie || techBusyCar.id}
+                                                    </span>
+                                                  </div>
+                                                  <button
+                                                    type="button"
+                                                    disabled={true}
+                                                    className="inline-flex items-center justify-center gap-1 px-2 py-1 font-bold text-slate-400 bg-slate-200 rounded text-[10px] cursor-not-allowed opacity-80"
+                                                    title={`Le technicien ${row.nomTechnicien || row.technicien} est actuellement occupé sur l'OR ${techBusyCar.no || techBusyCar.serie || techBusyCar.id}. Il doit terminer ce véhicule avant de pouvoir reprendre ce travail.`}
+                                                  >
+                                                    <Play size={9} className="fill-slate-400 text-slate-400" />
+                                                    <span>Reprendre (Technicien occupé)</span>
+                                                  </button>
+                                                </div>
+                                              ) : (
+                                                <button
+                                                  type="button"
+                                                  onClick={() => void handleReprendreTravail(row)}
+                                                  className="inline-flex items-center justify-center gap-1 px-2 py-1 font-bold text-white bg-fuchsia-600 hover:bg-fuchsia-700 active:scale-95 rounded text-[10px] shadow-2xs transition-all cursor-pointer"
+                                                  title="Cliquer pour reprendre le travail et enregistrer l'heure de reprise"
+                                                >
+                                                  <Play size={9} className="fill-white" />
+                                                  <span>Reprendre le travail</span>
+                                                </button>
+                                              )}
+                                            </div>
+                                          )}
+                                          {reaff && reaff.isRepris && (
+                                            <div className="mt-0.5 text-[9px] text-slate-500 font-medium flex items-center gap-1">
+                                              <CheckCircle2 size={10} className="text-emerald-600 shrink-0" />
+                                              <span>Repris le : {reaff.dateReprise}</span>
+                                            </div>
+                                          )}
+                                        </div>
+                                      ) : row.avancement && row.avancement !== "-" ? (
+                                        <div className="flex flex-col gap-1 min-w-[120px] max-w-[150px]">
+                                          <div className="flex items-center justify-between gap-1">
+                                            <span
+                                              className={`inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-bold border truncate max-w-[95px] ${row.avancement.toLowerCase().includes("termin")
+                                                  ? "bg-emerald-50 text-emerald-700 border-emerald-200"
+                                                  : row.avancement.toLowerCase().includes("devis")
+                                                    ? "bg-orange-50 text-orange-700 border-orange-200"
+                                                    : row.avancement.toLowerCase().includes("cours")
+                                                      ? "bg-blue-50 text-blue-700 border-blue-200"
+                                                      : "bg-slate-100 text-slate-700 border-slate-200"
+                                                }`}
+                                              title={row.avancement}
+                                            >
+                                              {row.avancement}
+                                            </span>
+                                            {pct !== null && (
+                                              <span className="text-[10px] font-black text-slate-500 font-mono shrink-0">
+                                                {pct}%
+                                              </span>
+                                            )}
+                                          </div>
+                                          {pct !== null && (
+                                            <div className="w-full h-1 bg-slate-100 rounded-full overflow-hidden border border-slate-200/50">
+                                              <div
+                                                className={`h-full rounded-full transition-all duration-300 ${pct === 100
+                                                    ? "bg-emerald-500"
+                                                    : pct > 40
+                                                      ? "bg-blue-500"
+                                                      : "bg-amber-500"
+                                                  }`}
+                                                style={{ width: `${pct}%` }}
+                                              />
+                                            </div>
+                                          )}
+                                          {isReaffActive && (
+                                            <div className={`mt-1 flex flex-col gap-1 p-1.5 rounded text-[10px] border ${
+                                              techBusyCar ? "bg-amber-50/80 border-amber-200" : "bg-fuchsia-50 border-fuchsia-200"
+                                            }`}>
+                                              <span className={`font-bold flex items-center gap-1 ${
+                                                techBusyCar ? "text-amber-900" : "text-fuchsia-900"
+                                              }`}>
+                                                <Clock size={11} className={techBusyCar ? "text-amber-700 shrink-0" : "text-fuchsia-700 shrink-0"} />
+                                                <span>Réaffecté : {reaff?.dateReaffectation}</span>
+                                              </span>
+                                              {techBusyCar ? (
+                                                <div className="text-[9px] font-bold text-amber-900 bg-amber-100/90 px-1.5 py-0.5 rounded border border-amber-300 flex items-center gap-1">
+                                                  <AlertTriangle size={10} className="text-amber-700 shrink-0" />
+                                                  <span className="truncate">
+                                                    {row.nomTechnicien || row.technicien} : Occupé sur OR {techBusyCar.no || techBusyCar.serie || techBusyCar.id}
+                                                  </span>
+                                                </div>
+                                              ) : (
+                                                <button
+                                                  type="button"
+                                                  onClick={() => void handleReprendreTravail(row)}
+                                                  className="inline-flex items-center justify-center gap-1 px-2 py-1 font-bold text-white bg-fuchsia-600 hover:bg-fuchsia-700 active:scale-95 rounded text-[10px] shadow-2xs transition-all cursor-pointer"
+                                                  title="Cliquer pour reprendre le travail"
+                                                >
+                                                  <Play size={9} className="fill-white" />
+                                                  <span>Reprendre le travail</span>
+                                                </button>
+                                              )}
+                                            </div>
+                                          )}
+                                          {reaff && reaff.isRepris && (
+                                            <div className="mt-0.5 text-[9px] text-slate-500 font-medium flex items-center gap-1">
+                                              <CheckCircle2 size={10} className="text-emerald-600 shrink-0" />
+                                              <span>Repris : {reaff.dateReprise}</span>
+                                            </div>
+                                          )}
+                                        </div>
+                                      ) : (
+                                        <div className="flex flex-col gap-0.5">
+                                          <span className="text-slate-400 text-xs font-semibold">-</span>
+                                          {isReaffActive && (
+                                            <span className="text-[10px] text-fuchsia-800 font-bold">
+                                              Réaffecté : {reaff?.dateReaffectation}
+                                            </span>
+                                          )}
+                                        </div>
+                                      )}
+                                    </td>
+                                  );
+                                };
+
+                                const renderCellEmplacement = () => (
+                                  <td>
+                                    <div className="emplacement-editor">
+                                      <input
+                                        aria-label={`Modifier emplacement ${row.no}`}
+                                        disabled={isSaving || !permissions.canEditEmplacement}
+                                        title={!permissions.canEditEmplacement ? "Modification de l'emplacement réservée au Chef Atelier ou Chef d'équipe" : undefined}
+                                        list="atelier-zone-options"
+                                        onBlur={(event) => {
+                                          const nextValue = event.currentTarget.value;
+                                          if (
+                                            normalizeSheetEmplacement(nextValue) !==
+                                            row.emplacement
+                                          ) {
+                                            void saveVehicleEmplacement(row, nextValue);
+                                          }
+                                        }}
+                                        onChange={(event) => {
+                                          const nextValue = normalizeSheetEmplacement(
+                                            event.target.value
+                                          );
+                                          setDraftEmplacements((current) => ({
+                                            ...current,
+                                            [row.id]: nextValue,
+                                          }));
+                                        }}
+                                        onFocus={() => {
+                                          setSelectedVehicleId(row.id);
+                                          setSelectedZone(row.emplacement);
+                                        }}
+                                        onKeyDown={(event) => {
+                                          if (event.key === "Enter") {
+                                            event.preventDefault();
+                                            void saveVehicleEmplacement(
+                                              row,
+                                              event.currentTarget.value
+                                            );
+                                          }
+                                          if (event.key === "Escape") {
+                                            event.preventDefault();
+                                            setDraftEmplacements((current) =>
+                                              removeDraft(current, row.id)
+                                            );
+                                          }
+                                        }}
+                                        value={draftValue}
+                                      />
+
+                                      <button
+                                        aria-label={`Enregistrer emplacement ${row.no}`}
+                                        className="emplacement-save"
+                                        disabled={!hasDraftChange || isSaving || !permissions.canEditEmplacement}
+                                        onClick={(event) => {
+                                          event.stopPropagation();
+                                          void saveVehicleEmplacement(row, draftValue);
+                                        }}
+                                        onMouseDown={(event) => {
+                                          event.preventDefault();
+                                        }}
+                                        title="Enregistrer emplacement"
+                                        type="button"
+                                      >
+                                        <Save size={12} />
+                                      </button>
+                                    </div>
+                                  </td>
+                                );
+
+                                const renderCellFiche = () => (
+                                  <td className="text-center">
+                                    <button
+                                      type="button"
+                                      onClick={(event) => {
+                                        event.stopPropagation();
+                                        setVehiculeModalData(row);
+                                      }}
+                                      className="p-1 rounded-lg text-emerald-600 hover:text-emerald-800 hover:bg-emerald-50 border border-emerald-200 transition-colors cursor-pointer"
+                                      title={`Voir la fiche détaillée et la condition du véhicule ${row.no}`}
+                                    >
+                                      <Eye size={13} />
+                                    </button>
+                                  </td>
+                                );
+
+                                return (
+                                  <tr
+                                    className={`${selectedVehicleId === row.id ? "table-row-selected" : ""
+                                      } ${isTransferPending ? "bg-amber-50/40 border-l-4 border-l-amber-500" : ""}`.trim()}
+                                    key={row.id}
+                                    onClick={() => {
+                                      setSelectedVehicleId(row.id);
+                                      setSelectedZone(row.emplacement);
+                                      setIsDetailPinned(true);
+                                    }}
+                                    onMouseEnter={() => {
+                                      if (isDetailPinned) return;
+
+                                      setSelectedVehicleId(row.id);
+                                      setSelectedZone(row.emplacement);
+                                    }}
+                                    onMouseLeave={hideVehicleDetails}
+                                  >
+                                    {/* CAS 1 : Tableaux de chargement (Attente Réparation) pour Chef d'Équipe */}
+                                    {isChefEquipeChargement ? (
+                                      <>
+                                        <td>{displayText(row.l2n2500 || row.no)}</td>
+                                        <td title={row.client}>{displayText(row.client)}</td>
+                                        <td>{displayText(row.marque)}</td>
+                                        <td title={row.modele || row.modelePowerBI}>{displayText(row.modele || row.modelePowerBI)}</td>
+                                        <td title={row.chassis}>{displayText(row.chassis)}</td>
+                                        {renderCellEtat()}
+                                        {renderCellEmplacement()}
+                                        {renderCellFiche()}
+                                      </>
+                                    ) : isEnCoursTab ? (
+                                      /* CAS 2 : Interventions En cours (OR, Client, Marque, Modèle, N° Chassis, Etat/Matricule, Tech, Nom Tech, Avancement, Emplacement, Fiche) */
+                                      <>
+                                        <td>
+                                          <div className="flex items-center gap-1.5 flex-wrap">
+                                            <span>{displayText(row.l2n2500 || row.no)}</span>
+                                            {(Boolean(row.bloc && row.bloc > 1) || Boolean(row.equipe1 && row.equipe1 !== "-" && normalizeTeamName(row.equipe1) !== normalizeTeamName(activeChefEquipeTeam || ""))) && (
+                                              <span
+                                                className="inline-flex items-center gap-0.5 px-1.5 py-0.5 rounded text-[10px] font-bold bg-amber-100 text-amber-900 border border-amber-300"
+                                                title={`Travail transféré depuis : ${getOriginTeam(row)}`}
+                                              >
+                                                <ArrowRightLeft size={10} />
+                                                <span>de {getOriginTeam(row)}</span>
+                                              </span>
+                                            )}
+                                          </div>
+                                        </td>
+                                        <td title={row.client}>{displayText(row.client)}</td>
+                                        <td>{displayText(row.marque)}</td>
+                                        <td title={row.modele || row.modelePowerBI}>{displayText(row.modele || row.modelePowerBI)}</td>
+                                        <td title={row.chassis}>{displayText(row.chassis)}</td>
+                                        {role === "chef_equipe" ? (
+                                          <td title={`Matricule: ${displayText(row.immatriculation || row.serie)}`}>
+                                            <span className="font-mono font-bold text-slate-800 text-xs px-2 py-0.5 rounded bg-slate-100 border border-slate-300/80">
+                                              {displayText(row.immatriculation || row.serie)}
+                                            </span>
+                                          </td>
+                                        ) : (
+                                          renderCellEtat()
+                                        )}
+                                        {renderCellTech()}
+                                        {renderCellNomTech()}
+                                        {role !== "chef_equipe" && renderCellEquipe()}
+                                        {renderCellAvancement()}
+                                        {renderCellEmplacement()}
+                                        {renderCellFiche()}
+                                      </>
+                                    ) : (
+                                      /* CAS 3 : Tableaux de chargement complet (Tous les véhicules) - 16 colonnes */
+                                      <>
+                                        <td>{displayText(row.l2n2500 || row.no)}</td>
+                                        <td>{displayText(row.cs)}</td>
+                                        <td title={row.client}>{displayText(row.client)}</td>
+                                        <td>{displayText(row.dateEntree)}</td>
+                                        <td>{displayText(row.heureEntree)}</td>
+                                        <td>{displayText(row.marque)}</td>
+                                        <td title={row.modele || row.modelePowerBI}>{displayText(row.modele || row.modelePowerBI)}</td>
+                                        <td title={row.chassis}>{displayText(row.chassis)}</td>
+                                        <td>{displayText(row.categorie)}</td>
+                                        {renderCellTech()}
+                                        {renderCellNomTech()}
+                                        {renderCellEquipe()}
+                                        {renderCellAvancement()}
+                                        {renderCellEtat()}
+                                        {renderCellEmplacement()}
+                                        {renderCellFiche()}
+                                      </>
+                                    )}
+                                  </tr>
+                                );
+                              })}
+
+                              {filteredRows.length === 0 && (
+                                <tr>
+                                  <td
+                                    colSpan={
+                                      isChefEquipeChargement
+                                        ? 8
+                                        : isEnCoursTab
+                                          ? role === "chef_equipe"
+                                            ? 11
+                                            : 12
+                                          : 16
+                                    }
+                                  >
+                                    <div className="table-empty">
+                                      Aucun véhicule pour ce filtre.
+                                    </div>
+                                  </td>
+                                </tr>
+                              )}
+                            </tbody>
+                          </table>
+                        </div>
                       );
-                    })}
+                    })()}
+                  </section>
+                </div>
+              </main>
 
-                    {filteredRows.length === 0 && (
-                      <tr>
-                        <td
-                          colSpan={
-                            isChefEquipeChargement
-                              ? 8
-                              : isEnCoursTab
-                              ? role === "chef_equipe"
-                                ? 11
-                                : 12
-                              : 16
-                          }
-                        >
-                          <div className="table-empty">
-                            Aucun véhicule pour ce filtre.
-                          </div>
-                        </td>
-                      </tr>
-                    )}
-                  </tbody>
-                </table>
-              </div>
-            );
-          })()}
-        </section>
-      </div>
-    </main>
-
-      <footer className="monitor-footer" aria-live="polite">
-        <span className="monitor-time">
-          Dernière mise à jour: {lastRefresh}
-        </span>
-      </footer>
-      </>
-      )}
+              <footer className="monitor-footer" aria-live="polite">
+                <span className="monitor-time">
+                  Dernière mise à jour: {lastRefresh}
+                </span>
+              </footer>
+            </>
+          )}
         </div>
       </div>
 
@@ -3692,25 +4738,33 @@ export default function Dashboard() {
         vehicule={
           vehiculeModalData
             ? {
-                noOr: vehiculeModalData.l2n2500 || vehiculeModalData.no || vehiculeModalData.ordre,
-                cs: vehiculeModalData.cs,
-                chassis: vehiculeModalData.chassis,
-                nomClient: vehiculeModalData.client,
-                dateEntree: vehiculeModalData.dateEntree,
-                heureEntree: vehiculeModalData.heureEntree,
-                marque: vehiculeModalData.marque,
-                modele: vehiculeModalData.modele || vehiculeModalData.modelePowerBI,
-                categorie: vehiculeModalData.categorie,
-                etat: vehiculeModalData.etatIntervention || vehiculeModalData.statut,
-                etatIntervention: vehiculeModalData.etatIntervention,
-                equipe: vehiculeModalData.equipe,
-                technicien: vehiculeModalData.technicien,
-                nomTechnicien: vehiculeModalData.nomTechnicien,
-                avancement: vehiculeModalData.avancement,
-                dateFinRep: vehiculeModalData.dateFinRep,
-                emplacement: vehiculeModalData.emplacement,
-                sheetRowNumber: vehiculeModalData.sheetRowNumber,
-              }
+              id: vehiculeModalData.id,
+              noOr: vehiculeModalData.l2n2500 || vehiculeModalData.no || vehiculeModalData.ordre,
+              cs: vehiculeModalData.cs,
+              chassis: vehiculeModalData.chassis,
+              immatriculation: vehiculeModalData.immatriculation || vehiculeModalData.serie,
+              serie: vehiculeModalData.serie || vehiculeModalData.immatriculation,
+              nomClient: vehiculeModalData.client,
+              dateEntree: vehiculeModalData.dateEntree,
+              heureEntree: vehiculeModalData.heureEntree,
+              dateEntreeHeure:
+                vehiculeModalData.dateEntree && vehiculeModalData.heureEntree
+                  ? `${vehiculeModalData.dateEntree} ${vehiculeModalData.heureEntree}`.trim()
+                  : vehiculeModalData.dateEntree,
+              marque: vehiculeModalData.marque,
+              modele: vehiculeModalData.modele || vehiculeModalData.modelePowerBI,
+              categorie: vehiculeModalData.categorie,
+              etat: vehiculeModalData.etatIntervention || vehiculeModalData.statut,
+              etatIntervention: vehiculeModalData.etatIntervention,
+              equipe: vehiculeModalData.equipe,
+              technicien: vehiculeModalData.technicien,
+              nomTechnicien: vehiculeModalData.nomTechnicien,
+              avancement: vehiculeModalData.avancement,
+              dateFinRep: vehiculeModalData.dateFinRep,
+              heureFin: (vehiculeModalData as any).heureFin,
+              emplacement: vehiculeModalData.emplacement,
+              sheetRowNumber: vehiculeModalData.sheetRowNumber,
+            }
             : null
         }
         canEdit={false}
@@ -3805,7 +4859,7 @@ export default function Dashboard() {
         </div>
       )}
 
-      {/* Notification Flottante - Pièces Achat Livrées avec Bouton Accepter et Reprendre */}
+      {/* Notification Flottante - Pièces Achat Retirées avec Bouton Accepter et Reprendre */}
       {deliveredAchatNotifications.length > 0 && (
         <div className="fixed top-24 right-6 z-50 max-w-sm w-full animate-in fade-in slide-from-top-4 duration-300 pointer-events-auto flex flex-col gap-3">
           {deliveredAchatNotifications.slice(0, 2).map((item) => (
@@ -3823,7 +4877,7 @@ export default function Dashboard() {
                   </div>
                   <div>
                     <h3 className="text-sm font-black text-slate-900 leading-tight">
-                      📦 Pièces Livrées !
+                      📦 Pièce Retirée !
                     </h3>
                     <p className="text-[11px] text-emerald-800 font-semibold mt-0.5">
                       Prêt pour reprise en atelier • {item.timestamp}
@@ -3866,7 +4920,7 @@ export default function Dashboard() {
                   </strong>
                 </div>
                 <div className="flex justify-between items-center pt-1 border-t border-slate-200">
-                  <span className="text-slate-500">Pièce livrée :</span>
+                  <span className="text-slate-500">Pièce retirée :</span>
                   <div className="text-right">
                     <span className="font-bold text-emerald-800">{item.demande.ref}</span>
                     <span className="text-[10px] text-slate-500 ml-1">({item.demande.designation})</span>
@@ -3900,22 +4954,327 @@ export default function Dashboard() {
         </div>
       )}
 
+      {/* Notification Flottante Réception - Nouveaux Devis à Appeler */}
+      {activeDevisAppelerNotifications.length > 0 && (
+        <div className="fixed top-24 right-6 z-50 max-w-sm w-full animate-in fade-in slide-from-top-4 duration-300 pointer-events-auto flex flex-col gap-3">
+          {activeDevisAppelerNotifications.slice(0, 1).map(({ vehicle, devis }) => (
+            <div
+              key={`notif-devis-appeler-${vehicle.id}`}
+              className="bg-white/95 backdrop-blur-md rounded-2xl shadow-2xl border-2 border-orange-500 p-5 relative overflow-hidden"
+            >
+              <div className="absolute top-0 left-0 right-0 h-1.5 bg-gradient-to-r from-orange-400 via-amber-500 to-orange-400 animate-pulse" />
+
+              <div className="flex items-start justify-between gap-3 mb-3 pt-1">
+                <div className="flex items-center gap-2.5">
+                  <div className="w-10 h-10 rounded-xl bg-gradient-to-br from-orange-500 to-amber-600 text-white flex items-center justify-center shadow-md animate-bounce shrink-0">
+                    <PhoneCall size={20} />
+                  </div>
+                  <div>
+                    <h3 className="text-sm font-black text-slate-900 leading-tight">
+                      📞 Devis créé : Appeler client !
+                    </h3>
+                    <p className="text-[11px] text-orange-800 font-semibold mt-0.5">
+                      N° DV : {devis?.numeroDevis || "En cours"} • Équipe {devis?.equipe || vehicle.equipe}
+                    </p>
+                  </div>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => handleDismissDevisNotif(`appeler-${vehicle.id}`)}
+                  className="text-slate-400 hover:text-slate-700 p-1 rounded-lg hover:bg-slate-100 transition-colors cursor-pointer"
+                  title="Fermer la notification"
+                >
+                  <X size={16} />
+                </button>
+              </div>
+
+              <div className="p-3 bg-slate-50 rounded-xl border border-slate-200/80 mb-4 space-y-1.5 text-xs">
+                <div className="flex justify-between items-center">
+                  <span className="text-slate-500">N° OR / Châssis :</span>
+                  <span className="font-mono font-bold text-slate-900">
+                    {vehicle.no || vehicle.ordre || "-"} • {vehicle.chassis || "-"}
+                  </span>
+                </div>
+                <div className="flex justify-between items-center">
+                  <span className="text-slate-500">Client :</span>
+                  <strong className="text-slate-800 truncate max-w-[170px]" title={vehicle.client}>
+                    {vehicle.client || "-"}
+                  </strong>
+                </div>
+                <div className="flex justify-between items-center">
+                  <span className="text-slate-500">Véhicule :</span>
+                  <span className="text-slate-700 font-medium">
+                    {vehicle.marque} {vehicle.modele || ""}
+                  </span>
+                </div>
+              </div>
+
+              <div className="flex items-center gap-1.5 flex-wrap">
+                <button
+                  type="button"
+                  onClick={() => handleAppelerClientFromNotif({ vehicle, devis: devis! })}
+                  className="flex-1 py-2 px-2.5 bg-blue-600 hover:bg-blue-700 active:scale-95 text-white rounded-xl text-xs font-bold flex items-center justify-center gap-1 shadow-md shadow-blue-600/20 transition-all cursor-pointer"
+                  title="Marquer que la réception a contacté le client"
+                >
+                  <PhoneCall size={13} />
+                  <span>Client Appelé</span>
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => handleAccepterDevisFromNotif({ vehicle, devis: devis! })}
+                  className="py-2 px-2.5 bg-emerald-600 hover:bg-emerald-700 active:scale-95 text-white rounded-xl text-xs font-bold flex items-center justify-center gap-1 shadow-md shadow-emerald-600/20 transition-all cursor-pointer"
+                  title="Le client accepte le devis : renvoyer à l'équipe"
+                >
+                  <CheckCircle2 size={13} />
+                  <span>Accepter</span>
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => handleRefuserDevisFromNotif({ vehicle, devis: devis! })}
+                  className="py-2 px-2.5 bg-rose-50 hover:bg-rose-100 border border-rose-300 text-rose-700 active:scale-95 rounded-xl text-xs font-bold flex items-center justify-center gap-1 transition-all cursor-pointer"
+                  title="Le client refuse : passer automatiquement en Terminer"
+                >
+                  <XCircle size={13} />
+                  <span>Refuser</span>
+                </button>
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {/* Notification Flottante Réception - Relance Devis (>24h sans réponse) */}
+      {activeDevisRelanceNotifications.length > 0 && (
+        <div className="fixed top-28 right-6 z-50 max-w-sm w-full animate-in fade-in slide-from-top-4 duration-300 pointer-events-auto flex flex-col gap-3">
+          {activeDevisRelanceNotifications.slice(0, 1).map(({ vehicle, devis }) => (
+            <div
+              key={`notif-devis-relance-${vehicle.id}`}
+              className="bg-white/95 backdrop-blur-md rounded-2xl shadow-2xl border-2 border-rose-500 p-5 relative overflow-hidden"
+            >
+              <div className="absolute top-0 left-0 right-0 h-1.5 bg-gradient-to-r from-rose-500 via-amber-500 to-rose-500 animate-pulse" />
+
+              <div className="flex items-start justify-between gap-3 mb-3 pt-1">
+                <div className="flex items-center gap-2.5">
+                  <div className="w-10 h-10 rounded-xl bg-gradient-to-br from-rose-600 to-amber-600 text-white flex items-center justify-center shadow-md animate-bounce shrink-0">
+                    <AlertTriangle size={20} />
+                  </div>
+                  <div>
+                    <h3 className="text-sm font-black text-rose-950 leading-tight">
+                      ⚠️ Relance Devis (&gt; 24h) !
+                    </h3>
+                    <p className="text-[11px] text-rose-800 font-semibold mt-0.5">
+                      Client sans réponse depuis 1 jour • N° DV : {devis?.numeroDevis}
+                    </p>
+                  </div>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => handleDismissDevisNotif(`relance-${vehicle.id}`)}
+                  className="text-slate-400 hover:text-slate-700 p-1 rounded-lg hover:bg-slate-100 transition-colors cursor-pointer"
+                  title="Fermer la notification"
+                >
+                  <X size={16} />
+                </button>
+              </div>
+
+              <div className="p-3 bg-rose-50/50 rounded-xl border border-rose-200/80 mb-4 space-y-1.5 text-xs">
+                <div className="flex justify-between items-center">
+                  <span className="text-slate-500">Client à relancer :</span>
+                  <strong className="text-slate-900 truncate max-w-[170px]" title={vehicle.client}>
+                    {vehicle.client || "-"}
+                  </strong>
+                </div>
+                <div className="flex justify-between items-center">
+                  <span className="text-slate-500">Dossier :</span>
+                  <span className="font-mono font-bold text-slate-800">
+                    OR : {vehicle.no || vehicle.ordre || "-"}
+                  </span>
+                </div>
+                <div className="flex justify-between items-center">
+                  <span className="text-slate-500">Créé / Premier appel :</span>
+                  <span className="text-slate-700 font-semibold">
+                    {devis?.dateAppel || devis?.date || "Depuis > 24h"}
+                  </span>
+                </div>
+              </div>
+
+              <div className="flex items-center gap-1.5 flex-wrap">
+                <button
+                  type="button"
+                  onClick={() => handleRelancerClientFromNotif({ vehicle, devis: devis! })}
+                  className="flex-1 py-2 px-2.5 bg-amber-600 hover:bg-amber-700 active:scale-95 text-white rounded-xl text-xs font-bold flex items-center justify-center gap-1 shadow-md shadow-amber-600/20 transition-all cursor-pointer"
+                  title="Marquer que le client a été relancé aujourd'hui"
+                >
+                  <AlertTriangle size={13} />
+                  <span>Relance Faite</span>
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => handleAccepterDevisFromNotif({ vehicle, devis: devis! })}
+                  className="py-2 px-2.5 bg-emerald-600 hover:bg-emerald-700 active:scale-95 text-white rounded-xl text-xs font-bold flex items-center justify-center gap-1 shadow-md shadow-emerald-600/20 transition-all cursor-pointer"
+                  title="Le client accepte le devis : renvoyer à l'équipe en atelier"
+                >
+                  <CheckCircle2 size={13} />
+                  <span>Accepter</span>
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => handleRefuserDevisFromNotif({ vehicle, devis: devis! })}
+                  className="py-2 px-2.5 bg-rose-50 hover:bg-rose-100 border border-rose-300 text-rose-700 active:scale-95 rounded-xl text-xs font-bold flex items-center justify-center gap-1 transition-all cursor-pointer"
+                  title="Le client refuse : passer automatiquement en Terminer"
+                >
+                  <XCircle size={13} />
+                  <span>Refuser</span>
+                </button>
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {/* Notification Flottante - Devis Client Accepté (Pour Chef d'Équipe) */}
+      {activeDevisAccordNotificationsForUser.length > 0 && (
+        <div className="fixed top-24 right-6 z-50 max-w-sm w-full animate-in fade-in slide-from-top-4 duration-300 pointer-events-auto flex flex-col gap-3">
+          {activeDevisAccordNotificationsForUser.slice(0, 2).map((item) => {
+            const matchingVehicle = vehicles.find(
+              (v) =>
+                v.id === item.vehicleId ||
+                (item.or && (v.no === item.or || v.ordre === item.or)) ||
+                (item.chassis && v.chassis === item.chassis)
+            );
+            return (
+              <div
+                key={`floating-accord-${item.id}`}
+                className="bg-white/95 backdrop-blur-md rounded-2xl shadow-2xl border-2 border-emerald-500 p-5 relative overflow-hidden"
+              >
+                {/* Glow bar */}
+                <div className="absolute top-0 left-0 right-0 h-1.5 bg-gradient-to-r from-emerald-400 via-teal-500 to-green-500 animate-pulse" />
+
+                <div className="flex items-start justify-between gap-3 mb-3 pt-1">
+                  <div className="flex items-center gap-2.5">
+                    <div className="w-10 h-10 rounded-xl bg-gradient-to-br from-emerald-500 to-teal-600 text-white flex items-center justify-center shadow-md animate-bounce shrink-0">
+                      <FileSignature size={20} />
+                    </div>
+                    <div>
+                      <h3 className="text-sm font-black text-slate-900 leading-tight">
+                        🎉 Devis Client Accepté !
+                      </h3>
+                      <p className="text-[11px] text-emerald-800 font-semibold mt-0.5">
+                        Retourné à l'équipe {item.equipeCible} • {item.timestamp}
+                      </p>
+                    </div>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => handleDismissDevisAccord(item.id)}
+                    className="text-slate-400 hover:text-slate-700 p-1 rounded-lg hover:bg-slate-100 transition-colors cursor-pointer"
+                    title="Fermer la notification"
+                  >
+                    <X size={16} />
+                  </button>
+                </div>
+
+                <div className="p-3 bg-slate-50 rounded-xl border border-slate-200/80 mb-4 space-y-1.5 text-xs">
+                  <div className="flex justify-between items-center">
+                    <span className="text-slate-500">N° OR / Dossier :</span>
+                    <strong className="text-slate-900 font-mono font-bold bg-white px-2 py-0.5 rounded border border-slate-200">
+                      {item.or}
+                    </strong>
+                  </div>
+                  <div className="flex justify-between items-center">
+                    <span className="text-slate-500">N° Devis :</span>
+                    <strong className="text-emerald-700 font-mono font-semibold">
+                      {item.numeroDevis}
+                    </strong>
+                  </div>
+                  <div className="flex justify-between items-center">
+                    <span className="text-slate-500">Véhicule :</span>
+                    <strong className="text-slate-800">
+                      {item.marque} {item.modele}
+                    </strong>
+                  </div>
+                  <div className="flex justify-between items-center">
+                    <span className="text-slate-500">État :</span>
+                    <span className="px-2 py-0.5 rounded-full text-[10px] font-bold bg-orange-100 text-orange-800 border border-orange-200">
+                      Tableaux de chargement (Attente réparation)
+                    </span>
+                  </div>
+                  {(item.nomTechnicien || item.technicien || matchingVehicle?.nomTechnicien || matchingVehicle?.technicien) && (
+                    <div className="flex justify-between items-center bg-emerald-50 px-2 py-1 rounded-lg border border-emerald-200">
+                      <span className="text-emerald-800 font-bold flex items-center gap-1">
+                        <Wrench size={12} className="text-emerald-700" />
+                        Technicien :
+                      </span>
+                      <strong className="text-emerald-950 font-bold">
+                        {item.nomTechnicien || matchingVehicle?.nomTechnicien || item.technicien || matchingVehicle?.technicien}
+                        {(item.technicien || matchingVehicle?.technicien) ? ` (${item.technicien || matchingVehicle?.technicien})` : ""}
+                      </strong>
+                    </div>
+                  )}
+                  <div className="flex justify-between items-center">
+                    <span className="text-slate-500">Client :</span>
+                    <strong className="text-slate-800 truncate max-w-[170px]" title={item.client}>
+                      {item.client}
+                    </strong>
+                  </div>
+                </div>
+
+                <div className="flex flex-col gap-2">
+                  <button
+                    type="button"
+                    onClick={() => handleVoirDansChargement(item, matchingVehicle)}
+                    className="w-full py-2.5 px-3 bg-slate-900 hover:bg-slate-800 text-white rounded-xl font-bold text-xs flex items-center justify-center gap-1.5 transition-all shadow-md active:scale-95 cursor-pointer"
+                  >
+                    <ClipboardList size={15} />
+                    <span>Voir dans Tableaux de chargement</span>
+                  </button>
+
+                  <div className="flex items-center gap-2">
+                    {matchingVehicle && (permissions.canEditEtat || permissions.canEditChargement) && (
+                      <button
+                        type="button"
+                        onClick={() => handlePrendreEnChargeDevisAccord(item, matchingVehicle)}
+                        className="flex-1 py-2 px-3 bg-emerald-50 hover:bg-emerald-100 text-emerald-800 border border-emerald-300 rounded-xl font-bold text-xs flex items-center justify-center gap-1.5 transition-all active:scale-95 cursor-pointer"
+                        title="Affecter ou démarrer l'intervention"
+                      >
+                        <UserCheck size={14} />
+                        <span>Démarrer / Affecter</span>
+                      </button>
+                    )}
+                    <button
+                      type="button"
+                      onClick={() => handleDismissDevisAccord(item.id)}
+                      className="p-2 text-slate-500 hover:text-slate-800 hover:bg-slate-100 rounded-xl transition-colors cursor-pointer border border-slate-200"
+                      title="Fermer"
+                    >
+                      <X size={15} />
+                    </button>
+                  </div>
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      )}
+
       {/* Modal Affectation Technicien */}
       <AffecterTechnicienModal
         isOpen={isTechModalOpen}
         vehicle={pendingEnCoursVehicle}
+        allVehicles={vehicles}
+        reaffectationsMap={reaffectationsMap}
         assignedTeam={
           role === "chef_equipe"
             ? (activeChefEquipeTeam || "Daily1")
             : (pendingEnCoursVehicle?.equipe && pendingEnCoursVehicle.equipe !== "-"
-                ? pendingEnCoursVehicle.equipe
-                : (activeChefEquipeTeam || "Daily1"))
+              ? pendingEnCoursVehicle.equipe
+              : (activeChefEquipeTeam || "Daily1"))
         }
-        equipeMembers={
-          equipeData?.members && equipeData.members.length > 0
-            ? equipeData.members
-            : DEFAULT_EQUIPE_MAPPINGS
-        }
+        equipeMembers={resolvedEquipeMembers}
         isOnlyTechnicienChange={isOnlyTechChange}
         isTransferAcceptance={isTransferAcceptanceModal}
         canChangeTeam={role !== "chef_equipe"}

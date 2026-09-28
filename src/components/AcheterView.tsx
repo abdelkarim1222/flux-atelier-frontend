@@ -140,13 +140,17 @@ export default function AcheterView({
   }, [vehicles, demandesMap]);
 
   // Comptes par statut pour les badges filtres
+  const isPieceRetiree = (d?: DemandeAchat) => {
+    return d?.statutAchat === "Pièce retirée" || d?.statutAchat === "Livrer" || d?.statutAchat === "Livré";
+  };
+
   const enAttenteCount = useMemo(() => {
     return acheterVehicles.filter((v) => {
       const d =
         demandesMap[String(v.id)] ||
         (v.no && demandesMap[v.no.trim()]) ||
         (v.chassis && demandesMap[v.chassis.trim()]);
-      return !d || (d.statutAchat !== "Livrer" && d.statutAchat !== "Livré");
+      return !isPieceRetiree(d);
     }).length;
   }, [acheterVehicles, demandesMap]);
 
@@ -156,7 +160,7 @@ export default function AcheterView({
         demandesMap[String(v.id)] ||
         (v.no && demandesMap[v.no.trim()]) ||
         (v.chassis && demandesMap[v.chassis.trim()]);
-      return d?.statutAchat === "Livrer" || d?.statutAchat === "Livré";
+      return isPieceRetiree(d);
     }).length;
   }, [acheterVehicles, demandesMap]);
 
@@ -185,7 +189,7 @@ export default function AcheterView({
         demandesMap[String(row.id)] ||
         (row.no && demandesMap[row.no.trim()]) ||
         (row.chassis && demandesMap[row.chassis.trim()]);
-      const isLivre = d?.statutAchat === "Livrer" || d?.statutAchat === "Livré";
+      const isLivre = isPieceRetiree(d);
 
       if (statusFilter === "attente" && isLivre) return false;
       if (statusFilter === "livre" && !isLivre) return false;
@@ -237,7 +241,7 @@ export default function AcheterView({
                 </span>
               </div>
               <p className="text-xs text-amber-200/80 mt-1 max-w-2xl">
-                Suivi des commandes et livraisons de pièces. Cliquez sur <strong>Livrer</strong> dès réception : le véhicule réintègre immédiatement l'atelier en cours avec notification d'acceptation, et une trace reste conservée dans cette liste.
+                Suivi des commandes et réceptions de pièces. Cliquez sur <strong>Pièce retirée</strong> dès disponibilité au magasin : le véhicule réintègre immédiatement l'atelier en cours avec notification d'acceptation, et une trace reste conservée dans cette liste.
               </p>
             </div>
           </div>
@@ -269,7 +273,7 @@ export default function AcheterView({
             <div className="text-2xl font-black text-amber-300 mt-0.5">{enAttenteCount}</div>
           </div>
           <div className="bg-white/5 rounded-xl p-3 border border-white/10">
-            <div className="text-[11px] text-emerald-300/80 font-semibold">✅ Livrés (Traces)</div>
+            <div className="text-[11px] text-emerald-300/80 font-semibold">✅ Pièces retirées (Traces)</div>
             <div className="text-2xl font-black text-emerald-400 mt-0.5">{livreCount}</div>
           </div>
           <div className="bg-white/5 rounded-xl p-3 border border-white/10">
@@ -346,7 +350,7 @@ export default function AcheterView({
             }`}
           >
             <CheckCircle2 size={12} />
-            <span>Livrés / Traces ({livreCount})</span>
+            <span>Pièces retirées ({livreCount})</span>
           </button>
         </div>
       </div>
@@ -561,10 +565,10 @@ export default function AcheterView({
                                   ? "bg-emerald-600 text-white shadow-sm font-black"
                                   : "text-slate-600 hover:text-emerald-700 hover:bg-emerald-50"
                               }`}
-                              title="Pièces livrées : renvoie le véhicule en cours d'intervention avec notification pour accepter"
+                              title="Pièce retirée du magasin PDR : renvoie le véhicule en cours d'intervention pour son équipe avec notification pour accepter"
                             >
                               <CheckCircle2 size={12} />
-                              <span>Livrer</span>
+                              <span>Pièce retirée</span>
                             </button>
                           </div>
 
@@ -573,7 +577,7 @@ export default function AcheterView({
                             <div className="flex flex-col gap-0.5">
                               <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md text-[10px] font-bold bg-emerald-100 text-emerald-800 border border-emerald-300 w-fit">
                                 <CheckCircle2 size={11} className="text-emerald-600" />
-                                <span>Livré {demande?.dateLivraison ? `le ${demande.dateLivraison}` : ""}</span>
+                                <span>Pièce retirée {demande?.dateLivraison ? `le ${demande.dateLivraison}` : ""}</span>
                               </span>
                               <span className="text-[9.5px] text-emerald-700 font-semibold italic">
                                 Trace conservée • Renvoyé en cours
@@ -581,7 +585,7 @@ export default function AcheterView({
                             </div>
                           ) : (
                             <span className="text-[9.5px] text-amber-700/80 font-medium">
-                              En attente de réception magasin
+                              En attente de retrait magasin
                             </span>
                           )}
                         </div>

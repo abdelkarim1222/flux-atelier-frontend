@@ -25,6 +25,7 @@ import {
   Tooltip as RechartsTooltip,
   CartesianGrid,
   Cell,
+  Rectangle,
 } from "recharts";
 import { useRole } from "../context/RoleContext";
 import {
@@ -330,6 +331,15 @@ export default function MoyennesView() {
     }));
   }, [displayData.modeles]);
 
+  // Totaux calculés pour affichage au-dessus des graphiques
+  const totalVehiculesEquipes = useMemo(() => {
+    return displayData.equipesTotal?.total ?? teamsChartData.reduce((acc, t) => acc + t.total, 0);
+  }, [displayData.equipesTotal, teamsChartData]);
+
+  const totalUnitesModeles = useMemo(() => {
+    return displayData.modelesTotal?.total ?? modelsChartData.reduce((acc, m) => acc + m.total, 0);
+  }, [displayData.modelesTotal, modelsChartData]);
+
   // Filtered correspondances
   const filteredCorrespondances = useMemo(() => {
     if (!searchFilter.trim()) return displayData.correspondances;
@@ -401,6 +411,29 @@ export default function MoyennesView() {
   }
 
   const isDataEmpty = (displayData.equipesTotal?.total || 0) === 0;
+
+  // Rendu permanent du rectangle avec son chiffre en noir au-dessus (ne s'éteint JAMAIS, ne clignote pas)
+  const renderBarWithPermanentNumber = (props: any) => {
+    const { x, y, width, height, fill } = props;
+    const val = typeof props.value === "number" ? props.value : (props.payload?.total ?? 0);
+    return (
+      <g>
+        <Rectangle x={x} y={y} width={width} height={height} fill={fill} radius={[5, 5, 0, 0]} />
+        {val > 0 && (
+          <text
+            x={x + width / 2}
+            y={y - 8}
+            fill="#000000"
+            textAnchor="middle"
+            fontSize={14}
+            fontWeight={900}
+          >
+            {val}
+          </text>
+        )}
+      </g>
+    );
+  };
 
   return (
     <div className="w-full h-full flex-1 overflow-y-auto overflow-x-hidden p-3 md:p-4 flex flex-col gap-3 bg-slate-100/80">
@@ -925,23 +958,44 @@ export default function MoyennesView() {
       {viewMode === "charts" && (
         <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
           {/* Bar Chart: Par Équipe */}
-          <div className="bg-white rounded-xl p-5 border border-slate-200 shadow-2xs">
-            <h3 className="text-sm font-black text-slate-900 mb-0.5 flex items-center gap-2">
-              <Users size={16} className="text-blue-700" />
-              <span>Volume Réalisé par Équipe ({MONTH_NAMES[selectedMonth - 1]} {selectedYear})</span>
-            </h3>
-            <p className="text-[11px] text-slate-500 mb-4 font-medium">Comparatif des interventions terminées sur le mois</p>
-            <div className="h-64 w-full">
+          <div className="bg-white rounded-xl p-5 border border-slate-200 shadow-2xs flex flex-col">
+            <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 mb-2">
+              <div>
+                <h3 className="text-sm font-black text-slate-900 mb-0.5 flex items-center gap-2">
+                  <Users size={16} className="text-blue-700" />
+                  <span>Volume Réalisé par Équipe ({MONTH_NAMES[selectedMonth - 1]} {selectedYear})</span>
+                </h3>
+                <p className="text-[11px] text-slate-500 font-medium">Comparatif des interventions terminées sur le mois</p>
+              </div>
+              <div className="inline-flex items-center gap-1.5 px-3 py-1 rounded-lg text-xs font-black bg-blue-50 text-blue-900 border border-blue-200 shrink-0 self-start sm:self-auto shadow-2xs">
+                <span>Total véhicules =</span>
+                <span className="px-2 py-0.5 rounded-md bg-blue-700 text-white font-black text-xs">
+                  {totalVehiculesEquipes}
+                </span>
+              </div>
+            </div>
+
+            {/* Graphique avec les nombres directement au-dessus des barres comme dans l'exemple manuscrit */}
+            <div className="h-72 w-full mt-auto">
               <ResponsiveContainer width="100%" height="100%">
-                <BarChart data={teamsChartData} margin={{ top: 10, right: 10, left: -20, bottom: 20 }}>
+                <BarChart data={teamsChartData} margin={{ top: 25, right: 10, left: -20, bottom: 25 }}>
                   <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#f1f5f9" />
-                  <XAxis dataKey="name" tick={{ fontSize: 10, fontWeight: 700 }} angle={-25} textAnchor="end" />
-                  <YAxis tick={{ fontSize: 10 }} />
+                  <XAxis dataKey="name" tick={{ fontSize: 10, fontWeight: 700 }} angle={-25} textAnchor="end" height={45} />
+                  <YAxis
+                    tick={{ fontSize: 10 }}
+                    allowDecimals={false}
+                    domain={[0, (dataMax: number) => (dataMax > 0 ? Math.ceil(dataMax * 1.35) + 3 : 5)]}
+                  />
                   <RechartsTooltip
                     formatter={(val: any) => [val, "Total véhicules"]}
                     contentStyle={{ borderRadius: 8, border: "1px solid #cbd5e1" }}
                   />
-                  <Bar dataKey="total" name="Total véhicules" radius={[4, 4, 0, 0]}>
+                  <Bar
+                    dataKey="total"
+                    name="Total véhicules"
+                    isAnimationActive={false}
+                    shape={renderBarWithPermanentNumber}
+                  >
                     {teamsChartData.map((entry, index) => (
                       <Cell key={`cell-team-${index}`} fill={entry.color} />
                     ))}
@@ -952,23 +1006,44 @@ export default function MoyennesView() {
           </div>
 
           {/* Bar Chart: Par Modèle */}
-          <div className="bg-white rounded-xl p-5 border border-slate-200 shadow-2xs">
-            <h3 className="text-sm font-black text-slate-900 mb-0.5 flex items-center gap-2">
-              <Truck size={16} className="text-blue-700" />
-              <span>Volume par Famille de Modèles ({MONTH_NAMES[selectedMonth - 1]} {selectedYear})</span>
-            </h3>
-            <p className="text-[11px] text-slate-500 mb-4 font-medium">Répartition du flux selon la gamme de véhicules</p>
-            <div className="h-64 w-full">
+          <div className="bg-white rounded-xl p-5 border border-slate-200 shadow-2xs flex flex-col">
+            <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 mb-2">
+              <div>
+                <h3 className="text-sm font-black text-slate-900 mb-0.5 flex items-center gap-2">
+                  <Truck size={16} className="text-blue-700" />
+                  <span>Volume par Famille de Modèles ({MONTH_NAMES[selectedMonth - 1]} {selectedYear})</span>
+                </h3>
+                <p className="text-[11px] text-slate-500 font-medium">Répartition du flux selon la gamme de véhicules</p>
+              </div>
+              <div className="inline-flex items-center gap-1.5 px-3 py-1 rounded-lg text-xs font-black bg-emerald-50 text-emerald-900 border border-emerald-200 shrink-0 self-start sm:self-auto shadow-2xs">
+                <span>Total unités =</span>
+                <span className="px-2 py-0.5 rounded-md bg-emerald-600 text-white font-black text-xs">
+                  {totalUnitesModeles}
+                </span>
+              </div>
+            </div>
+
+            {/* Graphique avec les nombres directement au-dessus des barres comme dans l'exemple manuscrit */}
+            <div className="h-72 w-full mt-auto">
               <ResponsiveContainer width="100%" height="100%">
-                <BarChart data={modelsChartData} margin={{ top: 10, right: 10, left: -20, bottom: 20 }}>
+                <BarChart data={modelsChartData} margin={{ top: 25, right: 10, left: -20, bottom: 25 }}>
                   <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#f1f5f9" />
-                  <XAxis dataKey="name" tick={{ fontSize: 10, fontWeight: 700 }} angle={-25} textAnchor="end" />
-                  <YAxis tick={{ fontSize: 10 }} />
+                  <XAxis dataKey="name" tick={{ fontSize: 10, fontWeight: 700 }} angle={-25} textAnchor="end" height={45} />
+                  <YAxis
+                    tick={{ fontSize: 10 }}
+                    allowDecimals={false}
+                    domain={[0, (dataMax: number) => (dataMax > 0 ? Math.ceil(dataMax * 1.35) + 3 : 5)]}
+                  />
                   <RechartsTooltip
                     formatter={(val: any) => [val, "Unités"]}
                     contentStyle={{ borderRadius: 8, border: "1px solid #cbd5e1" }}
                   />
-                  <Bar dataKey="total" name="Total unités" radius={[4, 4, 0, 0]}>
+                  <Bar
+                    dataKey="total"
+                    name="Total unités"
+                    isAnimationActive={false}
+                    shape={renderBarWithPermanentNumber}
+                  >
                     {modelsChartData.map((entry, index) => (
                       <Cell key={`cell-mod-${index}`} fill={entry.color} />
                     ))}

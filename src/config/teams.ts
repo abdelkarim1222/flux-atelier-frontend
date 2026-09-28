@@ -11,7 +11,6 @@ export const CANONICAL_TEAMS = [
 
 export type CanonicalTeam = typeof CANONICAL_TEAMS[number];
 
-// The 6 destination teams for New Vehicle Entry (Réception)
 export const DESTINATION_TEAMS = [
   "Daily",
   "Service Rapide",
@@ -22,6 +21,66 @@ export const DESTINATION_TEAMS = [
 ] as const;
 
 export type DestinationTeam = typeof DESTINATION_TEAMS[number];
+
+const CUSTOM_TEAMS_STORAGE_KEY = "flux_atelier_custom_teams_list";
+
+export function getCustomTeams(): string[] {
+  if (typeof window === "undefined") return [];
+  try {
+    const raw = localStorage.getItem(CUSTOM_TEAMS_STORAGE_KEY);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw);
+    if (Array.isArray(parsed)) {
+      return parsed.map((t) => String(t || "").trim()).filter(Boolean);
+    }
+  } catch {}
+  return [];
+}
+
+export function saveCustomTeams(teams: string[]): void {
+  if (typeof window === "undefined") return;
+  try {
+    const clean = Array.from(new Set(teams.map((t) => t.trim()).filter(Boolean)));
+    localStorage.setItem(CUSTOM_TEAMS_STORAGE_KEY, JSON.stringify(clean));
+    window.dispatchEvent(new CustomEvent("flux_teams_updated", { detail: clean }));
+    window.dispatchEvent(new Event("storage"));
+  } catch {}
+}
+
+export function addCustomTeam(teamName: string): string[] {
+  const clean = teamName.trim();
+  if (!clean) return getCustomTeams();
+  const current = getCustomTeams();
+  const exists =
+    current.some((t) => t.toLowerCase() === clean.toLowerCase()) ||
+    CANONICAL_TEAMS.some((t) => t.toLowerCase() === clean.toLowerCase());
+  if (!exists) {
+    const updated = [...current, clean];
+    saveCustomTeams(updated);
+    return updated;
+  }
+  return current;
+}
+
+export function removeCustomTeam(teamName: string): string[] {
+  const clean = teamName.trim().toLowerCase();
+  const current = getCustomTeams();
+  const updated = current.filter((t) => t.trim().toLowerCase() !== clean);
+  saveCustomTeams(updated);
+  return updated;
+}
+
+export function getAllDestinationTeams(): string[] {
+  const custom = getCustomTeams();
+  const base: string[] = [...DESTINATION_TEAMS];
+  custom.forEach((t) => {
+    if (!base.some((b) => b.toLowerCase() === t.toLowerCase())) {
+      base.push(t);
+    }
+  });
+  return base;
+}
+
 
 export function normalizeTeamName(t: string): string {
   const norm = (t || "")

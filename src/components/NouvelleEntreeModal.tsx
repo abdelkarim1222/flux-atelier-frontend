@@ -23,7 +23,7 @@ import {
   searchVehicleByVin,
   type VinVehicleInfo,
 } from "../services/googleSheets";
-import { DESTINATION_TEAMS, type DestinationTeam } from "../config/teams";
+import { getAllDestinationTeams, type DestinationTeam } from "../config/teams";
 import NouveauVinModal from "./NouveauVinModal";
 
 interface NouvelleEntreeModalProps {
@@ -603,7 +603,7 @@ export default function NouvelleEntreeModal({
 
                 {/* Boutons de sélection rapide */}
                 <div className="grid grid-cols-2 sm:grid-cols-3 gap-2">
-                  {DESTINATION_TEAMS.map((team) => {
+                  {getAllDestinationTeams().map((team) => {
                     const isSelected = formData.equipe === team;
                     return (
                       <button

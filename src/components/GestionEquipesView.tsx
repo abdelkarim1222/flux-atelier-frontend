@@ -25,9 +25,16 @@ import {
   saveCustomEquipeMembers,
   resetCustomEquipeMembers,
   fetchEquipeSheetData,
+  normalizePersonName,
 } from "../services/googleSheets";
 
-import { CANONICAL_TEAMS } from "../config/teams";
+import {
+  CANONICAL_TEAMS,
+  normalizeTeamName,
+  getCustomTeams,
+  addCustomTeam,
+  removeCustomTeam,
+} from "../config/teams";
 
 // Layout columns matching the 3 vertical columns of the Google Sheets screenshot
 const COLUMN_1_TEAMS = ["Daily1", "Service Rapide"];
@@ -53,6 +60,8 @@ export default function GestionEquipesView() {
     const custom = getCustomEquipeMembers();
     return custom && custom.length > 0 ? custom : DEFAULT_EQUIPE_MAPPINGS;
   });
+
+  const [customTeams, setCustomTeams] = useState<string[]>(() => getCustomTeams());
 
   const [search, setSearch] = useState("");
   const [selectedTeamFilter, setSelectedTeamFilter] = useState<string>("all");
@@ -89,6 +98,25 @@ export default function GestionEquipesView() {
     }
   }, []);
 
+  // Écouter les mises à jour externes ou synchronisations
+  useEffect(() => {
+    const handleUpdate = () => {
+      const custom = getCustomEquipeMembers();
+      if (custom && custom.length > 0) {
+        setMembers(custom);
+      }
+      setCustomTeams(getCustomTeams());
+    };
+    window.addEventListener("flux_equipes_updated", handleUpdate);
+    window.addEventListener("flux_teams_updated", handleUpdate);
+    window.addEventListener("storage", handleUpdate);
+    return () => {
+      window.removeEventListener("flux_equipes_updated", handleUpdate);
+      window.removeEventListener("flux_teams_updated", handleUpdate);
+      window.removeEventListener("storage", handleUpdate);
+    };
+  }, []);
+
   // Save to localStorage whenever members change
   const persistMembers = (updated: EquipeMember[]) => {
     setMembers(updated);
@@ -102,6 +130,7 @@ export default function GestionEquipesView() {
       )
     ) {
       resetCustomEquipeMembers();
+      setCustomTeams([]);
       try {
         const res = await fetchEquipeSheetData();
         if (res.members && res.members.length > 0) {
@@ -167,11 +196,12 @@ export default function GestionEquipesView() {
     };
 
     if (editingMember) {
-      const updated = members.map((m) =>
-        m.name === editingMember.name && m.team === editingMember.team
-          ? newMemberData
-          : m
-      );
+      const updated = members.map((m) => {
+        const isSameMat = Boolean(editingMember.matricule && m.matricule && m.matricule.trim() === editingMember.matricule.trim());
+        const isSameName = normalizePersonName(m.name) === normalizePersonName(editingMember.name);
+        const isSameTeam = normalizeTeamName(m.team) === normalizeTeamName(editingMember.team);
+        return (isSameMat || (isSameName && isSameTeam)) ? newMemberData : m;
+      });
       persistMembers(updated);
       setFormSuccess("Membre mis à jour avec succès !");
     } else {
@@ -201,30 +231,42 @@ export default function GestionEquipesView() {
       return;
     }
 
-    // Open add member modal pre-selected with this new team
+    // Persister la nouvelle équipe immédiatement
+    const updatedTeams = addCustomTeam(cleanTeam);
+    setCustomTeams(updatedTeams);
+
     setIsTeamModalOpen(false);
     setNewTeamName("");
+    setNewTeamError(null);
+
+    // Ouvrir le formulaire pour ajouter le 1er collaborateur dans cette nouvelle équipe
     openCreateModal(cleanTeam);
   };
 
   // Handle Delete Member
   const handleDeleteMember = () => {
     if (!isAdmin || !deletingMember) return;
-    const updated = members.filter(
-      (m) => !(m.name === deletingMember.name && m.team === deletingMember.team && m.matricule === deletingMember.matricule)
-    );
+    const updated = members.filter((m) => {
+      const isSameMat = Boolean(deletingMember.matricule && m.matricule && m.matricule.trim() === deletingMember.matricule.trim());
+      const isSameName = normalizePersonName(m.name) === normalizePersonName(deletingMember.name);
+      const isSameTeam = normalizeTeamName(m.team) === normalizeTeamName(deletingMember.team);
+      return !(isSameMat || (isSameName && isSameTeam));
+    });
     persistMembers(updated);
     setDeletingMember(null);
   };
 
-  // All unique teams
+  // All unique teams (Canoniques + Personnalisées + Équipes des membres)
   const allTeams = useMemo(() => {
     const set = new Set<string>(CANONICAL_TEAMS);
+    customTeams.forEach((t) => {
+      if (t && t.trim()) set.add(t.trim());
+    });
     members.forEach((m) => {
-      if (m.team) set.add(m.team);
+      if (m.team && m.team.trim()) set.add(m.team.trim());
     });
     return Array.from(set);
-  }, [members]);
+  }, [members, customTeams]);
 
   // Statistics
   const stats = useMemo(() => {
@@ -262,9 +304,20 @@ export default function GestionEquipesView() {
     });
 
     // Ensure canonical ordering within columns
-    col1.sort((a, b) => COLUMN_1_TEAMS.indexOf(a) - COLUMN_1_TEAMS.indexOf(b));
-    col2.sort((a, b) => COLUMN_2_TEAMS.indexOf(a) - COLUMN_2_TEAMS.indexOf(b));
-    col3.sort((a, b) => COLUMN_3_TEAMS.indexOf(a) - COLUMN_3_TEAMS.indexOf(b));
+    const sortInCol = (arr: string[], reference: string[]) => {
+      arr.sort((a, b) => {
+        const idxA = reference.indexOf(a);
+        const idxB = reference.indexOf(b);
+        if (idxA !== -1 && idxB !== -1) return idxA - idxB;
+        if (idxA !== -1) return -1;
+        if (idxB !== -1) return 1;
+        return a.localeCompare(b);
+      });
+    };
+
+    sortInCol(col1, COLUMN_1_TEAMS);
+    sortInCol(col2, COLUMN_2_TEAMS);
+    sortInCol(col3, COLUMN_3_TEAMS);
 
     return [col1, col2, col3];
   }, [allTeams]);
@@ -322,6 +375,21 @@ export default function GestionEquipesView() {
             >
               <Plus size={13} />
             </button>
+            {!CANONICAL_TEAMS.some((c) => c.toLowerCase() === teamName.toLowerCase()) && teamMembers.length === 0 && (
+              <button
+                type="button"
+                onClick={() => {
+                  if (window.confirm(`Supprimer l'équipe vide "${teamName}" ?`)) {
+                    const updated = removeCustomTeam(teamName);
+                    setCustomTeams(updated);
+                  }
+                }}
+                className="p-1 rounded bg-white/15 hover:bg-red-500/80 text-white transition-colors cursor-pointer"
+                title={`Supprimer l'équipe ${teamName}`}
+              >
+                <Trash2 size={13} />
+              </button>
+            )}
           </div>
         </div>
 
@@ -627,6 +695,11 @@ export default function GestionEquipesView() {
                       {t}
                     </option>
                   ))}
+                  {!allTeams.some((t) => t.toLowerCase() === formTeam.toLowerCase()) && formTeam && (
+                    <option value={formTeam}>
+                      {formTeam}
+                    </option>
+                  )}
                 </select>
               </div>
 

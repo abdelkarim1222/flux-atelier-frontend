@@ -1,4 +1,4 @@
-import { useState, useEffect, useMemo } from "react";
+import { useState, useEffect, useMemo, useRef } from "react";
 import { createPortal } from "react-dom";
 import {
   Wrench,
@@ -12,11 +12,19 @@ import {
   Hammer,
   ChevronDown,
   ChevronUp,
+  AlertTriangle,
+  Info,
 } from "lucide-react";
 import { type Flux } from "../data/mockData";
-import { type EquipeMember, DEFAULT_EQUIPE_MAPPINGS } from "../services/googleSheets";
+import {
+  type EquipeMember,
+  DEFAULT_EQUIPE_MAPPINGS,
+  getCustomEquipeMembers,
+  getReaffectationsLocal,
+  type ReaffectationRecord,
+} from "../services/googleSheets";
 
-import { CANONICAL_TEAMS } from "../config/teams";
+import { CANONICAL_TEAMS, getCustomTeams } from "../config/teams";
 
 export function normalizeTeamName(t: string): string {
   const norm = (t || "")
@@ -37,9 +45,229 @@ export function normalizeTeamName(t: string): string {
   return norm;
 }
 
+/**
+ * Vérifie si un véhicule est terminé (intervention terminée, 100%, sorti ou livré).
+ * Dès qu'un véhicule est terminé, le mécanicien redevient immédiatement LIBRE pour une autre voiture.
+ */
+export function isVehicleFinished(v: Flux): boolean {
+  const anyV = v as Record<string, any>;
+  if (anyV.dateSortie && anyV.dateSortie !== "-" && String(anyV.dateSortie).trim() !== "") {
+    return true;
+  }
+  const normStatut = (v.statut || "").trim().toLowerCase();
+  const normEtat = (v.etatIntervention || "").trim().toLowerCase();
+  const normAv = (v.avancement || "").trim().toLowerCase();
+
+  // Indications de travail terminé ou véhicule livré / sorti / attente client
+  if (
+    normStatut.includes("termin") ||
+    normStatut.includes("fini") ||
+    normStatut.includes("livr") ||
+    normStatut.includes("sorti") ||
+    normStatut.includes("pret") ||
+    normStatut.includes("attente client")
+  ) {
+    return true;
+  }
+
+  if (
+    normEtat.includes("termin") ||
+    normEtat.includes("fini") ||
+    normEtat.includes("livr") ||
+    normEtat.includes("sorti") ||
+    normEtat.includes("pret") ||
+    normEtat.includes("attente client")
+  ) {
+    return true;
+  }
+
+  // Avancement "Terminer" = travaux clôturés → technicien LIBÉRÉ immédiatement.
+  // La réception peut ensuite marquer "Livré au client" sans que le technicien puisse y revenir.
+  if (
+    normAv === "terminer" ||
+    normAv.includes("termin") ||
+    normAv.includes("fini") ||
+    normAv.includes("100%") ||
+    normAv.includes("livr") ||
+    normAv.includes("pret")
+  ) {
+    return true;
+  }
+
+  return false;
+}
+
+/**
+ * Vérifie si un véhicule a son technicien réaffecté (actif et non encore repris).
+ * Dans ce cas, le mécanicien a été libéré et doit impérativement être LIBRE pour prendre une autre voiture !
+ */
+export function isVehicleReaffecteActive(
+  v: Flux,
+  reaffectationsMap?: Record<string, ReaffectationRecord>
+): boolean {
+  const normAv = (v.avancement || "").trim().toLowerCase();
+  const normEtat = (v.etatIntervention || "").trim().toLowerCase();
+
+  // 1. Détection directe dans les chaînes d'avancement ou d'état
+  if (
+    normAv.includes("réaffect") ||
+    normAv.includes("reaffect") ||
+    normEtat.includes("réaffect") ||
+    normEtat.includes("reaffect")
+  ) {
+    return true;
+  }
+
+  // 2. Recherche dans le registre des réaffectations enregistrées
+  try {
+    const all = reaffectationsMap || getReaffectationsLocal();
+    const keysToTry = [
+      String(v.id || ""),
+      String(v.no || ""),
+      String(v.serie || ""),
+      String(v.immatriculation || ""),
+      String(v.ordre || ""),
+      String(v.chassis || ""),
+    ].filter(Boolean);
+
+    for (const k of keysToTry) {
+      if (all[k] && !all[k].isRepris) return true;
+      if (all[k.trim()] && !all[k.trim()].isRepris) return true;
+    }
+
+    const found = Object.values(all).find((r) => {
+      if (v.id && String(r.vehicleId) === String(v.id)) return true;
+      if (v.no && r.or && r.or.trim() === v.no.trim()) return true;
+      if (v.serie && r.or && r.or.trim() === v.serie.trim()) return true;
+      if (v.ordre && r.or && r.or.trim() === v.ordre.trim()) return true;
+      if (v.chassis && r.chassis && r.chassis.trim().toUpperCase() === v.chassis.trim().toUpperCase()) return true;
+      if (v.immatriculation && r.immatriculation && r.immatriculation.trim() === v.immatriculation.trim()) return true;
+      return false;
+    });
+
+    if (found && !found.isRepris) {
+      return true;
+    }
+  } catch (e) {
+    console.warn("Erreur vérification réaffectation:", e);
+  }
+
+  return false;
+}
+
+/**
+ * Vérifie si un véhicule occupe ACTUELLEMENT le mécanicien (travail en cours actif).
+ *
+ * RÈGLE D'ATELIER :
+ * - Un mécanicien n'est OCCUPÉ que si le véhicule est activement "En cours" (avec travail effectif / %).
+ * - Si le technicien a été RÉAFFECTÉ ("Technicien réaffecté", pause), le mécanicien redevient LIBRE !
+ * - Si le véhicule est en "Attente réparation", "Attente devis", "Attente pièces" ou "Essai", le mécanicien est LIBRE !
+ * - Si le véhicule est terminé / livré / sorti / attente client, le mécanicien est LIBRE !
+ */
+export function isVehicleActivelyOccupyingTech(
+  v: Flux,
+  reaffectationsMap?: Record<string, ReaffectationRecord>
+): boolean {
+  // 1. Véhicule terminé / livré / sorti / attente client -> LIBRE
+  if (isVehicleFinished(v)) {
+    return false;
+  }
+
+  // 2. Technicien réaffecté (actif et non repris) -> Le mécanicien est LIBRE !
+  if (isVehicleReaffecteActive(v, reaffectationsMap)) {
+    return false;
+  }
+
+  const normAv = (v.avancement || "").trim().toLowerCase();
+  const normEtat = (v.etatIntervention || "").trim().toLowerCase();
+
+  // 3. Statut en Attente Réparation ou toute attente -> Le travail est suspendu, le mécanicien est LIBRE !
+  if (
+    normAv.includes("attente") ||
+    normEtat.includes("attente") ||
+    normAv.includes("repar") ||
+    normEtat.includes("repar")
+  ) {
+    return false;
+  }
+
+  // 4. Véhicule en Attente Devis, Attente Pièces / Achat ou Essai -> Le mécanicien est LIBRE !
+  if (
+    normAv.includes("devis") ||
+    normEtat.includes("devis") ||
+    normAv.includes("achet") ||
+    normEtat.includes("achet") ||
+    normAv.includes("pièce") ||
+    normAv.includes("piece") ||
+    normAv === "essai" ||
+    normEtat === "essai"
+  ) {
+    return false;
+  }
+
+  // 5. Seul un véhicule dont les travaux sont véritablement En cours occupe le mécanicien
+  const isEnCoursActif =
+    (normAv.startsWith("en cours") || normAv.includes("%") || normEtat === "en cours") &&
+    !normAv.includes("attente") &&
+    !normEtat.includes("attente");
+
+  return isEnCoursActif;
+}
+
+/**
+ * Vérifie si un mécanicien est déjà occupé sur un autre véhicule non terminé et activement en cours.
+ * Règle de l'atelier : 1 seul véhicule en cours par mécanicien à la fois.
+ * Dès qu'un véhicule est terminé ou que le technicien est réaffecté, il redevient LIBRE !
+ */
+export function getActiveVehicleForTech(
+  techMatricule: string,
+  techName: string,
+  allVehicles: Flux[],
+  currentVehicleId?: string | number,
+  currentVehicleNo?: string,
+  reaffectationsMap?: Record<string, ReaffectationRecord>
+): Flux | undefined {
+  if (!allVehicles || allVehicles.length === 0) return undefined;
+  const normMat = (techMatricule || "").trim().toLowerCase();
+  const normName = (techName || "").trim().toLowerCase();
+  if ((!normMat || normMat === "-") && (!normName || normName === "-")) return undefined;
+
+  const currentReaffMap = reaffectationsMap || getReaffectationsLocal();
+
+  return allVehicles.find((v) => {
+    // Exclure le véhicule en cours de consultation/modification
+    if (currentVehicleId && String(v.id) === String(currentVehicleId)) {
+      return false;
+    }
+    if (currentVehicleNo && v.no && v.no.trim() === currentVehicleNo.trim()) {
+      return false;
+    }
+
+    // Le véhicule doit être ACTUELLEMENT en cours actif pour occuper le mécanicien
+    if (!isVehicleActivelyOccupyingTech(v, currentReaffMap)) {
+      return false;
+    }
+
+    // Vérifier correspondance matricule ou nom
+    const vMat = (v.technicien || "").trim().toLowerCase();
+    const vName = (v.nomTechnicien || "").trim().toLowerCase();
+
+    const matchMat = normMat !== "" && normMat !== "-" && vMat !== "" && vMat !== "-" && vMat === normMat;
+    const matchName = normName !== "" && normName !== "-" && vName !== "" && vName !== "-" && (
+      vName === normName ||
+      vName.includes(normName) ||
+      normName.includes(vName)
+    );
+
+    return Boolean(matchMat || matchName);
+  });
+}
+
 interface AffecterTechnicienModalProps {
   isOpen: boolean;
   vehicle: Flux | null;
+  allVehicles?: Flux[];
+  reaffectationsMap?: Record<string, ReaffectationRecord>;
   assignedTeam: string;
   equipeMembers: EquipeMember[];
   isOnlyTechnicienChange?: boolean;
@@ -59,6 +287,8 @@ interface AffecterTechnicienModalProps {
 export default function AffecterTechnicienModal({
   isOpen,
   vehicle,
+  allVehicles = [],
+  reaffectationsMap,
   assignedTeam,
   equipeMembers,
   isOnlyTechnicienChange = false,
@@ -74,60 +304,56 @@ export default function AffecterTechnicienModal({
   const [selectedPoste, setSelectedPoste] = useState<string>("");
   const [showOtherTeams, setShowOtherTeams] = useState<boolean>(false);
   const [isSubmitting, setIsSubmitting] = useState(false);
+  const [occupiedAlert, setOccupiedAlert] = useState<{
+    member: EquipeMember;
+    car: Flux;
+  } | null>(null);
 
-  // Synchronise currentTeam when modal opens or assignedTeam changes
+  // État local des collaborateurs avec synchronisation réactive au stockage local
+  const [localCustomMembers, setLocalCustomMembers] = useState<EquipeMember[] | null>(() => getCustomEquipeMembers());
+  const [localReaffMap, setLocalReaffMap] = useState<Record<string, ReaffectationRecord>>(getReaffectationsLocal);
+
   useEffect(() => {
-    if (isOpen) {
-      const targetTeam = assignedTeam && assignedTeam.trim() !== "-" ? assignedTeam.trim() : "Daily1";
-      setCurrentTeam(targetTeam);
-      setShowOtherTeams(false);
-    }
-  }, [isOpen, assignedTeam]);
+    const handleReaffUpdate = () => {
+      setLocalReaffMap(getReaffectationsLocal());
+    };
+    window.addEventListener("reaffectations_updated", handleReaffUpdate);
+    window.addEventListener("storage", handleReaffUpdate);
+    return () => {
+      window.removeEventListener("reaffectations_updated", handleReaffUpdate);
+      window.removeEventListener("storage", handleReaffUpdate);
+    };
+  }, []);
 
-  // Guaranteed full list of members
-  const allMembers = useMemo(() => {
-    return equipeMembers && equipeMembers.length > 0 ? equipeMembers : DEFAULT_EQUIPE_MAPPINGS;
-  }, [equipeMembers]);
+  const effectiveReaffMap = reaffectationsMap || localReaffMap;
 
-  // Group members into current team and other teams
-  const { teamMembers, otherMembers } = useMemo(() => {
-    const norm = normalizeTeamName(currentTeam);
-    const inTeam: EquipeMember[] = [];
-    const others: EquipeMember[] = [];
+  const openedVehicleKeyRef = useRef<string | null>(null);
 
-    allMembers.forEach((m) => {
-      if (normalizeTeamName(m.team) === norm) {
-        inTeam.push(m);
-      } else {
-        others.push(m);
-      }
-    });
-
-    // Fallback if team has 0 members in sheet: take from defaults
-    if (inTeam.length === 0) {
-      DEFAULT_EQUIPE_MAPPINGS.forEach((m) => {
-        if (normalizeTeamName(m.team) === norm) {
-          inTeam.push(m);
-        }
-      });
+  // Initialisation à l'ouverture du modal : exécutée UNE SEULE FOIS par session d'ouverture
+  useEffect(() => {
+    if (!isOpen || !vehicle) {
+      openedVehicleKeyRef.current = null;
+      return;
     }
 
-    // Sort so technicians/mechanics appear first, followed by Chef d'équipe
-    inTeam.sort((a, b) => {
-      const aIsChef = a.poste.toUpperCase().includes("CHEF") ? 1 : 0;
-      const bIsChef = b.poste.toUpperCase().includes("CHEF") ? 1 : 0;
-      return aIsChef - bIsChef;
-    });
+    const currentKey = `${vehicle.id || vehicle.no || "veh"}_open`;
+    if (openedVehicleKeyRef.current === currentKey) {
+      return; // Déjà initialisé, ne pas effacer la sélection de l'utilisateur !
+    }
+    openedVehicleKeyRef.current = currentKey;
 
-    return { teamMembers: inTeam, otherMembers: others };
-  }, [allMembers, currentTeam]);
+    setLocalCustomMembers(getCustomEquipeMembers());
+    setLocalReaffMap(getReaffectationsLocal());
+    const targetTeam = assignedTeam && assignedTeam.trim() !== "-" ? assignedTeam.trim() : "Daily1";
+    setCurrentTeam(targetTeam);
+    setShowOtherTeams(false);
+    setOccupiedAlert(null);
 
-  // Pre-fill on open if vehicle already has a technicien
-  useEffect(() => {
-    if (!isOpen || !vehicle) return;
-
+    // Initialiser le technicien seulement à l'ouverture initiale
     if (vehicle.technicien && vehicle.technicien !== "-") {
-      const match = allMembers.find(
+      const custom = getCustomEquipeMembers();
+      const list = custom && custom.length > 0 ? custom : (equipeMembers && equipeMembers.length > 0 ? equipeMembers : DEFAULT_EQUIPE_MAPPINGS);
+      const match = list.find(
         (m) =>
           m.matricule === vehicle.technicien ||
           (vehicle.nomTechnicien && m.name.toLowerCase() === vehicle.nomTechnicien.toLowerCase())
@@ -144,18 +370,205 @@ export default function AffecterTechnicienModal({
       setSelectedMatricule(vehicle.technicien && vehicle.technicien !== "-" ? vehicle.technicien : "");
       setSelectedNom(vehicle.nomTechnicien && vehicle.nomTechnicien !== "-" ? vehicle.nomTechnicien : "");
       setSelectedPoste("");
+    } else {
+      setSelectedMatricule("");
+      setSelectedNom("");
+      setSelectedPoste("");
+    }
+  }, [isOpen, vehicle?.id, vehicle?.no, assignedTeam]);
+
+  // Écouter les mises à jour dynamiques depuis GestionEquipesView ou d'autres onglets
+  useEffect(() => {
+    const handleUpdate = () => {
+      setLocalCustomMembers(getCustomEquipeMembers());
+    };
+    window.addEventListener("flux_equipes_updated", handleUpdate);
+    window.addEventListener("flux_teams_updated", handleUpdate);
+    window.addEventListener("storage", handleUpdate);
+    return () => {
+      window.removeEventListener("flux_equipes_updated", handleUpdate);
+      window.removeEventListener("flux_teams_updated", handleUpdate);
+      window.removeEventListener("storage", handleUpdate);
+    };
+  }, []);
+
+  // Liste exhaustive des membres : priorité absolue aux équipes personnalisées à jour
+  const allMembers = useMemo(() => {
+    const fromStorage = getCustomEquipeMembers();
+    if (fromStorage && fromStorage.length > 0) {
+      return fromStorage;
+    }
+    if (localCustomMembers && localCustomMembers.length > 0) {
+      return localCustomMembers;
+    }
+    return equipeMembers && equipeMembers.length > 0 ? equipeMembers : DEFAULT_EQUIPE_MAPPINGS;
+  }, [localCustomMembers, equipeMembers]);
+
+  // Liste dynamique de toutes les équipes (canoniques + toute équipe ajoutée)
+  const availableTeams = useMemo(() => {
+    const set = new Set<string>(CANONICAL_TEAMS);
+    getCustomTeams().forEach((t) => {
+      if (t && t.trim()) set.add(t.trim());
+    });
+    allMembers.forEach((m) => {
+      if (m.team && m.team.trim()) set.add(m.team.trim());
+    });
+    return Array.from(set);
+  }, [allMembers]);
+
+  // Group members into current team and other teams, compute free and occupied count, sort available first
+  const { teamMembers, otherMembers, freeCount, occupiedCount } = useMemo(() => {
+    const norm = normalizeTeamName(currentTeam);
+    const inTeam: EquipeMember[] = [];
+    const others: EquipeMember[] = [];
+
+    allMembers.forEach((m) => {
+      if (normalizeTeamName(m.team) === norm) {
+        inTeam.push(m);
+      } else {
+        others.push(m);
+      }
+    });
+
+    const hasCustom = Boolean(
+      (localCustomMembers && localCustomMembers.length > 0) ||
+      (getCustomEquipeMembers() && (getCustomEquipeMembers()?.length ?? 0) > 0)
+    );
+
+    // Fallback if team has 0 members in sheet and no custom team configuration exists: take from defaults
+    if (inTeam.length === 0 && !hasCustom) {
+      DEFAULT_EQUIPE_MAPPINGS.forEach((m) => {
+        if (normalizeTeamName(m.team) === norm) {
+          inTeam.push(m);
+        }
+      });
+    }
+
+    // Calcul du nombre de libres et occupés
+    let free = 0;
+    let busy = 0;
+    inTeam.forEach((m) => {
+      const activeCar = getActiveVehicleForTech(
+        m.matricule,
+        m.name,
+        allVehicles,
+        vehicle?.id,
+        vehicle?.no,
+        effectiveReaffMap
+      );
+      if (activeCar) {
+        busy += 1;
+      } else {
+        free += 1;
+      }
+    });
+
+    // Tri : Mécaniciens disponibles (libres) en premier, puis les occupés, puis les Chefs d'équipe
+    inTeam.sort((a, b) => {
+      const aBusy = Boolean(
+        getActiveVehicleForTech(
+          a.matricule,
+          a.name,
+          allVehicles,
+          vehicle?.id,
+          vehicle?.no,
+          effectiveReaffMap
+        )
+      );
+      const bBusy = Boolean(
+        getActiveVehicleForTech(
+          b.matricule,
+          b.name,
+          allVehicles,
+          vehicle?.id,
+          vehicle?.no,
+          effectiveReaffMap
+        )
+      );
+
+      if (aBusy !== bBusy) {
+        return aBusy ? 1 : -1; // Libres d'abord
+      }
+
+      const aIsChef = a.poste.toUpperCase().includes("CHEF") ? 1 : 0;
+      const bIsChef = b.poste.toUpperCase().includes("CHEF") ? 1 : 0;
+      if (aIsChef !== bIsChef) {
+        return aIsChef - bIsChef;
+      }
+      return a.name.localeCompare(b.name);
+    });
+
+    return {
+      teamMembers: inTeam,
+      otherMembers: others,
+      freeCount: free,
+      occupiedCount: busy,
+    };
+  }, [allMembers, currentTeam, localCustomMembers, allVehicles, vehicle?.id, vehicle?.no, effectiveReaffMap]);
+
+  // Vérifier si le collaborateur actuellement sélectionné est occupé sur un autre véhicule
+  const selectedMemberBusyCar = useMemo(() => {
+    if (!selectedMatricule || selectedMatricule === "-") return undefined;
+    return getActiveVehicleForTech(
+      selectedMatricule,
+      selectedNom,
+      allVehicles,
+      vehicle?.id,
+      vehicle?.no,
+      effectiveReaffMap
+    );
+  }, [selectedMatricule, selectedNom, allVehicles, vehicle?.id, vehicle?.no, effectiveReaffMap]);
+
+  const handleSelectMember = (member: EquipeMember) => {
+    const activeCar = getActiveVehicleForTech(
+      member.matricule,
+      member.name,
+      allVehicles,
+      vehicle?.id,
+      vehicle?.no,
+      effectiveReaffMap
+    );
+
+    if (activeCar) {
+      // Bloquer et afficher l'alerte explicative (1 mécanicien = 1 voiture)
+      setOccupiedAlert({ member, car: activeCar });
       return;
     }
 
-    // Default: clear selection so the user can choose who works
-    setSelectedMatricule("");
-    setSelectedNom("");
-    setSelectedPoste("");
-  }, [isOpen, vehicle, allMembers]);
+    // Mécanicien libre -> sélection valide
+    setOccupiedAlert(null);
+    setSelectedMatricule(member.matricule);
+    setSelectedNom(member.name);
+    setSelectedPoste(member.poste);
+  };
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!vehicle) return;
+
+    // Règle stricte : blocage si le mécanicien a déjà une voiture en cours
+    if (selectedMatricule && selectedMatricule !== "-") {
+      const busyCar = getActiveVehicleForTech(
+        selectedMatricule,
+        selectedNom,
+        allVehicles,
+        vehicle.id,
+        vehicle.no,
+        effectiveReaffMap
+      );
+      if (busyCar) {
+        setOccupiedAlert({
+          member: {
+            matricule: selectedMatricule,
+            name: selectedNom || selectedMatricule,
+            poste: selectedPoste,
+            team: currentTeam,
+          },
+          car: busyCar,
+        });
+        return;
+      }
+    }
 
     setIsSubmitting(true);
     try {
@@ -255,7 +668,7 @@ export default function AffecterTechnicienModal({
                 Changer d'équipe (Accès Responsable) :
               </span>
               <div className="flex flex-wrap gap-1.5">
-                {CANONICAL_TEAMS.map((teamName) => {
+                {availableTeams.map((teamName) => {
                   const isActive = normalizeTeamName(currentTeam) === normalizeTeamName(teamName);
                   return (
                     <button
@@ -297,7 +710,7 @@ export default function AffecterTechnicienModal({
 
           {/* TEAM MEMBERS SELECTION CARDS */}
           <div className="space-y-2">
-            <div className="flex items-center justify-between">
+            <div className="flex items-center justify-between gap-2">
               <label className="text-xs font-bold text-slate-900 flex items-center gap-1.5">
                 <Users size={14} className="text-blue-600" />
                 <span>
@@ -305,56 +718,126 @@ export default function AffecterTechnicienModal({
                 </span>
                 <span className="text-red-500 font-bold">*</span>
               </label>
-              <span className="text-[11px] font-semibold text-slate-500 bg-slate-100 px-2 py-0.5 rounded-md border border-slate-200">
-                {teamMembers.length} {teamMembers.length > 1 ? "collaborateurs" : "collaborateur"}
+              <div className="flex items-center gap-1.5 text-[11px] font-semibold">
+                <span className="bg-emerald-100 text-emerald-800 px-2 py-0.5 rounded-md border border-emerald-300">
+                  {freeCount} libre{freeCount > 1 ? "s" : ""}
+                </span>
+                {occupiedCount > 0 && (
+                  <span className="bg-rose-100 text-rose-800 px-2 py-0.5 rounded-md border border-rose-300">
+                    {occupiedCount} occupé{occupiedCount > 1 ? "s" : ""}
+                  </span>
+                )}
+              </div>
+            </div>
+
+            <div className="flex items-center justify-between text-[11px] text-slate-500 bg-slate-100/70 px-2.5 py-1.5 rounded-lg border border-slate-200">
+              <span className="flex items-center gap-1 font-medium">
+                <Info size={12} className="text-blue-600 shrink-0" />
+                <span>Règle d'atelier : <strong>1 mécanicien = 1 voiture en cours</strong></span>
+              </span>
+              <span className="text-[10px] text-slate-500 italic">
+                Libre dès que le véhicule actuel est terminé
               </span>
             </div>
-            <p className="text-[11px] text-slate-500">
-              Cliquez directement sur la personne de cette équipe pour l'affecter à l'intervention :
-            </p>
+
+            {/* Alerte si tentative de sélectionner un mécanicien occupé */}
+            {occupiedAlert && (
+              <div className="p-3 bg-rose-50 border-2 border-rose-300 rounded-xl text-xs text-rose-900 flex items-start gap-2.5 animate-in fade-in duration-200 shadow-xs">
+                <AlertTriangle className="w-5 h-5 text-rose-600 shrink-0 mt-0.5" />
+                <div className="flex-1">
+                  <div className="font-extrabold text-rose-950 flex items-center justify-between">
+                    <span>Mécanicien déjà occupé !</span>
+                    <button
+                      type="button"
+                      onClick={() => setOccupiedAlert(null)}
+                      className="text-rose-400 hover:text-rose-800 p-0.5 cursor-pointer"
+                      title="Fermer"
+                    >
+                      <X size={14} />
+                    </button>
+                  </div>
+                  <p className="mt-1 text-[11px] leading-relaxed">
+                    <strong>{occupiedAlert.member.name}</strong> (Mat: {occupiedAlert.member.matricule}) est actuellement affecté au véhicule{" "}
+                    <strong className="text-rose-950 font-mono">
+                      OR {occupiedAlert.car.no || occupiedAlert.car.serie || occupiedAlert.car.id}
+                    </strong>{" "}
+                    ({occupiedAlert.car.marque} {occupiedAlert.car.modele || ""} - {occupiedAlert.car.avancement || occupiedAlert.car.etatIntervention || "En cours"}).
+                  </p>
+                  <p className="mt-1 text-[10px] text-rose-700 font-semibold bg-rose-100/70 p-1 rounded border border-rose-200">
+                    🔒 Règle atelier : Un mécanicien ne peut prendre en charge qu'une seule voiture à la fois jusqu'à ce qu'elle soit terminée.
+                  </p>
+                </div>
+              </div>
+            )}
 
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5 max-h-56 overflow-y-auto p-1.5 bg-slate-50/70 rounded-xl border border-slate-200">
               {teamMembers.map((member) => {
                 const isSelected = selectedMatricule === member.matricule;
                 const isChef = member.poste.toUpperCase().includes("CHEF");
+                const activeCar = getActiveVehicleForTech(
+                  member.matricule,
+                  member.name,
+                  allVehicles,
+                  vehicle?.id,
+                  vehicle?.no,
+                  effectiveReaffMap
+                );
+                const isOccupied = Boolean(activeCar);
+
                 return (
                   <button
                     key={`${member.matricule}_${member.name}`}
                     type="button"
-                    onClick={() => {
-                      setSelectedMatricule(member.matricule);
-                      setSelectedNom(member.name);
-                      setSelectedPoste(member.poste);
-                    }}
-                    className={`group text-left p-3 rounded-xl border-2 transition-all flex items-center justify-between gap-2.5 cursor-pointer ${
+                    onClick={() => handleSelectMember(member)}
+                    className={`group text-left p-2.5 rounded-xl border-2 transition-all flex items-center justify-between gap-2 cursor-pointer ${
                       isSelected
                         ? "border-blue-600 bg-blue-50 shadow-sm ring-2 ring-blue-500/30"
+                        : isOccupied
+                        ? "border-rose-200/80 bg-rose-50/40 hover:border-rose-300 hover:bg-rose-50"
                         : "border-slate-200 hover:border-blue-300 hover:bg-white bg-white/90"
                     }`}
                   >
-                    <div className="flex items-center gap-2.5 min-w-0">
+                    <div className="flex items-center gap-2.5 min-w-0 flex-1">
                       <div
                         className={`w-9 h-9 rounded-xl flex items-center justify-center font-bold text-xs shrink-0 transition-transform group-hover:scale-105 ${
                           isSelected
                             ? "bg-blue-600 text-white shadow-xs"
+                            : isOccupied
+                            ? "bg-rose-100 text-rose-800 border border-rose-300"
                             : isChef
                             ? "bg-amber-100 text-amber-900 border border-amber-300"
                             : "bg-slate-100 text-slate-700 border border-slate-200"
                         }`}
                       >
                         {isChef ? (
-                          <ShieldCheck size={16} className={isSelected ? "text-white" : "text-amber-700"} />
+                          <ShieldCheck size={16} className={isSelected ? "text-white" : isOccupied ? "text-rose-700" : "text-amber-700"} />
                         ) : member.poste.toUpperCase().includes("ELEC") ? (
-                          <Zap size={15} className={isSelected ? "text-white" : "text-purple-600"} />
+                          <Zap size={15} className={isSelected ? "text-white" : isOccupied ? "text-rose-700" : "text-purple-600"} />
                         ) : member.poste.toUpperCase().includes("TOLL") ? (
-                          <Hammer size={15} className={isSelected ? "text-white" : "text-emerald-600"} />
+                          <Hammer size={15} className={isSelected ? "text-white" : isOccupied ? "text-rose-700" : "text-emerald-600"} />
                         ) : (
-                          <Wrench size={15} className={isSelected ? "text-white" : "text-blue-600"} />
+                          <Wrench size={15} className={isSelected ? "text-white" : isOccupied ? "text-rose-700" : "text-blue-600"} />
                         )}
                       </div>
-                      <div className="min-w-0">
-                        <div className="font-extrabold text-xs text-slate-900 truncate">
-                          {member.name}
+                      <div className="min-w-0 flex-1">
+                        <div className="flex items-center justify-between gap-1">
+                          <span className="font-extrabold text-xs text-slate-900 truncate">
+                            {member.name}
+                          </span>
+                          {isOccupied ? (
+                            <span
+                              className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[9px] font-extrabold bg-rose-100 text-rose-800 border border-rose-300 shrink-0"
+                              title={`Occupé sur OR ${activeCar?.no || activeCar?.serie || ""}`}
+                            >
+                              <span className="w-1.5 h-1.5 rounded-full bg-rose-600"></span>
+                              Occupé
+                            </span>
+                          ) : (
+                            <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[9px] font-extrabold bg-emerald-100 text-emerald-800 border border-emerald-300 shrink-0">
+                              <span className="w-1.5 h-1.5 rounded-full bg-emerald-600"></span>
+                              Libre
+                            </span>
+                          )}
                         </div>
                         <div className="flex items-center gap-1.5 mt-0.5 text-[10px]">
                           <span className="font-mono font-bold text-slate-600 bg-slate-100 px-1.5 py-0.2 rounded border border-slate-200">
@@ -368,6 +851,11 @@ export default function AffecterTechnicienModal({
                             {member.poste}
                           </span>
                         </div>
+                        {isOccupied && activeCar && (
+                          <div className="mt-1 text-[9.5px] font-semibold text-rose-700 bg-rose-100/60 px-1.5 py-0.5 rounded border border-rose-200 truncate">
+                            OR {activeCar.no || activeCar.serie || "Sans N°"} : {activeCar.marque} {activeCar.modele || ""} ({activeCar.avancement || activeCar.etatIntervention || "En cours"})
+                          </div>
+                        )}
                       </div>
                     </div>
 
@@ -375,10 +863,16 @@ export default function AffecterTechnicienModal({
                       className={`w-5 h-5 rounded-full flex items-center justify-center shrink-0 transition-all ${
                         isSelected
                           ? "bg-blue-600 text-white shadow-xs scale-105"
+                          : isOccupied
+                          ? "border border-rose-300 bg-rose-100/60"
                           : "border-2 border-slate-300 bg-white group-hover:border-blue-400"
                       }`}
                     >
-                      {isSelected && <Check size={12} strokeWidth={3} />}
+                      {isSelected ? (
+                        <Check size={12} strokeWidth={3} />
+                      ) : isOccupied ? (
+                        <span className="text-[10px] text-rose-600 font-black">✕</span>
+                      ) : null}
                     </div>
                   </button>
                 );
@@ -389,7 +883,9 @@ export default function AffecterTechnicienModal({
           {/* Selected Member Confirmation Card */}
           <div
             className={`p-3 rounded-xl border flex items-center justify-between gap-3 text-xs transition-colors ${
-              selectedMatricule
+              selectedMemberBusyCar
+                ? "bg-rose-50/90 border-rose-300 text-rose-950"
+                : selectedMatricule
                 ? "bg-emerald-50/90 border-emerald-300 text-emerald-950"
                 : "bg-amber-50/80 border-amber-200 text-amber-900"
             }`}
@@ -397,16 +893,27 @@ export default function AffecterTechnicienModal({
             <div className="flex items-center gap-2.5 min-w-0">
               <div
                 className={`w-8 h-8 rounded-lg flex items-center justify-center shrink-0 ${
-                  selectedMatricule ? "bg-emerald-600 text-white" : "bg-amber-200 text-amber-800"
+                  selectedMemberBusyCar
+                    ? "bg-rose-600 text-white"
+                    : selectedMatricule
+                    ? "bg-emerald-600 text-white"
+                    : "bg-amber-200 text-amber-800"
                 }`}
               >
-                <UserCheck size={16} />
+                {selectedMemberBusyCar ? <AlertTriangle size={16} /> : <UserCheck size={16} />}
               </div>
               <div className="min-w-0">
                 <span className="font-bold text-[10px] block text-slate-500 uppercase tracking-wide">
                   Personne désignée :
                 </span>
-                {selectedMatricule ? (
+                {selectedMemberBusyCar ? (
+                  <div className="font-extrabold text-xs text-rose-900">
+                    <span className="font-mono bg-rose-100 px-1 py-0.2 rounded border border-rose-300 mr-1.5">
+                      {selectedMatricule}
+                    </span>
+                    {selectedNom} - ⛔ Déjà occupé sur OR {selectedMemberBusyCar.no || selectedMemberBusyCar.serie}
+                  </div>
+                ) : selectedMatricule ? (
                   <div className="font-extrabold text-xs text-emerald-900 truncate">
                     <span className="font-mono bg-emerald-100 px-1 py-0.2 rounded border border-emerald-300 mr-1.5">
                       {selectedMatricule}
@@ -415,18 +922,24 @@ export default function AffecterTechnicienModal({
                   </div>
                 ) : (
                   <span className="text-amber-800 font-semibold italic text-xs">
-                    Veuillez cliquer sur une personne de l'équipe ci-dessus.
+                    Veuillez cliquer sur un mécanicien libre ci-dessus.
                   </span>
                 )}
               </div>
             </div>
 
-            {selectedMatricule && (
-              <span className="px-2 py-0.5 rounded-md font-extrabold text-[11px] bg-emerald-200 text-emerald-800 border border-emerald-300 shrink-0">
-                Sélectionné
+            {selectedMemberBusyCar ? (
+              <span className="px-2 py-0.5 rounded-md font-extrabold text-[11px] bg-rose-200 text-rose-900 border border-rose-300 shrink-0">
+                Non disponible
               </span>
-            )}
-           {/* Collapsible: Autre collaborateur ou autre équipe (Réservé au Chef Atelier / Administration) */}
+            ) : selectedMatricule ? (
+              <span className="px-2 py-0.5 rounded-md font-extrabold text-[11px] bg-emerald-200 text-emerald-800 border border-emerald-300 shrink-0">
+                Disponible
+              </span>
+            ) : null}
+          </div>
+
+          {/* Collapsible: Autre collaborateur ou autre équipe (Réservé au Chef Atelier / Administration) */}
           {canChangeTeam && (
             <div className="border border-slate-200 rounded-xl overflow-hidden text-xs">
               <button
@@ -455,10 +968,24 @@ export default function AffecterTechnicienModal({
                           setSelectedMatricule("");
                           setSelectedNom("");
                           setSelectedPoste("");
+                          setOccupiedAlert(null);
                           return;
                         }
                         const match = allMembers.find((m) => m.matricule === val);
                         if (match) {
+                          const busy = getActiveVehicleForTech(
+                            match.matricule,
+                            match.name,
+                            allVehicles,
+                            vehicle?.id,
+                            vehicle?.no,
+                            effectiveReaffMap
+                          );
+                          if (busy) {
+                            setOccupiedAlert({ member: match, car: busy });
+                            return;
+                          }
+                          setOccupiedAlert(null);
                           setSelectedMatricule(match.matricule);
                           setSelectedNom(match.name);
                           setSelectedPoste(match.poste);
@@ -468,18 +995,32 @@ export default function AffecterTechnicienModal({
                       className="w-full text-xs font-semibold text-slate-900 bg-white border border-slate-300 rounded-lg px-2.5 py-2"
                     >
                       <option value="">-- Sélectionner un autre collaborateur --</option>
-                      {otherMembers.map((m) => (
-                        <option key={`other_${m.team}_${m.matricule}`} value={m.matricule}>
-                          [{m.team}] {m.name} ({m.poste}) - Mat: {m.matricule}
-                        </option>
-                      ))}
+                      {otherMembers.map((m) => {
+                        const busy = getActiveVehicleForTech(
+                          m.matricule,
+                          m.name,
+                          allVehicles,
+                          vehicle?.id,
+                          vehicle?.no,
+                          effectiveReaffMap
+                        );
+                        return (
+                          <option
+                            key={`other_${m.team}_${m.matricule}`}
+                            value={m.matricule}
+                            disabled={Boolean(busy)}
+                          >
+                            {busy ? `⛔ [OCCUPÉ - OR ${busy.no || busy.serie || busy.id}] ` : "🟢 [LIBRE] "}
+                            [{m.team}] {m.name} ({m.poste}) - Mat: {m.matricule}
+                          </option>
+                        );
+                      })}
                     </select>
                   </div>
                 </div>
               )}
             </div>
           )}
-          </div>
 
           {/* Actions */}
           <div className="pt-3 border-t border-slate-100 flex flex-col sm:flex-row items-center justify-between gap-2.5">
@@ -507,12 +1048,17 @@ export default function AffecterTechnicienModal({
 
               <button
                 type="submit"
-                disabled={isSubmitting || !selectedMatricule}
+                disabled={isSubmitting || !selectedMatricule || Boolean(selectedMemberBusyCar)}
                 className={`inline-flex items-center justify-center gap-2 px-5 py-2.5 text-xs font-bold text-white rounded-xl shadow-md transition-all cursor-pointer ${
-                  selectedMatricule
+                  selectedMatricule && !selectedMemberBusyCar
                     ? "bg-blue-600 hover:bg-blue-700 shadow-blue-600/30 hover:scale-[1.02] active:scale-[0.98]"
                     : "bg-slate-300 text-slate-500 cursor-not-allowed shadow-none"
                 }`}
+                title={
+                  selectedMemberBusyCar
+                    ? "Impossible d'affecter : ce mécanicien est déjà occupé sur un autre véhicule"
+                    : undefined
+                }
               >
                 <Check size={14} strokeWidth={2.5} />
                 <span>

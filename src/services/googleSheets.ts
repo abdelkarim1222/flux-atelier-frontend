@@ -600,13 +600,13 @@ function cleanupJsonp(
     jsonpWindow[callbackName] = () => {
       try {
         delete jsonpWindow[callbackName];
-      } catch (_) {}
+      } catch (_) { }
     };
   }
   if (script) {
     try {
       script.remove();
-    } catch (_) {}
+    } catch (_) { }
   }
 }
 
@@ -752,7 +752,7 @@ export interface EquipeSheetResult {
 }
 
 export const DEFAULT_EQUIPE_MAPPINGS: EquipeMember[] = [
-  // 1. Daily1
+  // 1. Daily1 (6 collaborateurs)
   { team: "Daily1", name: "WAJIH TOUIL", poste: "CHEF EQUIPE", matricule: "8701" },
   { team: "Daily1", name: "Montassar Bjaoui", poste: "MECANICIEN", matricule: "1214" },
   { team: "Daily1", name: "MOUHAMED SAMI BEN SALEM", poste: "MECANICIEN", matricule: "1482" },
@@ -831,31 +831,41 @@ export function getTeamForChefEquipe(
   if (clean.includes("SERVICE RAPIDE") || clean.includes("RAPIDE") || clean.includes("TRABELSI")) return "Service Rapide";
   if (clean.includes("CARROSSERIE") || clean.includes("BEN AMARA")) return "Carrosserie";
   if (clean.includes("ELECTRIQUE") || clean.includes("ELICTRIQUE") || clean.includes("BOUSHIH")) return "Elictrique";
-  if (clean.includes("CHANGAN") || clean.includes("AMEN")) return "Changan";
+  if (clean.includes("CHANGAN")) return "Changan";
   return "Daily1";
 }
 
 const CUSTOM_EQUIPES_KEY = "flux_atelier_equipes_custom";
 
 export function getCustomEquipeMembers(): EquipeMember[] | null {
-  if (typeof window === "undefined") return null;
+  if (typeof window === "undefined") return DEFAULT_EQUIPE_MAPPINGS;
   try {
     const raw = localStorage.getItem(CUSTOM_EQUIPES_KEY);
-    if (!raw) return null;
+    if (!raw) return DEFAULT_EQUIPE_MAPPINGS;
     const parsed = JSON.parse(raw);
-    if (Array.isArray(parsed) && parsed.length > 0) return parsed;
+    if (Array.isArray(parsed) && parsed.length > 0) {
+      return parsed;
+    }
   } catch {
     // Ignored
   }
-  return null;
+  return DEFAULT_EQUIPE_MAPPINGS;
 }
 
 export function saveCustomEquipeMembers(members: EquipeMember[]): void {
   if (typeof window === "undefined") return;
   try {
     localStorage.setItem(CUSTOM_EQUIPES_KEY, JSON.stringify(members));
+    window.dispatchEvent(new CustomEvent("flux_equipes_updated", { detail: members }));
+    window.dispatchEvent(new Event("storage"));
   } catch (err) {
     console.warn("Erreur sauvegarde équipes locales:", err);
+  }
+  // Synchronisation distante transparente si Apps Script configuré
+  if (isGoogleSheetWriteConfigured()) {
+    void sauvegarderEquipesRemote(members).catch((e) =>
+      console.warn("Erreur synchronisation distante équipes:", e)
+    );
   }
 }
 
@@ -863,14 +873,94 @@ export function resetCustomEquipeMembers(): void {
   if (typeof window === "undefined") return;
   try {
     localStorage.removeItem(CUSTOM_EQUIPES_KEY);
+    window.dispatchEvent(new CustomEvent("flux_equipes_updated", { detail: null }));
+    window.dispatchEvent(new Event("storage"));
   } catch (err) {
     console.warn("Erreur réinitialisation équipes locales:", err);
   }
 }
 
+export async function sauvegarderEquipesRemote(
+  members: EquipeMember[]
+): Promise<{ ok: boolean; message?: string }> {
+  const writeUrl = getSheetWriteUrl();
+  if (!writeUrl || typeof window === "undefined") {
+    return { ok: true, message: "Sauvegardé localement" };
+  }
+
+  const token = getSheetWriteToken();
+
+  // 1. Essai prioritaire via POST text/plain pour éviter la limite d'URL
+  try {
+    const postPayload = {
+      action: "sauvegarderEquipes",
+      token: token || "",
+      equipesJson: JSON.stringify(members),
+    };
+
+    await fetch(writeUrl, {
+      method: "POST",
+      mode: "no-cors",
+      headers: { "Content-Type": "text/plain;charset=utf-8" },
+      body: JSON.stringify(postPayload),
+    });
+  } catch (errPost) {
+    console.warn("Tentative POST sauvegarderEquipes:", errPost);
+  }
+
+  // 2. Requête JSONP de confirmation
+  return new Promise((resolve) => {
+    let timeout = 0;
+    const callbackName = `cb_eq_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+    const jsonpWindow = window as unknown as Window &
+      Record<string, ((r: { ok?: boolean; message?: string }) => void) | undefined>;
+    const script = document.createElement("script");
+
+    function cleanup() {
+      window.clearTimeout(timeout);
+      if (jsonpWindow[callbackName]) {
+        jsonpWindow[callbackName] = () => {
+          try { delete jsonpWindow[callbackName]; } catch (_) {}
+        };
+      }
+      try { script.remove(); } catch (_) {}
+    }
+
+    try {
+      const url = new URL(writeUrl);
+      url.searchParams.set("action", "sauvegarderEquipes");
+      url.searchParams.set("callback", callbackName);
+      url.searchParams.set("equipesJson", JSON.stringify(members));
+      if (token) url.searchParams.set("token", token);
+
+      timeout = window.setTimeout(() => {
+        cleanup();
+        resolve({ ok: true, message: "Équipes sauvegardées avec succès." });
+      }, 8000);
+
+      jsonpWindow[callbackName] = (response) => {
+        cleanup();
+        resolve({ ok: response?.ok ?? true, message: response?.message || "Équipes sauvegardées." });
+      };
+
+      script.onerror = () => {
+        cleanup();
+        resolve({ ok: true, message: "Sauvegardé localement." });
+      };
+
+      script.src = url.toString();
+      document.head.appendChild(script);
+    } catch {
+      cleanup();
+      resolve({ ok: true, message: "Sauvegardé localement." });
+    }
+  });
+}
+
 export async function fetchEquipeSheetData(): Promise<EquipeSheetResult> {
+  // 1. Si des équipes personnalisées ont été modifiées localement dans l'app, les prioriser
   const customMembers = getCustomEquipeMembers();
-  if (customMembers && customMembers.length > 0) {
+  if (customMembers && customMembers.length > 0 && typeof window !== "undefined" && localStorage.getItem(CUSTOM_EQUIPES_KEY)) {
     const teamByMemberName = new Map<string, string>();
     customMembers.forEach((m) => {
       teamByMemberName.set(normalizePersonName(m.name), m.team);
@@ -884,99 +974,75 @@ export async function fetchEquipeSheetData(): Promise<EquipeSheetResult> {
     };
   }
 
+  // 2. Tenter de lire dynamiquement la feuille _LISTES_EQUIPE de Google Sheets (sans limite de lignes)
   const tqx = "out:json";
-  const url = `${BASE_GVIZ_URL}?sheet=EQUIPE&headers=1&tqx=${encodeURIComponent(tqx)}`;
-
   try {
+    const url = `${BASE_GVIZ_URL}?sheet=_LISTES_EQUIPE&headers=1&tqx=${encodeURIComponent(tqx)}`;
     const res = await fetch(url, { cache: "no-store" });
-    if (!res.ok) throw new Error("Erreur HTTP " + res.status);
-    const text = await res.text();
-    const json = extractGvizJson(text);
+    if (res.ok) {
+      const text = await res.text();
+      const json = extractGvizJson(text);
+      const rows = json.table?.rows ?? [];
 
-    const rows = json.table?.rows ?? [];
+      const members: EquipeMember[] = [];
+      const teamByMemberName = new Map<string, string>();
 
-    const members: EquipeMember[] = [];
-    const teamByMemberName = new Map<string, string>();
+      for (const r of rows) {
+        const team = String(r?.c?.[0]?.v || "").trim();
+        const mat = String(r?.c?.[1]?.v || "").trim();
+        const nom = String(r?.c?.[2]?.v || "").trim();
+        const poste = String(r?.c?.[3]?.v || "").trim();
 
-    function addMember(team: string, mat: unknown, nom: unknown, poste: unknown) {
-      if (
-        nom &&
-        typeof nom === "string" &&
-        nom.trim() &&
-        !nom.toLowerCase().includes("technicien") &&
-        !nom.toLowerCase().includes("colonne") &&
-        !nom.toLowerCase().includes("correspondance")
-      ) {
-        const cleanName = nom.trim();
+        if (!nom || !team) continue;
+        if (
+          nom.toLowerCase().includes("technicien") ||
+          nom.toLowerCase().includes("colonne") ||
+          nom.toLowerCase().includes("correspondance")
+        ) {
+          continue;
+        }
+
+        const cleanTeam = team;
+        const cleanPoste = poste || "MECANICIEN";
+
         members.push({
-          team,
-          name: cleanName,
-          poste: String(poste || "").trim(),
-          matricule: mat ? String(mat).trim() : "",
+          team: cleanTeam,
+          name: nom,
+          matricule: mat,
+          poste: cleanPoste,
         });
-        teamByMemberName.set(normalizePersonName(cleanName), team);
+        teamByMemberName.set(normalizePersonName(nom), cleanTeam);
+      }
+
+      if (members.length > 0) {
+        // Enregistrer la version distante dans le cache pour un affichage instantané
+        try {
+          localStorage.setItem(CUSTOM_EQUIPES_KEY, JSON.stringify(members));
+        } catch (_) {}
+
+        const chefsEquipe = members.filter((m) =>
+          m.poste.toUpperCase().includes("CHEF")
+        );
+
+        return { members, chefsEquipe, teamByMemberName };
       }
     }
-
-    // Group 1 (Cols A-B-C: 0, 1, 2): Daily1 (rows 1-6), Service Rapide (rows 11-12)
-    for (let r = 1; r <= 6; r++) {
-      addMember("Daily1", rows[r]?.c?.[0]?.v, rows[r]?.c?.[1]?.v, rows[r]?.c?.[2]?.v);
-    }
-    for (let r = 11; r <= 12; r++) {
-      addMember("Service Rapide", rows[r]?.c?.[0]?.v, rows[r]?.c?.[1]?.v, rows[r]?.c?.[2]?.v);
-    }
-
-    // Group 2 (Cols E-F-G: 4, 5, 6): Daily2 (rows 1-2), Lourd (rows 6-11)
-    for (let r = 1; r <= 2; r++) {
-      addMember("Daily2", rows[r]?.c?.[4]?.v, rows[r]?.c?.[5]?.v, rows[r]?.c?.[6]?.v);
-    }
-    for (let r = 6; r <= 11; r++) {
-      addMember("Lourd", rows[r]?.c?.[4]?.v, rows[r]?.c?.[5]?.v, rows[r]?.c?.[6]?.v);
-    }
-
-    // Group 3 (Cols I-J-K: 8, 9, 10): Changan (rows 1-2), Carrosserie (rows 7-8), Elictrique (rows 13-14)
-    for (let r = 1; r <= 2; r++) {
-      addMember("Changan", rows[r]?.c?.[8]?.v, rows[r]?.c?.[9]?.v, rows[r]?.c?.[10]?.v);
-    }
-    for (let r = 7; r <= 8; r++) {
-      addMember("Carrosserie", rows[r]?.c?.[8]?.v, rows[r]?.c?.[9]?.v, rows[r]?.c?.[10]?.v);
-    }
-    for (let r = 13; r <= 14; r++) {
-      addMember("Elictrique", rows[r]?.c?.[8]?.v, rows[r]?.c?.[9]?.v, rows[r]?.c?.[10]?.v);
-    }
-
-    // Safety merge: ensure every known default member/technician is included
-    DEFAULT_EQUIPE_MAPPINGS.forEach((def) => {
-      const exists = members.some(
-        (m) =>
-          normalizePersonName(m.name) === normalizePersonName(def.name) ||
-          (def.matricule && m.matricule === def.matricule)
-      );
-      if (!exists) {
-        members.push(def);
-        teamByMemberName.set(normalizePersonName(def.name), def.team);
-      }
-    });
-
-    const chefsEquipe = members.filter((m) =>
-      m.poste.toUpperCase().includes("CHEF")
-    );
-
-    return { members, chefsEquipe, teamByMemberName };
   } catch (err) {
-    console.warn("Chargement distant EQUIPE échoué, fallback sur données intégrées:", err);
-    const teamByMemberName = new Map<string, string>();
-    DEFAULT_EQUIPE_MAPPINGS.forEach((m) => {
-      teamByMemberName.set(normalizePersonName(m.name), m.team);
-    });
-    return {
-      members: DEFAULT_EQUIPE_MAPPINGS,
-      chefsEquipe: DEFAULT_EQUIPE_MAPPINGS.filter((m) =>
-        m.poste.toUpperCase().includes("CHEF")
-      ),
-      teamByMemberName,
-    };
+    console.warn("Lecture distante _LISTES_EQUIPE impossible, fallback:", err);
   }
+
+  // 3. Fallback sur les données par défaut intégrées
+  const teamByMemberName = new Map<string, string>();
+  DEFAULT_EQUIPE_MAPPINGS.forEach((m) => {
+    teamByMemberName.set(normalizePersonName(m.name), m.team);
+  });
+  return {
+    members: DEFAULT_EQUIPE_MAPPINGS,
+    chefsEquipe: DEFAULT_EQUIPE_MAPPINGS.filter((m) =>
+      m.poste.toUpperCase().includes("CHEF")
+    ),
+    teamByMemberName,
+  };
 }
 
 export interface MoyennesRow {
@@ -1236,7 +1302,7 @@ export async function fetchMoyennesSheetData(): Promise<MoyennesSheetData> {
 
     try {
       localStorage.setItem(MOYENNES_STORAGE_KEY, JSON.stringify(result));
-    } catch {}
+    } catch { }
 
     return result;
   } catch (err) {
@@ -1246,7 +1312,7 @@ export async function fetchMoyennesSheetData(): Promise<MoyennesSheetData> {
       if (cached) {
         return JSON.parse(cached) as MoyennesSheetData;
       }
-    } catch {}
+    } catch { }
     return DEFAULT_MOYENNES_DATA;
   }
 }
@@ -1404,7 +1470,7 @@ function callSheetWriteAction(
         if (!response.ok) {
           const defaultError =
             action === "updateEtat" &&
-            String(response.error || "").includes("Action inconnue")
+              String(response.error || "").includes("Action inconnue")
               ? "Redéploie le script Apps Script pour activer la modification de l'Etat."
               : "Google Sheets a refuse la modification.";
 
@@ -1526,6 +1592,8 @@ export const BASE_AVANCEMENT_OPTIONS = [
   "En cours - 70%",
   "En cours - 80%",
   "En cours - 90%",
+  "Attente PDR",
+  "Technicien réaffecté",
   "attends acheter",
   "Essai",
   "Terminer",
@@ -1637,9 +1705,10 @@ export interface DemandeAchat {
   commentaire?: string;
   equipe?: string;
   demandeur?: string;
-  statutAchat?: "Attente" | "Livrer" | "Livré";
+  statutAchat?: "Attente" | "Livrer" | "Livré" | "Pièce retirée";
   dateLivraison?: string;
   livrePar?: string;
+  createdAtTimestamp?: number;
 }
 
 export interface DemandeEssaiControle {
@@ -1668,10 +1737,21 @@ export interface DemandeDevis {
   modele: string;      // Modèle
   immatriculation: string; // N° Immatriculation
   date: string;
+  pieces?: string;     // Pièces remplacées / demandées dans le devis
   equipe?: string;
+  equipeOrigine?: string;  // Équipe qui a initié le devis (pour retour automatique dès accord)
+  technicien?: string;     // Matricule du technicien assigné à la création du devis
+  nomTechnicien?: string;  // Nom complet du technicien assigné
   demandeur?: string;
-  statutDevis?: "En attente accord" | "Accepté" | "Refusé";
+  statutDevis?: "En attente accord" | "Client appelé" | "Accepté" | "Refusé" | "Annulé";
   commentaire?: string;
+  dateAppel?: string;      // Date et heure du premier appel au client
+  appelant?: string;        // Nom de la réceptionniste ayant appelé
+  dateDecision?: string;   // Date d'acceptation ou refus
+  dateRelance?: string;    // Date du rappel si > 24h
+  createdAtTimestamp?: number; // Pour calcul précis du délai de 24h (1 jour)
+  calledAtTimestamp?: number;  // Pour calcul du délai de 24h après appel
+  decisionAtTimestamp?: number; // Timestamp exact de la décision (accepté / refusé) pour calcul précis chronométrie
 }
 
 const STORAGE_KEY_DEMANDES_DEVIS = "flux_atelier_demandes_devis";
@@ -1692,13 +1772,655 @@ export function saveDemandeDevisLocal(devis: DemandeDevis): void {
     const key = String(devis.vehicleId || devis.or || devis.chassis);
     all[key] = {
       ...devis,
-      statutDevis: devis.statutDevis || "En attente accord",
+      equipeOrigine: devis.equipeOrigine || devis.equipe || all[key]?.equipeOrigine || all[key]?.equipe,
+      statutDevis: devis.statutDevis || all[key]?.statutDevis || "En attente accord",
+      createdAtTimestamp: devis.createdAtTimestamp || all[key]?.createdAtTimestamp || Date.now(),
     };
     localStorage.setItem(STORAGE_KEY_DEMANDES_DEVIS, JSON.stringify(all));
     window.dispatchEvent(new Event("demandes_devis_updated"));
   } catch (e) {
     console.warn("Erreur sauvegarde demande devis:", e);
   }
+}
+
+export function marquerDevisAppele(
+  keyOrId: string,
+  appelant?: string,
+  dateAppelCustom?: string,
+  fallbackVehicle?: Flux,
+  commentaire?: string
+): DemandeDevis | null {
+  try {
+    const all = getDemandesDevisLocal();
+    let targetKey = keyOrId;
+    if (!all[targetKey]) {
+      const foundEntry = Object.entries(all).find(
+        ([, d]) =>
+          d.id === keyOrId ||
+          String(d.vehicleId) === keyOrId ||
+          d.or === keyOrId ||
+          d.chassis === keyOrId ||
+          d.numeroDevis === keyOrId
+      );
+      if (foundEntry) targetKey = foundEntry[0];
+    }
+
+    const now = new Date();
+    const dd = String(now.getDate()).padStart(2, "0");
+    const mm = String(now.getMonth() + 1).padStart(2, "0");
+    const yyyy = now.getFullYear();
+    const hh = String(now.getHours()).padStart(2, "0");
+    const min = String(now.getMinutes()).padStart(2, "0");
+    const dateAppel = dateAppelCustom || `${dd}/${mm}/${yyyy} ${hh}:${min}`;
+
+    if (all[targetKey]) {
+      all[targetKey] = {
+        ...all[targetKey],
+        statutDevis: "Client appelé",
+        dateAppel,
+        appelant: appelant || all[targetKey].appelant || "Réception",
+        commentaire: commentaire !== undefined ? commentaire : all[targetKey].commentaire,
+        calledAtTimestamp: Date.now(),
+      };
+    } else {
+      const fallbackKey = keyOrId;
+      all[fallbackKey] = {
+        id: fallbackKey,
+        vehicleId: fallbackVehicle?.id,
+        numeroDevis: `DV-${fallbackVehicle?.no || fallbackVehicle?.ordre || fallbackKey}`,
+        or: fallbackVehicle?.no || fallbackVehicle?.ordre || fallbackKey,
+        chassis: fallbackVehicle?.chassis || "",
+        client: fallbackVehicle?.client || "Client",
+        modele: fallbackVehicle?.modele || "-",
+        immatriculation: fallbackVehicle?.serie || fallbackVehicle?.immatriculation || "-",
+        date: dateAppel || `${dd}/${mm}/${yyyy} ${hh}:${min}`,
+        equipe: fallbackVehicle?.equipe || "Daily1",
+        equipeOrigine: fallbackVehicle?.equipe || "Daily1",
+        statutDevis: "Client appelé",
+        dateAppel,
+        appelant: appelant || "Réception",
+        commentaire: commentaire || "",
+        createdAtTimestamp: Date.now(),
+        calledAtTimestamp: Date.now(),
+      };
+      targetKey = fallbackKey;
+    }
+
+    localStorage.setItem(STORAGE_KEY_DEMANDES_DEVIS, JSON.stringify(all));
+    window.dispatchEvent(new Event("demandes_devis_updated"));
+    return all[targetKey];
+  } catch (e) {
+    console.warn("Erreur marquage appel devis:", e);
+  }
+  return null;
+}
+
+export function marquerDevisRelance(keyOrId: string, relanceur?: string): DemandeDevis | null {
+  try {
+    const all = getDemandesDevisLocal();
+    let targetKey = keyOrId;
+    if (!all[targetKey]) {
+      const foundEntry = Object.entries(all).find(
+        ([, d]) =>
+          d.id === keyOrId ||
+          String(d.vehicleId) === keyOrId ||
+          d.or === keyOrId ||
+          d.chassis === keyOrId ||
+          d.numeroDevis === keyOrId
+      );
+      if (foundEntry) targetKey = foundEntry[0];
+    }
+
+    if (all[targetKey]) {
+      const now = new Date();
+      const dd = String(now.getDate()).padStart(2, "0");
+      const mm = String(now.getMonth() + 1).padStart(2, "0");
+      const yyyy = now.getFullYear();
+      const hh = String(now.getHours()).padStart(2, "0");
+      const min = String(now.getMinutes()).padStart(2, "0");
+      const dateRelance = `${dd}/${mm}/${yyyy} ${hh}:${min}`;
+
+      all[targetKey] = {
+        ...all[targetKey],
+        dateRelance,
+        calledAtTimestamp: Date.now(),
+        appelant: relanceur || all[targetKey].appelant,
+      };
+      localStorage.setItem(STORAGE_KEY_DEMANDES_DEVIS, JSON.stringify(all));
+      window.dispatchEvent(new Event("demandes_devis_updated"));
+      return all[targetKey];
+    }
+  } catch (e) {
+    console.warn("Erreur marquage relance devis:", e);
+  }
+  return null;
+}
+
+export function marquerDevisAccepte(keyOrId: string): DemandeDevis | null {
+  try {
+    const all = getDemandesDevisLocal();
+    let targetKey = keyOrId;
+    if (!all[targetKey]) {
+      const foundEntry = Object.entries(all).find(
+        ([, d]) =>
+          d.id === keyOrId ||
+          String(d.vehicleId) === keyOrId ||
+          d.or === keyOrId ||
+          d.chassis === keyOrId ||
+          d.numeroDevis === keyOrId
+      );
+      if (foundEntry) targetKey = foundEntry[0];
+    }
+
+    if (all[targetKey]) {
+      const now = new Date();
+      const dd = String(now.getDate()).padStart(2, "0");
+      const mm = String(now.getMonth() + 1).padStart(2, "0");
+      const yyyy = now.getFullYear();
+      const hh = String(now.getHours()).padStart(2, "0");
+      const min = String(now.getMinutes()).padStart(2, "0");
+      const dateDecision = `${dd}/${mm}/${yyyy} ${hh}:${min}`;
+
+      all[targetKey] = {
+        ...all[targetKey],
+        statutDevis: "Accepté",
+        dateDecision,
+        decisionAtTimestamp: Date.now(),
+      };
+      localStorage.setItem(STORAGE_KEY_DEMANDES_DEVIS, JSON.stringify(all));
+      window.dispatchEvent(new Event("demandes_devis_updated"));
+      return all[targetKey];
+    }
+  } catch (e) {
+    console.warn("Erreur marquage devis accepté:", e);
+  }
+  return null;
+}
+
+export function marquerDevisRefuse(keyOrId: string): DemandeDevis | null {
+  try {
+    const all = getDemandesDevisLocal();
+    let targetKey = keyOrId;
+    if (!all[targetKey]) {
+      const foundEntry = Object.entries(all).find(
+        ([, d]) =>
+          d.id === keyOrId ||
+          String(d.vehicleId) === keyOrId ||
+          d.or === keyOrId ||
+          d.chassis === keyOrId ||
+          d.numeroDevis === keyOrId
+      );
+      if (foundEntry) targetKey = foundEntry[0];
+    }
+
+    if (all[targetKey]) {
+      const now = new Date();
+      const dd = String(now.getDate()).padStart(2, "0");
+      const mm = String(now.getMonth() + 1).padStart(2, "0");
+      const yyyy = now.getFullYear();
+      const hh = String(now.getHours()).padStart(2, "0");
+      const min = String(now.getMinutes()).padStart(2, "0");
+      const dateDecision = `${dd}/${mm}/${yyyy} ${hh}:${min}`;
+
+      all[targetKey] = {
+        ...all[targetKey],
+        statutDevis: "Refusé",
+        dateDecision,
+        decisionAtTimestamp: Date.now(),
+      };
+      localStorage.setItem(STORAGE_KEY_DEMANDES_DEVIS, JSON.stringify(all));
+      window.dispatchEvent(new Event("demandes_devis_updated"));
+      return all[targetKey];
+    }
+  } catch (e) {
+    console.warn("Erreur marquage devis refusé:", e);
+  }
+  return null;
+}
+
+// ==========================================
+// NOTIFICATIONS ACCORD DEVIS CLIENT
+// (Retour véhicule à l'équipe d'origine en Attente réparation)
+// ==========================================
+export interface DevisAccordNotification {
+  id: string; // `devis-accord-${vehicleId || or}`
+  vehicleId: number;
+  or: string;
+  chassis: string;
+  client: string;
+  marque: string;
+  modele: string;
+  immatriculation?: string;
+  equipeCible: string;
+  technicien?: string;
+  nomTechnicien?: string;
+  numeroDevis: string;
+  dateAccord: string;
+  timestamp: string;
+  timestampMs: number;
+}
+
+const STORAGE_KEY_DEVIS_ACCORD_NOTIFS = "flux_atelier_devis_accord_notifications";
+
+export function getDevisAccordNotifications(): DevisAccordNotification[] {
+  try {
+    const raw = localStorage.getItem(STORAGE_KEY_DEVIS_ACCORD_NOTIFS);
+    if (raw) return JSON.parse(raw);
+  } catch (e) {
+    console.warn("Erreur lecture notifications accord devis:", e);
+  }
+  return [];
+}
+
+export function saveDevisAccordNotification(notif: DevisAccordNotification): void {
+  try {
+    const list = getDevisAccordNotifications().filter((n) => n.id !== notif.id);
+    list.unshift(notif);
+    localStorage.setItem(STORAGE_KEY_DEVIS_ACCORD_NOTIFS, JSON.stringify(list));
+    window.dispatchEvent(new Event("devis_accord_updated"));
+  } catch (e) {
+    console.warn("Erreur sauvegarde notification accord devis:", e);
+  }
+}
+
+export function removeDevisAccordNotification(notifId: string): void {
+  try {
+    const list = getDevisAccordNotifications().filter((n) => n.id !== notifId);
+    localStorage.setItem(STORAGE_KEY_DEVIS_ACCORD_NOTIFS, JSON.stringify(list));
+    window.dispatchEvent(new Event("devis_accord_updated"));
+  } catch (e) {
+    console.warn("Erreur suppression notification accord devis:", e);
+  }
+}
+
+// ==========================================
+// SUIVI TECHNICIEN RÉAFFECTÉ & REPRISE TRAVAIL
+// ==========================================
+export interface ReaffectationRecord {
+  id: string; // vehicleId or or or chassis
+  vehicleId?: number;
+  or?: string;
+  chassis?: string;
+  immatriculation?: string;
+  technicienNom?: string;
+  technicienMatricule?: string;
+  equipe?: string;
+  dateReaffectation: string; // DD/MM/YYYY HH:mm
+  timestampReaffectation: number;
+  reaffectePar?: string;
+  dateReprise?: string; // DD/MM/YYYY HH:mm
+  timestampReprise?: number;
+  reprisePar?: string;
+  isRepris: boolean;
+}
+
+const STORAGE_KEY_REAFFECTATIONS = "flux_atelier_reaffectations";
+
+export function getReaffectationsLocal(): Record<string, ReaffectationRecord> {
+  try {
+    const raw = localStorage.getItem(STORAGE_KEY_REAFFECTATIONS);
+    if (raw) return JSON.parse(raw);
+  } catch (e) {
+    console.warn("Erreur lecture réaffectations:", e);
+  }
+  return {};
+}
+
+export function saveReaffectationLocal(record: ReaffectationRecord): void {
+  try {
+    const all = getReaffectationsLocal();
+    all[record.id] = record;
+    if (record.vehicleId) all[String(record.vehicleId)] = record;
+    if (record.or) all[record.or.trim()] = record;
+    if (record.chassis) all[record.chassis.trim()] = record;
+    localStorage.setItem(STORAGE_KEY_REAFFECTATIONS, JSON.stringify(all));
+    window.dispatchEvent(new Event("reaffectations_updated"));
+  } catch (e) {
+    console.warn("Erreur sauvegarde réaffectation:", e);
+  }
+}
+
+export function marquerVehiculeReaffecte(row: Flux, reaffectePar?: string): ReaffectationRecord {
+  const now = new Date();
+  const dd = String(now.getDate()).padStart(2, "0");
+  const mm = String(now.getMonth() + 1).padStart(2, "0");
+  const yyyy = now.getFullYear();
+  const hh = String(now.getHours()).padStart(2, "0");
+  const min = String(now.getMinutes()).padStart(2, "0");
+  const dateReaffectation = `${dd}/${mm}/${yyyy} ${hh}:${min}`;
+
+  const key = String(row.id);
+  const record: ReaffectationRecord = {
+    id: key,
+    vehicleId: row.id,
+    or: row.no || row.ordre,
+    chassis: row.chassis,
+    immatriculation: row.serie || row.immatriculation,
+    technicienNom: row.nomTechnicien || row.technicien,
+    technicienMatricule: row.technicien,
+    equipe: row.equipe,
+    dateReaffectation,
+    timestampReaffectation: Date.now(),
+    reaffectePar: reaffectePar || "Chef d'équipe",
+    isRepris: false,
+  };
+  saveReaffectationLocal(record);
+  return record;
+}
+
+export function marquerVehiculeReprise(row: Flux, reprisePar?: string): ReaffectationRecord {
+  const all = getReaffectationsLocal();
+  const key = String(row.id);
+  const found = all[key] || (row.no && all[row.no.trim()]) || (row.chassis && all[row.chassis.trim()]);
+
+  const now = new Date();
+  const dd = String(now.getDate()).padStart(2, "0");
+  const mm = String(now.getMonth() + 1).padStart(2, "0");
+  const yyyy = now.getFullYear();
+  const hh = String(now.getHours()).padStart(2, "0");
+  const min = String(now.getMinutes()).padStart(2, "0");
+  const dateReprise = `${dd}/${mm}/${yyyy} ${hh}:${min}`;
+
+  const record: ReaffectationRecord = found
+    ? {
+        ...found,
+        technicienNom: found.technicienNom || row.nomTechnicien || row.technicien,
+        technicienMatricule: found.technicienMatricule || row.technicien,
+        equipe: found.equipe || row.equipe,
+        dateReprise,
+        timestampReprise: Date.now(),
+        reprisePar: reprisePar || "Chef d'équipe",
+        isRepris: true,
+      }
+    : {
+        id: key,
+        vehicleId: row.id,
+        or: row.no || row.ordre,
+        chassis: row.chassis,
+        immatriculation: row.serie || row.immatriculation,
+        technicienNom: row.nomTechnicien || row.technicien,
+        technicienMatricule: row.technicien,
+        equipe: row.equipe,
+        dateReaffectation: dateReprise,
+        timestampReaffectation: Date.now(),
+        dateReprise,
+        timestampReprise: Date.now(),
+        reprisePar: reprisePar || "Chef d'équipe",
+        isRepris: true,
+      };
+
+  saveReaffectationLocal(record);
+  return record;
+}
+
+// -------------------------------------------------------------
+// Suivi des Transferts Inter-Équipes (VR) & Timeline Attente
+// -------------------------------------------------------------
+
+export interface VehicleTransferRecord {
+  id: string;
+  vehicleId: any;
+  or?: string;
+  chassis?: string;
+  immatriculation?: string;
+  equipeDepart: string;
+  equipeCible: string;
+  vrCode: string;
+  dateTransfert: string;
+  timestampTransfert: number;
+  dateAcceptation?: string;
+  timestampAcceptation?: number;
+  isAccepte: boolean;
+  acceptePar?: string;
+}
+
+const STORAGE_KEY_TRANSFERS = "flux_atelier_transfers_timeline";
+
+export function getTeamFromVr(vrCode: string): string {
+  const clean = (vrCode || "").trim().toLowerCase();
+  if (clean.includes("rapide")) return "Service Rapide";
+  if (clean.includes("carross")) return "Carrosserie";
+  if (clean.includes("elict") || clean.includes("elect")) return "Electrique";
+  if (clean.includes("lourd")) return "Lourd";
+  if (clean.includes("changan")) return "Changan";
+  if (clean.includes("daily")) return "Daily";
+  return "";
+}
+
+export function getVehicleTransfersLocal(): VehicleTransferRecord[] {
+  try {
+    const raw = localStorage.getItem(STORAGE_KEY_TRANSFERS);
+    if (raw) return JSON.parse(raw);
+  } catch (e) {
+    console.warn("Erreur lecture transferts timeline:", e);
+  }
+  return [];
+}
+
+export function saveVehicleTransferLocal(record: VehicleTransferRecord): void {
+  try {
+    const all = getVehicleTransfersLocal();
+    const idx = all.findIndex((t) => t.id === record.id);
+    if (idx >= 0) {
+      all[idx] = record;
+    } else {
+      all.push(record);
+    }
+    localStorage.setItem(STORAGE_KEY_TRANSFERS, JSON.stringify(all));
+    window.dispatchEvent(new Event("transfers_timeline_updated"));
+  } catch (e) {
+    console.warn("Erreur sauvegarde transfert timeline:", e);
+  }
+}
+
+export function marquerDebutTransfertVR(
+  row: Flux,
+  vrCode: string,
+  targetEquipe?: string,
+  transferePar?: string
+): VehicleTransferRecord {
+  const now = new Date();
+  const dd = String(now.getDate()).padStart(2, "0");
+  const mm = String(now.getMonth() + 1).padStart(2, "0");
+  const yyyy = now.getFullYear();
+  const hh = String(now.getHours()).padStart(2, "0");
+  const min = String(now.getMinutes()).padStart(2, "0");
+  const dateTransfert = `${dd}/${mm}/${yyyy} ${hh}:${min}`;
+
+  const resolvedTarget = targetEquipe || getTeamFromVr(vrCode) || "Atelier";
+  const record: VehicleTransferRecord = {
+    id: `transfer-${Date.now()}-${Math.random().toString(36).substr(2, 5)}`,
+    vehicleId: row.id,
+    or: row.no || row.ordre,
+    chassis: row.chassis,
+    immatriculation: row.serie || row.immatriculation,
+    equipeDepart: row.equipe || "Atelier",
+    equipeCible: resolvedTarget,
+    vrCode,
+    dateTransfert,
+    timestampTransfert: Date.now(),
+    isAccepte: false,
+    acceptePar: transferePar || "Chef d'équipe",
+  };
+  saveVehicleTransferLocal(record);
+  return record;
+}
+
+export function marquerTransfertAccepte(
+  row: Partial<Flux>,
+  acceptePar?: string
+): VehicleTransferRecord | null {
+  const all = getVehicleTransfersLocal();
+  const vId = row.id ? String(row.id) : null;
+  const orKey = (row.no || row.ordre || "").trim();
+  const chKey = (row.chassis || "").trim().toUpperCase();
+
+  const transfer = all
+    .filter((t) => !t.isAccepte)
+    .reverse()
+    .find(
+      (t) =>
+        (vId && String(t.vehicleId) === vId) ||
+        (orKey && t.or && t.or.trim() === orKey) ||
+        (chKey && t.chassis && t.chassis.trim().toUpperCase() === chKey)
+    );
+
+  if (!transfer) return null;
+
+  const now = new Date();
+  const dd = String(now.getDate()).padStart(2, "0");
+  const mm = String(now.getMonth() + 1).padStart(2, "0");
+  const yyyy = now.getFullYear();
+  const hh = String(now.getHours()).padStart(2, "0");
+  const min = String(now.getMinutes()).padStart(2, "0");
+  const dateAcceptation = `${dd}/${mm}/${yyyy} ${hh}:${min}`;
+
+  transfer.dateAcceptation = dateAcceptation;
+  transfer.timestampAcceptation = Date.now();
+  transfer.isAccepte = true;
+  transfer.acceptePar = acceptePar || "Chef d'équipe";
+
+  saveVehicleTransferLocal(transfer);
+  return transfer;
+}
+
+export function getTransfersForVehicle(row: Partial<Flux>): VehicleTransferRecord[] {
+  const all = getVehicleTransfersLocal();
+  const vId = row.id ? String(row.id) : null;
+  const orKey = (row.no || row.ordre || "").trim();
+  const chKey = (row.chassis || "").trim().toUpperCase();
+
+  return all.filter(
+    (t) =>
+      (vId && String(t.vehicleId) === vId) ||
+      (orKey && t.or && t.or.trim() === orKey) ||
+      (chKey && t.chassis && t.chassis.trim().toUpperCase() === chKey)
+  );
+}
+
+// -------------------------------------------------------------
+// Suivi Timeline de la Phase Essai Routier & Contrôle Qualité
+// -------------------------------------------------------------
+
+export interface VehicleEssaiRecord {
+  id: string;
+  vehicleId: any;
+  or?: string;
+  chassis?: string;
+  immatriculation?: string;
+  dateDebut: string;
+  timestampDebut: number;
+  dateFin?: string;
+  timestampFin?: number;
+  isTermine: boolean;
+  essayeur?: string;
+  resultat?: string;
+  lancePar?: string;
+}
+
+const STORAGE_KEY_ESSAIS_TIMELINE = "flux_atelier_essais_timeline";
+
+export function getVehicleEssaisLocal(): VehicleEssaiRecord[] {
+  try {
+    const raw = localStorage.getItem(STORAGE_KEY_ESSAIS_TIMELINE);
+    if (raw) return JSON.parse(raw);
+  } catch (e) {
+    console.warn("Erreur lecture essais timeline:", e);
+  }
+  return [];
+}
+
+export function saveVehicleEssaiLocal(record: VehicleEssaiRecord): void {
+  try {
+    const all = getVehicleEssaisLocal();
+    const idx = all.findIndex((e) => e.id === record.id);
+    if (idx >= 0) {
+      all[idx] = record;
+    } else {
+      all.push(record);
+    }
+    localStorage.setItem(STORAGE_KEY_ESSAIS_TIMELINE, JSON.stringify(all));
+    window.dispatchEvent(new Event("essais_timeline_updated"));
+  } catch (e) {
+    console.warn("Erreur sauvegarde essai timeline:", e);
+  }
+}
+
+export function marquerDebutEssai(row: Flux, lancePar?: string): VehicleEssaiRecord {
+  const now = new Date();
+  const dd = String(now.getDate()).padStart(2, "0");
+  const mm = String(now.getMonth() + 1).padStart(2, "0");
+  const yyyy = now.getFullYear();
+  const hh = String(now.getHours()).padStart(2, "0");
+  const min = String(now.getMinutes()).padStart(2, "0");
+  const dateDebut = `${dd}/${mm}/${yyyy} ${hh}:${min}`;
+
+  const record: VehicleEssaiRecord = {
+    id: `essai-${Date.now()}-${Math.random().toString(36).substr(2, 5)}`,
+    vehicleId: row.id,
+    or: row.no || row.ordre,
+    chassis: row.chassis,
+    immatriculation: row.serie || row.immatriculation,
+    dateDebut,
+    timestampDebut: Date.now(),
+    isTermine: false,
+    lancePar: lancePar || "Chef d'équipe",
+  };
+  saveVehicleEssaiLocal(record);
+  return record;
+}
+
+export function marquerFinEssai(
+  row: Partial<Flux>,
+  payload?: { essayeur?: string; resultat?: string; dateControle?: string }
+): VehicleEssaiRecord | null {
+  const all = getVehicleEssaisLocal();
+  const vId = row.id ? String(row.id) : null;
+  const orKey = (row.no || row.ordre || "").trim();
+  const chKey = (row.chassis || "").trim().toUpperCase();
+
+  const essai = all
+    .filter((e) => !e.isTermine)
+    .reverse()
+    .find(
+      (e) =>
+        (vId && String(e.vehicleId) === vId) ||
+        (orKey && e.or && e.or.trim() === orKey) ||
+        (chKey && e.chassis && e.chassis.trim().toUpperCase() === chKey)
+    );
+
+  if (!essai) return null;
+
+  const now = new Date();
+  const dd = String(now.getDate()).padStart(2, "0");
+  const mm = String(now.getMonth() + 1).padStart(2, "0");
+  const yyyy = now.getFullYear();
+  const hh = String(now.getHours()).padStart(2, "0");
+  const min = String(now.getMinutes()).padStart(2, "0");
+  const dateFin = payload?.dateControle || `${dd}/${mm}/${yyyy} ${hh}:${min}`;
+
+  essai.dateFin = dateFin;
+  essai.timestampFin = Date.now();
+  essai.isTermine = true;
+  essai.essayeur = payload?.essayeur || essai.essayeur;
+  essai.resultat = payload?.resultat || "CONFORME";
+
+  saveVehicleEssaiLocal(essai);
+  return essai;
+}
+
+export function getEssaisForVehicle(row: Partial<Flux>): VehicleEssaiRecord[] {
+  const all = getVehicleEssaisLocal();
+  const vId = row.id ? String(row.id) : null;
+  const orKey = (row.no || row.ordre || "").trim();
+  const chKey = (row.chassis || "").trim().toUpperCase();
+
+  return all.filter(
+    (e) =>
+      (vId && String(e.vehicleId) === vId) ||
+      (orKey && e.or && e.or.trim() === orKey) ||
+      (chKey && e.chassis && e.chassis.trim().toUpperCase() === chKey)
+  );
 }
 
 const STORAGE_KEY_DEMANDES_ACHAT = "flux_atelier_demandes_achat";
@@ -1848,7 +2570,7 @@ export function getDemandeAchatForVehicle(vehicle: Flux): DemandeAchat | null {
 export async function updateGoogleSheetStatutAchat(
   row: Flux,
   demande: DemandeAchat,
-  nouveauStatut: "Attente" | "Livré"
+  nouveauStatut: "Attente" | "Livré" | "Pièce retirée"
 ) {
   return callSheetWriteAction(row, "updateStatutAchat", {
     ref: demande.ref,
@@ -1857,6 +2579,38 @@ export async function updateGoogleSheetStatutAchat(
     dateLivraison: demande.dateLivraison || "",
     livrePar: demande.livrePar || "",
   });
+}
+
+export async function updateGoogleSheetStatutDevis(
+  row: Flux,
+  devis: DemandeDevis,
+  nouveauStatut: "En attente accord" | "Client appelé" | "Accepté" | "Refusé" | "Annulé"
+) {
+  return callSheetWriteAction(row, "updateStatutDevis", {
+    numeroDevis: devis.numeroDevis || "",
+    statutDevis: nouveauStatut,
+    dateAppel: devis.dateAppel || "",
+    appelant: devis.appelant || "",
+    dateDecision: devis.dateDecision || "",
+    or: row.no || row.ordre || devis.or || "",
+    chassis: row.chassis || devis.chassis || "",
+    client: row.client || devis.client || "",
+    modele: row.modele || devis.modele || "",
+    immatriculation: row.serie || row.immatriculation || devis.immatriculation || "",
+    equipe: row.equipe || devis.equipe || "",
+    pieces: devis.pieces || "",
+    dateDevis: devis.date || "",
+  });
+}
+
+export function getNowFormatted(): string {
+  const now = new Date();
+  const dd = String(now.getDate()).padStart(2, "0");
+  const mm = String(now.getMonth() + 1).padStart(2, "0");
+  const yyyy = now.getFullYear();
+  const hh = String(now.getHours()).padStart(2, "0");
+  const min = String(now.getMinutes()).padStart(2, "0");
+  return `${dd}/${mm}/${yyyy} ${hh}:${min}`;
 }
 
 export async function updateGoogleSheetAvancement(
@@ -1872,8 +2626,13 @@ export async function updateGoogleSheetAvancement(
     throw new Error("Choisis un avancement valide avant d'enregistrer.");
   }
 
+  const cleanAv = avancement.trim();
+  const nowFormatted = getNowFormatted();
+  const dateModif = (extraParams?.dateModification || nowFormatted).trim();
+
   const values: Record<string, string> = {
-    avancement: avancement.trim(),
+    avancement: cleanAv,
+    dateModification: dateModif,
   };
   if (equipe || row.equipe) {
     values.equipe = (equipe || row.equipe || "").trim();
@@ -1883,12 +2642,40 @@ export async function updateGoogleSheetAvancement(
     values.bloc = String(targetBloc);
   }
 
+  // Horodatage systématique selon les 12 statuts demandés :
+  // 1. ATENDE DEVIS
+  if (cleanAv === "ATENDE DEVIS" || cleanAv.toLowerCase().includes("devis")) {
+    values.emplacement = "P";
+    values.dateDevis = extraParams?.dateDevis || dateModif;
+  }
+  // 2. Attente PDR & 4. attends acheter
+  else if (cleanAv === "Attente PDR" || cleanAv === "attends acheter") {
+    values.dateDemande = extraParams?.dateDemande || dateModif;
+  }
+  // 3. Technicien réaffecté
+  else if (cleanAv === "Technicien réaffecté") {
+    values.dateReaffectation = extraParams?.dateReaffectation || dateModif;
+  }
+  // 5. Essai
+  else if (cleanAv === "Essai") {
+    values.dateControle = extraParams?.dateControle || dateModif;
+    values.dateDebutEssai = extraParams?.dateDebutEssai || dateModif;
+  }
+  // 6. Terminer
+  else if (cleanAv === "Terminer") {
+    values.dateFin = extraParams?.dateFin || dateModif;
+  }
+  // 7 à 12. Transferts VR ("vrElictrique", "vrService Rapide", "vrCarrosserie", "vrDaily", "vrLourd", "vrChangan")
+  else if (cleanAv.startsWith("vr")) {
+    values.dateTransfert = extraParams?.dateTransfert || dateModif;
+  }
+
   if (demandeAchat) {
     values.ref = demandeAchat.ref;
     values.designation = demandeAchat.designation;
     values.qt = String(demandeAchat.qt);
     values.commentaire = demandeAchat.commentaire || "";
-    values.dateDemande = demandeAchat.date;
+    values.dateDemande = demandeAchat.date || dateModif;
     values.client = demandeAchat.client;
     values.chassis = demandeAchat.chassis;
     values.noOr = demandeAchat.or;
@@ -1896,12 +2683,15 @@ export async function updateGoogleSheetAvancement(
 
   if (demandeDevis) {
     values.numeroDevis = demandeDevis.numeroDevis;
-    values.dateDevis = demandeDevis.date;
+    values.dateDevis = demandeDevis.date || dateModif;
     values.client = demandeDevis.client;
     values.chassis = demandeDevis.chassis;
     values.noOr = demandeDevis.or;
     values.modele = demandeDevis.modele;
     values.immatriculation = demandeDevis.immatriculation;
+    if (demandeDevis.pieces) {
+      values.pieces = demandeDevis.pieces;
+    }
     if (demandeDevis.commentaire) {
       values.commentaire = demandeDevis.commentaire;
     }
@@ -1909,6 +2699,13 @@ export async function updateGoogleSheetAvancement(
 
   if (extraParams) {
     Object.assign(values, extraParams);
+  }
+
+  if (
+    (cleanAv === "Attente réparation" || cleanAv === "Attente Réparation") &&
+    !values.etat
+  ) {
+    values.etat = "Attente réparation";
   }
 
   return callSheetWriteAction(row, "updateAvancement", values);
@@ -2037,7 +2834,7 @@ export function registerPendingAddedVehicle(entree: {
       list = list.filter((p) => now - p.timestamp < 300000 && p.vehicle.no !== newFlux.no);
       list.unshift({ timestamp: now, vehicle: newFlux });
       localStorage.setItem("flux_pending_new_chargement_entries", JSON.stringify(list));
-    } catch (_) {}
+    } catch (_) { }
 
     window.dispatchEvent(new CustomEvent("flux_new_vehicle_added", { detail: newFlux }));
     window.dispatchEvent(new CustomEvent("flux_refresh_requested"));
@@ -2697,7 +3494,7 @@ export async function modifierDossierEntree(
           reject(
             new Error(
               response.error ||
-                "Impossible de modifier le dossier dans Google Sheets."
+              "Impossible de modifier le dossier dans Google Sheets."
             )
           );
           return;
@@ -2793,7 +3590,7 @@ export async function supprimerDossierEntree(
           reject(
             new Error(
               response.error ||
-                "Impossible de supprimer le dossier dans Google Sheets."
+              "Impossible de supprimer le dossier dans Google Sheets."
             )
           );
           return;
@@ -2910,12 +3707,12 @@ export async function fetchRemoteAccounts(): Promise<AuthorizedAccount[]> {
             // Laisser un no-op pour que toute réponse tardive ne provoque pas ReferenceError
             if (jsonpWindow[callbackName]) {
               jsonpWindow[callbackName] = () => {
-                try { delete jsonpWindow[callbackName]; } catch (_) {}
+                try { delete jsonpWindow[callbackName]; } catch (_) { }
               };
             }
             try {
               script.remove();
-            } catch (_) {}
+            } catch (_) { }
           }
 
           const url = new URL(writeUrl);
@@ -2981,12 +3778,12 @@ export async function saveRemoteAccount(
       window.clearTimeout(timeout);
       if (jsonpWindow[callbackName]) {
         jsonpWindow[callbackName] = () => {
-          try { delete jsonpWindow[callbackName]; } catch (_) {}
+          try { delete jsonpWindow[callbackName]; } catch (_) { }
         };
       }
       try {
         script.remove();
-      } catch (_) {}
+      } catch (_) { }
     }
 
     try {
@@ -3050,12 +3847,12 @@ export async function deleteRemoteAccount(
       window.clearTimeout(timeout);
       if (jsonpWindow[callbackName]) {
         jsonpWindow[callbackName] = () => {
-          try { delete jsonpWindow[callbackName]; } catch (_) {}
+          try { delete jsonpWindow[callbackName]; } catch (_) { }
         };
       }
       try {
         script.remove();
-      } catch (_) {}
+      } catch (_) { }
     }
 
     try {
