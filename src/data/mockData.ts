@@ -39,8 +39,13 @@ export interface Flux {
   heureEntree?: string;
   technicien?: string;
   nomTechnicien?: string;
+  /** Indique exceptionnellement que le technicien affecté travaille le samedi. */
+  travailleSamedi?: boolean;
   equipe?: string;
   avancement?: string;
+  dateDebutRep?: string;
+  dateDebutTravail?: string;
+  heureDebutTravail?: string;
   dateFinRep?: string;
   etatIntervention: WorkshopStatus;
   emplacement: string;
@@ -55,6 +60,11 @@ export interface Flux {
   isPendingNewEntry?: boolean;
   creationTimestamp?: number;
   dateModification?: string;
+  statutAcceptation?: "en_attente" | "accepte" | "mis_en_attente";
+  dateAcceptation?: string;
+  dateMiseEnAttente?: string;
+  acceptePar?: string;
+  misEnAttentePar?: string;
 }
 
 export const statusMeta: Array<{

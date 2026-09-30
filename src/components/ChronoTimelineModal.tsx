@@ -47,13 +47,15 @@ export default function ChronoTimelineModal({
   // Formulaire d'ajout d'une nouvelle attente / interruption
   const [showAddForm, setShowAddForm] = useState(false);
   const [newStepType, setNewStepType] = useState<
-    "attente_pieces" | "attente_devis" | "reaffectation" | "essai" | "attente_client"
+    "attente_pieces" | "attente_devis" | "attente_mecanicien" | "reaffectation" | "essai" | "attente_client"
   >("attente_pieces");
   const [newStepLabel, setNewStepLabel] = useState("");
   const [newStepDebut, setNewStepDebut] = useState("");
   const [newStepFin, setNewStepFin] = useState("");
+  const [newStepReprisePrevue, setNewStepReprisePrevue] = useState("");
   const [newStepDureeMin, setNewStepDureeMin] = useState<number | "">("");
   const [newStepCommentaire, setNewStepCommentaire] = useState("");
+  const [now, setNow] = useState(() => Date.now());
 
   // Configuration du barème / temps alloué prévu par le Chef d'équipe
   const [inputTempsAlloueMin, setInputTempsAlloueMin] = useState<number | "">("");
@@ -84,6 +86,13 @@ export default function ChronoTimelineModal({
       setNewStepDebut(`${dd}/${mm}/${yyyy} ${hh}:${min}`);
     }
   }, [isOpen, vehicle]);
+
+  // Le temps restant d'une attente mécanicien doit continuer à évoluer tant que la fenêtre est ouverte.
+  useEffect(() => {
+    if (!isOpen) return;
+    const timer = window.setInterval(() => setNow(Date.now()), 30_000);
+    return () => window.clearInterval(timer);
+  }, [isOpen]);
 
   if (!isOpen || !vehicle || !calc) return null;
 
@@ -159,6 +168,8 @@ export default function ChronoTimelineModal({
           ? "Attente pièces de rechange"
           : newStepType === "attente_devis"
           ? "Attente accord de devis"
+          : newStepType === "attente_mecanicien"
+          ? "Attente déclarée par le mécanicien"
           : newStepType === "reaffectation"
           ? "Technicien réaffecté"
           : newStepType === "essai"
@@ -166,6 +177,7 @@ export default function ChronoTimelineModal({
           : "Attente décision client"),
       dateDebut: newStepDebut.trim(),
       dateFin: newStepFin.trim() || undefined,
+      datePrevueFin: newStepType === "attente_mecanicien" ? newStepReprisePrevue.trim() || undefined : undefined,
       dureeMinutes: computedMin > 0 ? computedMin : undefined,
       commentaire: newStepCommentaire.trim() || undefined,
       automatique: false,
@@ -192,6 +204,7 @@ export default function ChronoTimelineModal({
     // Reset formulaire
     setNewStepLabel("");
     setNewStepFin("");
+    setNewStepReprisePrevue("");
     setNewStepDureeMin("");
     setNewStepCommentaire("");
     setShowAddForm(false);
@@ -641,6 +654,7 @@ export default function ChronoTimelineModal({
                     >
                       <option value="attente_pieces">Attente Pièces (Achat / PDR)</option>
                       <option value="attente_devis">Attente Accord Devis (N° DV)</option>
+                      <option value="attente_mecanicien">Attente Mécanicien (reprise prévue)</option>
                       <option value="reaffectation">Technicien Réaffecté (Pause intervention)</option>
                       <option value="essai">Essai Routier & Contrôle Qualité</option>
                       <option value="attente_client">Attente Décision Client</option>
@@ -663,7 +677,9 @@ export default function ChronoTimelineModal({
 
                   <div>
                     <label className="block text-[11px] font-semibold text-slate-700 mb-1">
-                      Date & Heure Fin (Optionnelle)
+                      {newStepType === "attente_mecanicien"
+                        ? "Date & Heure de fin réelle (si reprise déjà faite)"
+                        : "Date & Heure Fin (Optionnelle)"}
                     </label>
                     <input
                       type="text"
@@ -676,18 +692,36 @@ export default function ChronoTimelineModal({
                 </div>
 
                 <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-                  <div>
-                    <label className="block text-[11px] font-semibold text-slate-700 mb-1">
-                      Ou Durée directe en minutes (ex: 15 ou 60)
-                    </label>
-                    <input
-                      type="number"
-                      placeholder="Ex: 15 (min)"
-                      value={newStepDureeMin}
-                      onChange={(e) => setNewStepDureeMin(e.target.value ? Number(e.target.value) : "")}
-                      className="w-full px-2.5 py-1.5 bg-white border border-slate-300 rounded-lg font-mono text-slate-800"
-                    />
-                  </div>
+                  {newStepType === "attente_mecanicien" && (
+                    <div>
+                      <label className="block text-[11px] font-semibold text-slate-700 mb-1">
+                        Date & Heure de reprise prévue
+                      </label>
+                      <input
+                        type="text"
+                        placeholder="DD/MM/YYYY HH:mm"
+                        value={newStepReprisePrevue}
+                        onChange={(e) => setNewStepReprisePrevue(e.target.value)}
+                        className="w-full px-2.5 py-1.5 bg-white border border-indigo-300 rounded-lg font-mono text-slate-800"
+                        required
+                      />
+                      <p className="text-[10px] text-indigo-700 mt-1">Le système calculera automatiquement le temps restant.</p>
+                    </div>
+                  )}
+                  {newStepType !== "attente_mecanicien" && (
+                    <div>
+                      <label className="block text-[11px] font-semibold text-slate-700 mb-1">
+                        Ou Durée directe en minutes (ex: 15 ou 60)
+                      </label>
+                      <input
+                        type="number"
+                        placeholder="Ex: 15 (min)"
+                        value={newStepDureeMin}
+                        onChange={(e) => setNewStepDureeMin(e.target.value ? Number(e.target.value) : "")}
+                        className="w-full px-2.5 py-1.5 bg-white border border-slate-300 rounded-lg font-mono text-slate-800"
+                      />
+                    </div>
+                  )}
 
                   <div>
                     <label className="block text-[11px] font-semibold text-slate-700 mb-1">
@@ -744,6 +778,10 @@ export default function ChronoTimelineModal({
                   badgeColor = "bg-purple-100 text-purple-800 border-purple-300";
                   dotColor = "bg-purple-600";
                   Icon = FileSignature;
+                } else if (step.type === "attente_mecanicien") {
+                  badgeColor = "bg-sky-100 text-sky-800 border-sky-300";
+                  dotColor = "bg-sky-600";
+                  Icon = Wrench;
                 } else if (step.type === "reaffectation") {
                   badgeColor = "bg-fuchsia-100 text-fuchsia-800 border-fuchsia-300";
                   dotColor = "bg-fuchsia-600";
@@ -804,6 +842,23 @@ export default function ChronoTimelineModal({
                           {step.commentaire}
                         </p>
                       )}
+                      {step.type === "attente_mecanicien" && step.datePrevueFin && (() => {
+                        const repriseTs = parseDateTimestamp(step.datePrevueFin);
+                        const remainingMin = Math.ceil((repriseTs - now) / 60000);
+                        const hasValidDate = repriseTs > 0;
+                        return (
+                          <div className={`mt-2 ml-1 inline-flex items-center gap-1.5 px-2 py-1 rounded-md text-[11px] font-bold border ${
+                            !hasValidDate ? "bg-slate-50 text-slate-500 border-slate-200" : remainingMin > 0 ? "bg-sky-50 text-sky-800 border-sky-200" : "bg-rose-50 text-rose-700 border-rose-200"
+                          }`}>
+                            <Hourglass className="w-3.5 h-3.5" />
+                            {hasValidDate
+                              ? remainingMin > 0
+                                ? `Reprise prévue : ${step.datePrevueFin} — reste ${formatMinutes(remainingMin)}`
+                                : `Reprise prévue : ${step.datePrevueFin} — dépassé de ${formatMinutes(Math.abs(remainingMin))}`
+                              : "Date de reprise prévue invalide"}
+                          </div>
+                        );
+                      })()}
                     </div>
                   </div>
                 );

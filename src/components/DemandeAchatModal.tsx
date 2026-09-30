@@ -13,9 +13,10 @@ import {
   AlertCircle,
   Tag,
   Boxes,
+  Phone,
 } from "lucide-react";
 import type { Flux } from "../data/mockData";
-import type { DemandeAchat } from "../services/googleSheets";
+import type { DemandeAchat } from "../services/database";
 
 interface DemandeAchatModalProps {
   isOpen: boolean;
@@ -47,6 +48,9 @@ export default function DemandeAchatModal({
   const [qt, setQt] = useState<number>(1);
   const [commentaire, setCommentaire] = useState("");
   const [dateDemand, setDateDemand] = useState(getNowFormatted);
+  const [commandeTelephone, setCommandeTelephone] = useState(false);
+  const [fournisseur, setFournisseur] = useState("");
+  const [telephoneFournisseur, setTelephoneFournisseur] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [isSubmitting, setIsSubmitting] = useState(false);
 
@@ -58,6 +62,9 @@ export default function DemandeAchatModal({
       setQt(1);
       setCommentaire("");
       setDateDemand(getNowFormatted());
+      setCommandeTelephone(false);
+      setFournisseur("");
+      setTelephoneFournisseur("");
       setError(null);
       setIsSubmitting(false);
     }
@@ -106,6 +113,10 @@ export default function DemandeAchatModal({
         commentaire: commentaire.trim(),
         equipe: vehicle.equipe || undefined,
         demandeur: currentChefEquipeName || undefined,
+        modeCommande: commandeTelephone ? "Téléphone" : "Autre",
+        fournisseur: fournisseur.trim() || undefined,
+        telephoneFournisseur: telephoneFournisseur.trim() || undefined,
+        dateCommandeTelephone: commandeTelephone ? (dateDemand || getNowFormatted()) : undefined,
       };
 
       await onConfirm(demande);
@@ -292,6 +303,42 @@ export default function DemandeAchatModal({
                 />
                 <Package size={14} className="absolute left-3 top-2.5 text-slate-400 pointer-events-none" />
               </div>
+            </div>
+
+            <div className="rounded-xl border border-sky-200 bg-sky-50/70 p-3.5 space-y-3">
+              <label className="flex items-center gap-2.5 text-xs font-extrabold text-sky-900 cursor-pointer">
+                <input
+                  type="checkbox"
+                  checked={commandeTelephone}
+                  onChange={(e) => setCommandeTelephone(e.target.checked)}
+                  className="h-4 w-4 rounded border-sky-300 text-sky-600 focus:ring-sky-500"
+                />
+                <Phone size={15} /> Commande passée par téléphone
+              </label>
+              {commandeTelephone && (
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                  <div>
+                    <label className="block text-xs font-bold text-slate-700 mb-1">Fournisseur appelé</label>
+                    <input
+                      type="text"
+                      value={fournisseur}
+                      onChange={(e) => setFournisseur(e.target.value)}
+                      placeholder="Nom du fournisseur"
+                      className="w-full px-3 py-2 text-xs font-semibold rounded-xl border border-sky-200 focus:border-sky-500 focus:ring-2 focus:ring-sky-500/20 outline-none"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-xs font-bold text-slate-700 mb-1">N° téléphone appelé</label>
+                    <input
+                      type="tel"
+                      value={telephoneFournisseur}
+                      onChange={(e) => setTelephoneFournisseur(e.target.value)}
+                      placeholder="Ex. +216 71 000 000"
+                      className="w-full px-3 py-2 text-xs font-semibold rounded-xl border border-sky-200 focus:border-sky-500 focus:ring-2 focus:ring-sky-500/20 outline-none"
+                    />
+                  </div>
+                </div>
+              )}
             </div>
 
             {/* Commentaire */}

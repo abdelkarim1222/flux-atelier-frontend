@@ -15,7 +15,7 @@ import {
   Wrench,
 } from "lucide-react";
 import type { Flux } from "../data/mockData";
-import type { DemandeDevis } from "../services/googleSheets";
+import type { DemandeDevis } from "../services/database";
 
 interface DemandeDevisModalProps {
   isOpen: boolean;

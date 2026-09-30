@@ -19,10 +19,10 @@ import {
 } from "lucide-react";
 import {
   ajouterNouvelleEntree,
-  isGoogleSheetWriteConfigured,
+  isDatabaseWriteConfigured,
   searchVehicleByVin,
   type VinVehicleInfo,
-} from "../services/googleSheets";
+} from "../services/database";
 import { getAllDestinationTeams, type DestinationTeam } from "../config/teams";
 import NouveauVinModal from "./NouveauVinModal";
 
@@ -33,6 +33,7 @@ interface NouvelleEntreeModalProps {
     noOr: string;
     cs: string;
     chassis: string;
+    immatriculation?: string;
     codeClient?: string;
     nomClient?: string;
     dateEntreeHeure: string;
@@ -67,6 +68,7 @@ export default function NouvelleEntreeModal({
     noOr: "",
     cs: "R10",
     chassis: "",
+    immatriculation: "",
     codeClient: "",
     nomClient: "",
     dateEntreeHeure: getNowFormatted(false),
@@ -98,6 +100,7 @@ export default function NouvelleEntreeModal({
         noOr: "",
         cs: "R10",
         chassis: "",
+        immatriculation: "",
         codeClient: "",
         nomClient: "",
         dateEntreeHeure: getNowFormatted(false),
@@ -138,7 +141,7 @@ export default function NouvelleEntreeModal({
     return () => window.removeEventListener("keydown", handleKeyDown);
   }, [isOpen, loading, onClose]);
 
-  // Fonction de recherche VIN dans Google Sheets
+  // Fonction de recherche VIN dans PostgreSQL
   const performVinLookup = async (chassisQuery: string) => {
     const clean = chassisQuery.trim().toUpperCase();
     if (clean.length < 5) {
@@ -173,6 +176,7 @@ export default function NouvelleEntreeModal({
           return {
             ...prev,
             chassis: info.chassis || clean,
+            immatriculation: info.immatriculation || prev.immatriculation,
             nomClient: info.nomClient || prev.nomClient,
             codeClient: info.codeClient || prev.codeClient,
             marque: info.marque || prev.marque,
@@ -222,9 +226,9 @@ export default function NouvelleEntreeModal({
       return;
     }
 
-    if (!isGoogleSheetWriteConfigured()) {
+    if (!isDatabaseWriteConfigured()) {
       setError(
-        "L'URL d'écriture Google Sheets n'est pas configurée. Veuillez renseigner VITE_SHEET_WRITE_URL dans la synchronisation."
+        "Le serveur PostgreSQL n'est pas disponible. Vérifiez sa configuration puis réessayez."
       );
       return;
     }
@@ -239,6 +243,7 @@ export default function NouvelleEntreeModal({
         noOr: formData.noOr.trim(),
         cs: formData.cs.trim() || "R18",
         chassis: formData.chassis.trim().toUpperCase(),
+        immatriculation: formData.immatriculation.trim().toUpperCase(),
         marque: formData.marque.trim() || "IVECO",
         nomClient: formData.nomClient.trim() || "Client non renseigné",
         dateEntreeHeure: submissionDate,
@@ -258,7 +263,7 @@ export default function NouvelleEntreeModal({
       setError(
         err instanceof Error
           ? err.message
-          : "Erreur lors de l'enregistrement de l'entrée dans Google Sheets."
+          : "Erreur lors de l'enregistrement de l'entrée dans PostgreSQL."
       );
     } finally {
       setLoading(false);
@@ -295,11 +300,11 @@ export default function NouvelleEntreeModal({
                 Nouvelle Entrée Véhicule (Réception)
                 <span className="inline-flex items-center gap-1 text-[10px] bg-emerald-400/20 text-emerald-200 border border-emerald-400/30 px-2 py-0.5 rounded-full font-semibold">
                   <Sparkles className="w-3 h-3 text-emerald-300" />
-                  Auto-Lookup VIN
+                  Auto-Lookup Parc & VIN
                 </span>
               </h3>
               <p className="text-xs text-emerald-100/80">
-                Récupère automatiquement le Client, Marque, Modèle et Catégorie depuis l'onglet VIN
+                Récupère automatiquement l'Immatriculation, Client, Marque, Modèle et Catégorie depuis le Parc véhicules & engins
               </p>
             </div>
           </div>
@@ -329,7 +334,7 @@ export default function NouvelleEntreeModal({
               <div className="flex items-center gap-2.5 p-3.5 rounded-xl bg-emerald-50 border border-emerald-200 text-emerald-800 text-xs font-semibold shadow-xs">
                 <CheckCircle2 className="w-5 h-5 text-emerald-600 shrink-0" />
                 <span>
-                  Véhicule enregistré avec succès dans Google Sheets (Suivi & Tableaux de chargement) !
+                  Véhicule enregistré avec succès dans PostgreSQL (Suivi & Tableaux de chargement) !
                 </span>
               </div>
             )}
@@ -376,7 +381,7 @@ export default function NouvelleEntreeModal({
               </div>
 
               {/* N° Châssis (VIN) avec recherche auto */}
-              <div className="md:col-span-2">
+              <div>
                 <div className="flex items-center justify-between mb-1">
                   <label className="block text-xs font-bold text-slate-700">
                     N° Châssis (VIN) <span className="text-rose-500 font-bold">*</span>
@@ -410,20 +415,65 @@ export default function NouvelleEntreeModal({
                     ) : vinLookupStatus === "found" ? (
                       <span className="inline-flex items-center gap-1 px-2.5 py-1 rounded-md text-[10px] font-bold bg-emerald-100 text-emerald-800 border border-emerald-300 shadow-2xs">
                         <Check className="w-3.5 h-3.5 text-emerald-700" />
-                        Trouvé dans VIN
+                        Trouvé
                       </span>
                     ) : (
                       <button
                         type="button"
                         onClick={() => performVinLookup(formData.chassis)}
-                        disabled={formData.chassis.trim().length < 5}
+                        disabled={formData.chassis.trim().length < 3}
                         className="inline-flex items-center gap-1 px-2.5 py-1 rounded-md text-[10px] font-bold bg-slate-100 hover:bg-slate-200 text-slate-700 transition-colors disabled:opacity-40 cursor-pointer"
-                        title="Rechercher dans la page VIN"
+                        title="Rechercher dans le Parc véhicules & engins"
                       >
                         <Search className="w-3 h-3 text-slate-500" />
                         Rechercher
                       </button>
                     )}
+                  </div>
+                </div>
+              </div>
+
+              {/* Immatriculation */}
+              <div>
+                <div className="flex items-center justify-between mb-1">
+                  <label className="block text-xs font-bold text-slate-700">
+                    Immatriculation
+                  </label>
+                  {formData.immatriculation && vinLookupStatus === "found" ? (
+                    <span className="inline-flex items-center gap-1 text-[10px] font-bold text-emerald-700 bg-emerald-50 px-1.5 py-0.5 rounded border border-emerald-200">
+                      <Sparkles className="w-2.5 h-2.5 text-emerald-600" />
+                      Auto-rempli
+                    </span>
+                  ) : (
+                    <span className="text-[11px] text-slate-500">
+                      Auto-rempli / Optionnel
+                    </span>
+                  )}
+                </div>
+                <div className="relative flex items-center">
+                  <input
+                    type="text"
+                    placeholder="ex: RS215545 ou 123456-A-78"
+                    value={formData.immatriculation}
+                    onChange={(e) =>
+                      setFormData({
+                        ...formData,
+                        immatriculation: e.target.value.toUpperCase(),
+                      })
+                    }
+                    className="w-full pl-3 pr-24 py-2 rounded-lg border border-slate-200 text-xs font-bold text-slate-900 uppercase focus:outline-none focus:ring-2 focus:ring-emerald-500/20 focus:border-emerald-500 font-mono tracking-wider"
+                  />
+                  <div className="absolute right-1.5 flex items-center gap-1">
+                    <button
+                      type="button"
+                      onClick={() => performVinLookup(formData.immatriculation)}
+                      disabled={formData.immatriculation.trim().length < 3 || vinLookupStatus === "searching"}
+                      className="inline-flex items-center gap-1 px-2 py-1 rounded-md text-[10px] font-bold bg-slate-100 hover:bg-slate-200 text-slate-700 transition-colors disabled:opacity-40 cursor-pointer"
+                      title="Rechercher par immatriculation dans le Parc"
+                    >
+                      <Search className="w-3 h-3 text-slate-500" />
+                      Rechercher
+                    </button>
                   </div>
                 </div>
               </div>
@@ -434,15 +484,18 @@ export default function NouvelleEntreeModal({
                   <div className="flex items-center gap-2">
                     <Sparkles className="w-4 h-4 text-emerald-600 shrink-0" />
                     <span>
-                      <strong>Véhicule identifié dans la page VIN :</strong>{" "}
+                      <strong>Véhicule identifié dans {foundVinDetails?.source === "inventory" ? "le Parc véhicules & engins" : "la base VIN"} :</strong>{" "}
                       {foundVinDetails?.marque} {foundVinDetails?.modele}
+                      {foundVinDetails?.immatriculation
+                        ? ` • Immat: ${foundVinDetails.immatriculation}`
+                        : ""}
                       {foundVinDetails?.nomClient
                         ? ` • ${foundVinDetails.nomClient}`
                         : ""}
                     </span>
                   </div>
                   <span className="text-[10px] font-bold bg-emerald-200/80 text-emerald-900 px-2 py-0.5 rounded-md shrink-0">
-                    Page VIN
+                    {foundVinDetails?.source === "inventory" ? "Parc Véhicules" : "Base VIN"}
                   </span>
                 </div>
               )}
@@ -452,14 +505,14 @@ export default function NouvelleEntreeModal({
                   <div className="flex items-center gap-2">
                     <AlertCircle className="w-4 h-4 text-amber-600 shrink-0" />
                     <span>
-                      Châssis non répertorié dans la page VIN. Vous pouvez compléter les champs manuellement.
+                      Véhicule non répertorié dans le Parc véhicules & engins ni dans la base VIN. Vous pouvez compléter les champs manuellement.
                     </span>
                   </div>
                   <button
                     type="button"
                     onClick={() => setIsVinModalOpen(true)}
                     className="inline-flex items-center gap-1 px-2.5 py-1 text-[11px] font-bold text-amber-950 bg-amber-200 hover:bg-amber-300 rounded-lg transition-colors cursor-pointer shrink-0"
-                    title="Enregistrer ce véhicule dans la base VIN de Google Sheets"
+                    title="Enregistrer ce véhicule dans la base VIN de PostgreSQL"
                   >
                     <Plus className="w-3.5 h-3.5" />
                     Ajouter ce VIN

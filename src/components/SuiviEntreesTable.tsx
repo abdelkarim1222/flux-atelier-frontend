@@ -8,8 +8,7 @@ import {
   Calendar,
   ShieldCheck,
   AlertCircle,
-  FileSpreadsheet,
-  ChevronRight,
+  TableProperties,
   MapPin,
   Clock,
   Wrench,
@@ -22,30 +21,31 @@ import {
   Lock,
   Loader2,
   Check,
-  Settings,
   Pencil,
   Trash2,
   Eye,
 } from "lucide-react";
 import {
   fetchSuiviEntreesData,
-  fetchGoogleSheetFluxData,
+  fetchDatabaseFluxData,
+  isDatabaseWriteConfigured,
   updateReceptionRowEtat,
   updateReceptionRowEmplacement,
-  isGoogleSheetWriteConfigured,
+  livrerVehiculeReception,
   DELIVERED_EMPLACEMENT,
-  DEFAULT_SUIVI_GID,
-  DEFAULT_SHEET_GID,
-  VEHICLE_SHEET_URL,
-} from "../services/googleSheets";
+} from "../services/database";
+import { EMPLACEMENT_ZONES, FULL_PARKING_EMPLACEMENT, normalizeEmplacementCode } from "../services/emplacementService";
 import type { Flux, WorkshopStatus } from "../data/mockData";
 import { useRole } from "../context/RoleContext";
 import NouvelleEntreeModal from "./NouvelleEntreeModal";
 import NouveauVinModal from "./NouveauVinModal";
 import ModifierEntreeModal from "./ModifierEntreeModal";
 import ConfirmationSuppressionModal from "./ConfirmationSuppressionModal";
-import GoogleSheetConfigModal from "./GoogleSheetConfigModal";
 import DetailVehiculeModal from "./DetailVehiculeModal";
+
+export interface SuiviEntreesTableProps {
+  onNavigateToMap?: (emplacement: string) => void;
+}
 
 export interface UnifiedReceptionRow {
   id: string;
@@ -70,6 +70,13 @@ export interface UnifiedReceptionRow {
   marque?: string;
   modele?: string;
   categorie?: string;
+  statutAcceptation?: string;
+  dateAcceptation?: string;
+  dateMiseEnAttente?: string;
+  acceptePar?: string;
+  dateDebutRep?: string;
+  dateDebutTravail?: string;
+  heureDebutTravail?: string;
 }
 
 type SortField =
@@ -110,17 +117,17 @@ function parseDateEntreeTimestamp(dateStr?: string): number {
   const str = String(dateStr).trim();
   if (str.includes("1899")) return 0;
 
-  // gviz Date(YYYY, M, D, H, M, S)
-  const gvizMatch = str.match(
+  // Ancien format Date(YYYY, M, D, H, M, S)
+  const serializedDateMatch = str.match(
     /Date\((\d{4}),\s*(\d{1,2}),\s*(\d{1,2})(?:,\s*(\d{1,2}))?(?:,\s*(\d{1,2}))?(?:,\s*(\d{1,2}))?\)/i
   );
-  if (gvizMatch) {
-    const year = Number(gvizMatch[1]);
-    const month = Number(gvizMatch[2]);
-    const day = Number(gvizMatch[3]);
-    const hour = Number(gvizMatch[4] || 0);
-    const minute = Number(gvizMatch[5] || 0);
-    const second = Number(gvizMatch[6] || 0);
+  if (serializedDateMatch) {
+    const year = Number(serializedDateMatch[1]);
+    const month = Number(serializedDateMatch[2]);
+    const day = Number(serializedDateMatch[3]);
+    const hour = Number(serializedDateMatch[4] || 0);
+    const minute = Number(serializedDateMatch[5] || 0);
+    const second = Number(serializedDateMatch[6] || 0);
     if (year <= 1900) return 0;
     return new Date(year, month, day, hour, minute, second).getTime();
   }
@@ -168,15 +175,15 @@ function parseDateEntreeTimestamp(dateStr?: string): number {
 function formatDisplayDate(dateStr?: string): string {
   if (!dateStr || dateStr.includes("1899")) return "-";
 
-  const gvizMatch = dateStr.match(
+  const serializedDateMatch = dateStr.match(
     /Date\((\d{4}),\s*(\d{1,2}),\s*(\d{1,2})(?:,\s*(\d{1,2}))?(?:,\s*(\d{1,2}))?(?:,\s*(\d{1,2}))?\)/i
   );
-  if (gvizMatch) {
-    const y = gvizMatch[1];
-    const m = String(Number(gvizMatch[2]) + 1).padStart(2, "0");
-    const d = String(Number(gvizMatch[3])).padStart(2, "0");
-    const hh = String(Number(gvizMatch[4] || 0)).padStart(2, "0");
-    const mm = String(Number(gvizMatch[5] || 0)).padStart(2, "0");
+  if (serializedDateMatch) {
+    const y = serializedDateMatch[1];
+    const m = String(Number(serializedDateMatch[2]) + 1).padStart(2, "0");
+    const d = String(Number(serializedDateMatch[3])).padStart(2, "0");
+    const hh = String(Number(serializedDateMatch[4] || 0)).padStart(2, "0");
+    const mm = String(Number(serializedDateMatch[5] || 0)).padStart(2, "0");
     return `${d}/${m}/${y} ${hh}:${mm}`;
   }
 
@@ -195,8 +202,11 @@ function parseAvancementPct(value: string): number | null {
   return null;
 }
 
-export default function SuiviEntreesTable() {
-  const { permissions } = useRole();
+export default function SuiviEntreesTable({ onNavigateToMap }: SuiviEntreesTableProps = {}) {
+  const { permissions, role } = useRole();
+  // Les Chefs d'équipe consultent uniquement ce tableau : aucune fiche, édition
+  // ou suppression n'est exposée depuis le suivi des entrées.
+  const canManageEntries = role !== "chef_equipe";
   const [items, setItems] = useState<UnifiedReceptionRow[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -213,8 +223,68 @@ export default function SuiviEntreesTable() {
   // Saving state for live updates on État / Emplacement
   const [savingRowId, setSavingRowId] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
-  const [isConfigModalOpen, setIsConfigModalOpen] = useState(false);
-  const [writeActive, setWriteActive] = useState(() => isGoogleSheetWriteConfigured());
+
+  // Modal Mode de paiement (affiché quand on clique « Livrer »)
+  const [paiementModal, setPaiementModal] = useState<{
+    item: UnifiedReceptionRow;
+    mode: string;
+  } | null>(null);
+
+  const MODES_PAIEMENT = [
+    { value: "Espèces",         icon: "💵" },
+    { value: "Chèque",           icon: "📝" },
+    { value: "Virement",         icon: "🏦" },
+    { value: "Carte bancaire",   icon: "💳" },
+    { value: "Bon de commande",  icon: "📋" },
+    { value: "Autre",            icon: "⚙️" },
+  ];
+
+  const handleConfirmLivraison = async () => {
+    if (!paiementModal || !paiementModal.mode) return;
+    const { item, mode } = paiementModal;
+    setPaiementModal(null);
+
+    // Optimistic UI update
+    setSavingRowId(item.id);
+    setNotice(null);
+    setItems((current) =>
+      current.map((row) =>
+        row.id === item.id
+          ? { ...row, etat: "Livr\u00e9", emplacement: DELIVERED_EMPLACEMENT }
+          : row
+      )
+    );
+
+    try {
+      if (isDatabaseWriteConfigured()) {
+        // livrerVehicule : action r\u00e9ception autoris\u00e9e (\u00e9vite le 400 de updateEtat)
+        await livrerVehiculeReception(item, mode);
+        setNotice(
+          `Dossier ${item.noOr} livr\u00e9 \u2014 Mode de paiement\u00a0: ${mode}. Emplacement\u00a0: ${DELIVERED_EMPLACEMENT}.`
+        );
+      } else {
+        setNotice(
+          `Dossier ${item.noOr} livr\u00e9 en local (mode\u00a0: ${mode}). (Configurez DATABASE_URL pour enregistrer dans PostgreSQL).`
+        );
+      }
+    } catch (err) {
+      // Revert on error
+      setItems((current) =>
+        current.map((row) =>
+          row.id === item.id
+            ? { ...row, etat: item.etat, emplacement: item.emplacement }
+            : row
+        )
+      );
+      setNotice(
+        err instanceof Error
+          ? `Erreur livraison\u00a0: ${err.message}`
+          : "Impossible d'enregistrer la livraison dans PostgreSQL."
+      );
+    } finally {
+      setSavingRowId(null);
+    }
+  };
 
   // Default sort: Date Entrée et Heure descending (newest entries and new N° OR at the top)
   const [sortField, setSortField] = useState<SortField>("dateEntreeHeure");
@@ -228,7 +298,7 @@ export default function SuiviEntreesTable() {
     try {
       const [suiviData, chargementData] = await Promise.all([
         fetchSuiviEntreesData(),
-        fetchGoogleSheetFluxData().catch((err) => {
+        fetchDatabaseFluxData().catch((err) => {
           console.warn("Tableaux de chargement fallback:", err);
           return [] as Flux[];
         }),
@@ -301,6 +371,13 @@ export default function SuiviEntreesTable() {
           marque: s.marque || f?.marque || "IVECO",
           modele: s.modele || f?.modele || "-",
           categorie: s.categorie || f?.categorie,
+          statutAcceptation: f?.statutAcceptation || (s as any).statutAcceptation,
+          dateAcceptation: f?.dateAcceptation || (s as any).dateAcceptation,
+          dateMiseEnAttente: f?.dateMiseEnAttente || (s as any).dateMiseEnAttente,
+          acceptePar: f?.acceptePar || (s as any).acceptePar,
+          dateDebutRep: f?.dateDebutRep || (s as any).dateDebutRep || f?.dateDebutTravail || (s as any).dateDebutTravail,
+          dateDebutTravail: f?.dateDebutTravail || (s as any).dateDebutTravail || f?.dateDebutRep,
+          heureDebutTravail: f?.heureDebutTravail || (s as any).heureDebutTravail,
         };
       });
 
@@ -333,6 +410,13 @@ export default function SuiviEntreesTable() {
           marque: f.marque || "IVECO",
           modele: f.modele || "-",
           categorie: f.categorie,
+          statutAcceptation: f.statutAcceptation,
+          dateAcceptation: f.dateAcceptation,
+          dateMiseEnAttente: f.dateMiseEnAttente,
+          acceptePar: f.acceptePar,
+          dateDebutRep: f.dateDebutRep || f.dateDebutTravail,
+          dateDebutTravail: f.dateDebutTravail || f.dateDebutRep,
+          heureDebutTravail: f.heureDebutTravail,
         });
       });
 
@@ -356,7 +440,6 @@ export default function SuiviEntreesTable() {
       if (!silent) {
         setLoading(false);
       }
-      setWriteActive(isGoogleSheetWriteConfigured());
     }
   }, []);
 
@@ -409,7 +492,7 @@ export default function SuiviEntreesTable() {
     );
 
     try {
-      if (isGoogleSheetWriteConfigured()) {
+      if (isDatabaseWriteConfigured()) {
         await updateReceptionRowEtat(item, nextEtat);
         if (isNowLivré && nextEmplacement !== previousEmplacement) {
           await updateReceptionRowEmplacement(item, nextEmplacement).catch(
@@ -423,7 +506,7 @@ export default function SuiviEntreesTable() {
         );
       } else {
         setNotice(
-          `Dossier ${item.noOr} mis à jour en local : État "${nextEtat}". (Pour enregistrer dans Google Sheets, configurez VITE_SHEET_WRITE_URL).`
+          `Dossier ${item.noOr} mis à jour en local : État "${nextEtat}". (Pour enregistrer dans PostgreSQL, configurez DATABASE_URL).`
         );
       }
     } catch (err) {
@@ -438,7 +521,7 @@ export default function SuiviEntreesTable() {
       setNotice(
         err instanceof Error
           ? `Erreur : ${err.message}`
-          : "Impossible de modifier l'état dans Google Sheets."
+          : "Impossible de modifier l'état dans PostgreSQL."
       );
     } finally {
       setSavingRowId(null);
@@ -457,6 +540,21 @@ export default function SuiviEntreesTable() {
 
     if (!nextEmplacement || nextEmplacement === item.emplacement) return;
 
+    const normalizedTarget = normalizeEmplacementCode(nextEmplacement);
+    const isExclusiveLocation = normalizedTarget !== "NA" &&
+      normalizedTarget !== DELIVERED_EMPLACEMENT &&
+      normalizedTarget !== FULL_PARKING_EMPLACEMENT;
+    const occupiedBy = isExclusiveLocation
+      ? items.find((row) => {
+          if (row.id === item.id || normalizeEmplacementCode(row.emplacement) !== normalizedTarget) return false;
+          return !`${row.etat} ${row.avancement}`.toLowerCase().includes("livr");
+        })
+      : undefined;
+    if (occupiedBy) {
+      setNotice(`Emplacement ${nextEmplacement} indisponible : il est déjà occupé par le dossier ${occupiedBy.noOr || occupiedBy.chassis}.`);
+      return;
+    }
+
     const previousEmplacement = item.emplacement;
     setSavingRowId(item.id);
     setNotice(null);
@@ -469,14 +567,14 @@ export default function SuiviEntreesTable() {
     );
 
     try {
-      if (isGoogleSheetWriteConfigured()) {
+      if (isDatabaseWriteConfigured()) {
         await updateReceptionRowEmplacement(item, nextEmplacement);
         setNotice(
           `Emplacement ${item.noOr} mis à jour : ${previousEmplacement} -> ${nextEmplacement}.`
         );
       } else {
         setNotice(
-          `Emplacement ${item.noOr} mis à jour en local : ${nextEmplacement}. (Configurez VITE_SHEET_WRITE_URL pour Google Sheets).`
+          `Emplacement ${item.noOr} mis à jour en local : ${nextEmplacement}. (Configurez DATABASE_URL pour PostgreSQL).`
         );
       }
     } catch (err) {
@@ -489,7 +587,7 @@ export default function SuiviEntreesTable() {
       setNotice(
         err instanceof Error
           ? `Erreur : ${err.message}`
-          : "Impossible de modifier l'emplacement dans Google Sheets."
+          : "Impossible de modifier l'emplacement dans PostgreSQL."
       );
     } finally {
       setSavingRowId(null);
@@ -734,15 +832,27 @@ export default function SuiviEntreesTable() {
         label: "Non assigné",
       };
     }
-    if (emp.includes("LIVRAISON")) {
+    if (emp.includes("LIVR")) {
       return {
         bg: "bg-emerald-100 text-emerald-800 border-emerald-300 font-bold",
         label: "Livraison au client",
       };
     }
+    if (emp.includes("COMPLET") || emp.includes("PLEIN")) {
+      return {
+        bg: "bg-red-100 text-red-800 border-red-300 font-extrabold animate-pulse",
+        label: FULL_PARKING_EMPLACEMENT,
+      };
+    }
     if (emp.startsWith("L")) {
       return {
         bg: "bg-blue-100 text-blue-800 border-blue-300 font-extrabold",
+        label: emp,
+      };
+    }
+    if (emp.startsWith("D")) {
+      return {
+        bg: "bg-indigo-100 text-indigo-800 border-indigo-300 font-extrabold",
         label: emp,
       };
     }
@@ -752,8 +862,38 @@ export default function SuiviEntreesTable() {
         label: emp,
       };
     }
+    if (emp.startsWith("E")) {
+      return {
+        bg: "bg-emerald-100 text-emerald-800 border-emerald-300 font-extrabold",
+        label: emp,
+      };
+    }
+    if (emp.startsWith("S")) {
+      return {
+        bg: "bg-amber-100 text-amber-800 border-amber-300 font-extrabold",
+        label: emp,
+      };
+    }
+    if (emp.startsWith("C")) {
+      return {
+        bg: "bg-rose-100 text-rose-800 border-rose-300 font-extrabold",
+        label: emp,
+      };
+    }
+    if (emp.startsWith("T") || emp.startsWith("M")) {
+      return {
+        bg: "bg-purple-100 text-purple-800 border-purple-300 font-extrabold",
+        label: emp,
+      };
+    }
+    if (emp.startsWith("P")) {
+      return {
+        bg: "bg-cyan-100 text-cyan-800 border-cyan-300 font-bold",
+        label: emp,
+      };
+    }
     return {
-      bg: "bg-amber-100 text-amber-800 border-amber-300 font-bold",
+      bg: "bg-slate-100 text-slate-700 border-slate-300 font-bold",
       label: emp,
     };
   };
@@ -765,7 +905,7 @@ export default function SuiviEntreesTable() {
         <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-4">
           <div className="flex items-center gap-3.5">
             <div className="w-12 h-12 rounded-xl bg-gradient-to-br from-emerald-600 to-teal-700 flex items-center justify-center text-white shadow-md shadow-emerald-500/20 shrink-0">
-              <FileSpreadsheet className="w-6 h-6" />
+              <TableProperties className="w-6 h-6" />
             </div>
             <div>
               <div className="flex items-center flex-wrap gap-2">
@@ -800,36 +940,17 @@ export default function SuiviEntreesTable() {
 
           {/* Top Quick Actions */}
           <div className="flex items-center flex-wrap gap-2.5">
-            {/* Bouton de statut/configuration Google Sheets */}
-            <button
-              type="button"
-              onClick={() => setIsConfigModalOpen(true)}
-              className={`inline-flex items-center gap-1.5 px-3 py-2 text-xs font-bold rounded-xl border transition-all cursor-pointer ${
-                writeActive
-                  ? "bg-emerald-50 text-emerald-800 border-emerald-300 hover:bg-emerald-100"
-                  : "bg-amber-50 text-amber-900 border-amber-300 hover:bg-amber-100 shadow-2xs animate-pulse"
-              }`}
-              title="Configurer l'enregistrement automatique dans Google Sheets"
-            >
-              {writeActive ? (
-                <>
-                  <CheckCircle2 className="w-3.5 h-3.5 text-emerald-600" />
-                  <span>Google Sheets Connecté</span>
-                </>
-              ) : (
-                <>
-                  <Settings className="w-3.5 h-3.5 text-amber-600" />
-                  <span>Activer Synchro Google Sheets</span>
-                </>
-              )}
-            </button>
+            <div className="inline-flex items-center gap-1.5 px-3 py-2 text-xs font-bold rounded-xl border bg-emerald-50 text-emerald-800 border-emerald-300" title="Les données sont enregistrées dans PostgreSQL">
+              <CheckCircle2 className="w-3.5 h-3.5 text-emerald-600" />
+              <span>Base SQL</span>
+            </div>
 
             <button
               type="button"
               onClick={() => loadData(false)}
               disabled={loading}
               className="inline-flex items-center gap-2 px-3.5 py-2 text-xs font-semibold text-slate-700 bg-slate-100 hover:bg-slate-200 rounded-xl transition-all disabled:opacity-50 cursor-pointer"
-              title="Recharger les données Google Sheets"
+              title="Recharger les données PostgreSQL"
             >
               <RefreshCcw
                 className={`w-3.5 h-3.5 ${loading ? "animate-spin" : ""}`}
@@ -837,7 +958,7 @@ export default function SuiviEntreesTable() {
               Actualiser
             </button>
 
-            {permissions.canAddEntree ? (
+            {canManageEntries && permissions.canAddEntree ? (
               <div className="flex items-center gap-2">
                 <button
                   type="button"
@@ -876,15 +997,6 @@ export default function SuiviEntreesTable() {
             <div className="flex items-center flex-wrap gap-2">
               <Sparkles className="w-4 h-4 text-blue-600 shrink-0" />
               <span className="font-semibold">{notice}</span>
-              {!writeActive && (
-                <button
-                  type="button"
-                  onClick={() => setIsConfigModalOpen(true)}
-                  className="ml-2 px-2.5 py-1 text-[11px] font-bold bg-emerald-700 hover:bg-emerald-800 text-white rounded-lg shadow-xs transition-colors cursor-pointer"
-                >
-                  ⚡ Activer la synchronisation Google Sheets
-                </button>
-              )}
             </div>
             <button
               type="button"
@@ -1065,7 +1177,7 @@ export default function SuiviEntreesTable() {
         <div className="p-4 mb-4 rounded-xl bg-red-50 border border-red-200 text-red-700 text-xs flex items-center gap-3">
           <AlertCircle className="w-5 h-5 shrink-0 text-red-500" />
           <div className="flex-1">
-            <p className="font-bold">Erreur de chargement Google Sheets</p>
+            <p className="font-bold">Erreur de chargement PostgreSQL</p>
             <p className="mt-0.5">{error}</p>
           </div>
           <button
@@ -1211,29 +1323,31 @@ export default function SuiviEntreesTable() {
                 </th>
 
                 {/* 12. Actions (Modifier / Supprimer) */}
-                <th className="py-3 px-3.5 whitespace-nowrap text-center sticky right-0 bg-slate-100/95 backdrop-blur-md shadow-[-4px_0_6px_-2px_rgba(0,0,0,0.05)] z-10">
-                  Actions
-                </th>
+                {canManageEntries && (
+                  <th className="py-3 px-3.5 whitespace-nowrap text-center sticky right-0 bg-slate-100/95 backdrop-blur-md shadow-[-4px_0_6px_-2px_rgba(0,0,0,0.05)] z-10">
+                    Actions
+                  </th>
+                )}
               </tr>
             </thead>
             <tbody className="divide-y divide-slate-100">
               {loading && items.length === 0 ? (
                 <tr>
-                  <td colSpan={13} className="py-16 text-center text-slate-400">
+                  <td colSpan={canManageEntries ? 13 : 12} className="py-16 text-center text-slate-400">
                     <div className="flex flex-col items-center justify-center gap-2.5">
                       <RefreshCcw className="w-7 h-7 animate-spin text-emerald-600" />
                       <p className="font-semibold text-slate-700 text-sm">
                         Chargement des données unifiées Réception & Atelier...
                       </p>
                       <p className="text-xs text-slate-400">
-                        Synchronisation avec les feuilles Google Sheets en cours
+                        Chargement des dossiers depuis PostgreSQL
                       </p>
                     </div>
                   </td>
                 </tr>
               ) : filteredData.length === 0 ? (
                 <tr>
-                  <td colSpan={13} className="py-16 text-center text-slate-400">
+                  <td colSpan={canManageEntries ? 13 : 12} className="py-16 text-center text-slate-400">
                     <div className="flex flex-col items-center justify-center gap-2">
                       <Car className="w-9 h-9 text-slate-300" />
                       <p className="font-bold text-slate-700 text-sm">
@@ -1273,7 +1387,7 @@ export default function SuiviEntreesTable() {
                       itemTs > 0 &&
                       nowTs - itemTs < 24 * 60 * 60 * 1000 &&
                       nowTs >= itemTs - 60000;
-                    const canEdit = isAvancementTermine(item.avancement);
+                    const canEdit = canManageEntries && isAvancementTermine(item.avancement);
                     const isSaving = savingRowId === item.id;
                     const isDelivered =
                       item.etat.toLowerCase().includes("livr") ||
@@ -1282,9 +1396,9 @@ export default function SuiviEntreesTable() {
                   return (
                     <tr
                       key={item.id}
-                      onClick={() => setDetailRow(item)}
-                      className="hover:bg-blue-50/40 transition-colors group cursor-pointer"
-                      title="Cliquer pour voir la fiche détaillée et la condition du véhicule"
+                      onClick={canManageEntries ? () => setDetailRow(item) : undefined}
+                      className={`hover:bg-blue-50/40 transition-colors group ${canManageEntries ? "cursor-pointer" : ""}`}
+                      title={canManageEntries ? "Cliquer pour voir la fiche détaillée et la condition du véhicule" : undefined}
                     >
                       {/* 1. N° OR */}
                       <td className="py-3 px-3.5 font-bold text-slate-900 whitespace-nowrap">
@@ -1410,9 +1524,11 @@ export default function SuiviEntreesTable() {
                                 </span>
                                 <button
                                   type="button"
-                                  onClick={() => handleUpdateEtat(item, "Livré")}
+                                  onClick={() =>
+                                    setPaiementModal({ item, mode: "" })
+                                  }
                                   className="inline-flex items-center gap-1 px-2.5 py-1 text-[10px] font-extrabold text-white bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-700 hover:to-teal-700 active:scale-95 rounded-lg shadow-xs transition-all cursor-pointer"
-                                  title="Passer à Livré (réparations terminées)"
+                                  title="Choisir le mode de paiement et passer à Livré"
                                 >
                                   <CheckCircle2 className="w-3 h-3" />
                                   <span>Livrer</span>
@@ -1433,6 +1549,22 @@ export default function SuiviEntreesTable() {
                               {item.etat || "En attente"}
                             </span>
                             <Lock className="w-3 h-3 text-slate-300" />
+                          </div>
+                        )}
+                        {item.dateAcceptation && (
+                          <div className="text-[10px] font-semibold text-emerald-800 bg-emerald-50 px-1.5 py-0.5 rounded border border-emerald-200 mt-1 w-fit" title={`Accepté par ${item.acceptePar || "le chef d'équipe"}`}>
+                            ✓ Accepté : {item.dateAcceptation}
+                          </div>
+                        )}
+                        {(item.dateDebutRep || item.dateDebutTravail) && (
+                          <div className="text-[10px] font-semibold text-blue-800 bg-blue-50 px-1.5 py-0.5 rounded border border-blue-200 mt-1 w-fit flex items-center gap-1" title={`Début des travaux : ${item.dateDebutRep || item.dateDebutTravail}`}>
+                            <Clock size={10} className="text-blue-600 shrink-0" />
+                            <span>Début : {item.dateDebutRep || item.dateDebutTravail}</span>
+                          </div>
+                        )}
+                        {item.dateMiseEnAttente && !item.dateAcceptation && (
+                          <div className="text-[10px] font-semibold text-amber-800 bg-amber-50 px-1.5 py-0.5 rounded border border-amber-200 mt-1 w-fit">
+                            ⏸ Mis en attente : {item.dateMiseEnAttente}
                           </div>
                         )}
                       </td>
@@ -1510,6 +1642,12 @@ export default function SuiviEntreesTable() {
                                 />
                               </div>
                             )}
+                            {(item.dateDebutRep || item.dateDebutTravail) && (
+                              <div className="text-[9px] font-semibold text-blue-800 bg-blue-50/80 px-1.5 py-0.5 rounded border border-blue-200/80 mt-1 w-fit flex items-center gap-1" title={`Début des travaux : ${item.dateDebutRep || item.dateDebutTravail}`}>
+                                <Clock size={9} className="text-blue-600 shrink-0" />
+                                <span>Début : {item.dateDebutRep || item.dateDebutTravail}</span>
+                              </div>
+                            )}
                           </div>
                         ) : (
                           <span className="text-slate-300 italic text-[11px]">
@@ -1558,75 +1696,113 @@ export default function SuiviEntreesTable() {
                               <option value="Livraison au client">
                                 🚚 Livraison au client
                               </option>
-                              <optgroup label="Zones Attente Client (L)">
-                                {["L1", "L2", "L3", "L4", "L5", "L6", "L7", "L8"].map(
-                                  (z) => (
-                                    <option key={z} value={z}>
-                                      Zone {z}
-                                    </option>
-                                  )
-                                )}
-                              </optgroup>
-                              <optgroup label="Zones Daily (D)">
-                                {[
-                                  "D1",
-                                  "D2",
-                                  "D3",
-                                  "D4",
-                                  "D5",
-                                  "D6",
-                                  "D7",
-                                  "D8",
-                                ].map((z) => (
+                              <option value="Place complet">
+                                ⛔ Place complet
+                              </option>
+                              <optgroup label="Zone D — Daily1 / Daily2">
+                                {EMPLACEMENT_ZONES.DAILY.map((z) => (
                                   <option key={z} value={z}>
                                     Zone {z}
                                   </option>
                                 ))}
                               </optgroup>
-                              <optgroup label="Zones Changan / JMC (J)">
-                                {["J1", "J2", "J3", "J4", "J5", "J6"].map(
-                                  (z) => (
-                                    <option key={z} value={z}>
-                                      Zone {z}
-                                    </option>
-                                  )
-                                )}
-                              </optgroup>
-                              <optgroup label="Autres zones atelier">
-                                {[
-                                  "S11",
-                                  "S21",
-                                  "S22",
-                                  "E1",
-                                  "E2",
-                                  "C1",
-                                  "C2",
-                                ].map((z) => (
+                              <optgroup label="Zone J — Changan / JMC">
+                                {EMPLACEMENT_ZONES.CHANGAN.map((z) => (
                                   <option key={z} value={z}>
                                     Zone {z}
+                                  </option>
+                                ))}
+                              </optgroup>
+                              <optgroup label="Zone E — Électrique">
+                                {EMPLACEMENT_ZONES.ELECTRIQUE.map((z) => (
+                                  <option key={z} value={z}>
+                                    Zone {z}
+                                  </option>
+                                ))}
+                              </optgroup>
+                              <optgroup label="Zone S — Service Rapide">
+                                {EMPLACEMENT_ZONES.SERVICE_RAPIDE.map((z) => (
+                                  <option key={z} value={z}>
+                                    Zone {z}
+                                  </option>
+                                ))}
+                              </optgroup>
+                              <optgroup label="Zone C — Carrosserie">
+                                {EMPLACEMENT_ZONES.CARROSSERIE.map((z) => (
+                                  <option key={z} value={z}>
+                                    Zone {z}
+                                  </option>
+                                ))}
+                              </optgroup>
+                              <optgroup label="Zone T — Lourd (Postes T)">
+                                {EMPLACEMENT_ZONES.LOURD_T.map((z) => (
+                                  <option key={z} value={z}>
+                                    Zone {z}
+                                  </option>
+                                ))}
+                              </optgroup>
+                              <optgroup label="Zone M — Lourd (Postes M)">
+                                {EMPLACEMENT_ZONES.LOURD_M.map((z) => (
+                                  <option key={z} value={z}>
+                                    Zone {z}
+                                  </option>
+                                ))}
+                              </optgroup>
+                              <optgroup label="Zone L — Attente Client">
+                                {EMPLACEMENT_ZONES.ATTENTE_CLIENT_L.map((z) => (
+                                  <option key={z} value={z}>
+                                    Zone {z}
+                                  </option>
+                                ))}
+                              </optgroup>
+                              <optgroup label="Zone P — Parking général">
+                                {EMPLACEMENT_ZONES.PARKING_P.map((z) => (
+                                  <option key={z} value={z}>
+                                    Parking {z}
                                   </option>
                                 ))}
                               </optgroup>
                             </select>
+                            {onNavigateToMap && item.emplacement && item.emplacement !== "-" && item.emplacement !== "NA" && (
+                              <button
+                                type="button"
+                                onClick={() => onNavigateToMap(item.emplacement)}
+                                className="p-1 rounded-md text-amber-600 hover:text-amber-800 hover:bg-amber-50 transition-colors cursor-pointer"
+                                title={`Voir ${item.emplacement} sur le Plan d'Atelier`}
+                              >
+                                <MapPin className="w-3.5 h-3.5 shrink-0" />
+                              </button>
+                            )}
                           </div>
                         ) : (
                           <div
                             className="flex items-center gap-1"
-                            title="Emplacement verrouillé : réparations en cours (Avancement != Terminer)"
+                            title={
+                              onNavigateToMap && item.emplacement && item.emplacement !== "-" && item.emplacement !== "NA"
+                                ? `Cliquer pour voir ${item.emplacement} sur le Plan d'Atelier`
+                                : "Emplacement atelier"
+                            }
                           >
-                            <span
-                              className={`inline-flex items-center gap-1 px-2.5 py-1 rounded-lg text-xs border ${empBadge.bg} shadow-2xs`}
+                            <button
+                              type="button"
+                              disabled={!onNavigateToMap || !item.emplacement || item.emplacement === "-" || item.emplacement === "NA"}
+                              onClick={() => onNavigateToMap?.(item.emplacement)}
+                              className={`inline-flex items-center gap-1 px-2.5 py-1 rounded-lg text-xs border ${empBadge.bg} shadow-2xs ${
+                                onNavigateToMap && item.emplacement && item.emplacement !== "-" && item.emplacement !== "NA"
+                                  ? "cursor-pointer hover:scale-105 active:scale-95 transition-transform"
+                                  : ""
+                              }`}
                             >
                               <MapPin className="w-3 h-3 shrink-0" />
                               <span>{empBadge.label}</span>
-                            </span>
+                            </button>
                             <Lock className="w-3 h-3 text-slate-300" />
                           </div>
                         )}
                       </td>
 
                       {/* 12. Actions : Détails, Modifier & Supprimer */}
-                      <td
+                      {canManageEntries && <td
                         onClick={(e) => e.stopPropagation()}
                         className="py-3 px-3.5 whitespace-nowrap text-center sticky right-0 bg-white group-hover:bg-slate-50/90 transition-colors shadow-[-4px_0_6px_-2px_rgba(0,0,0,0.05)]"
                       >
@@ -1656,7 +1832,7 @@ export default function SuiviEntreesTable() {
                             <Trash2 className="w-3.5 h-3.5 group-hover/btn:scale-110 transition-transform" />
                           </button>
                         </div>
-                      </td>
+                      </td>}
                     </tr>
                   );
                 });
@@ -1685,27 +1861,7 @@ export default function SuiviEntreesTable() {
             )
           </div>
 
-          <div className="flex items-center gap-4">
-            <a
-              href={`${VEHICLE_SHEET_URL}#gid=${DEFAULT_SUIVI_GID}`}
-              target="_blank"
-              rel="noopener noreferrer"
-              className="text-emerald-700 hover:text-emerald-800 font-semibold hover:underline inline-flex items-center gap-1"
-            >
-              Suivi des entrées
-              <ChevronRight className="w-3 h-3" />
-            </a>
-            <span className="text-slate-300">•</span>
-            <a
-              href={`${VEHICLE_SHEET_URL}#gid=${DEFAULT_SHEET_GID}`}
-              target="_blank"
-              rel="noopener noreferrer"
-              className="text-blue-700 hover:text-blue-800 font-semibold hover:underline inline-flex items-center gap-1"
-            >
-              Tableaux de chargement
-              <ChevronRight className="w-3 h-3" />
-            </a>
-          </div>
+          <span>Source : PostgreSQL</span>
         </div>
       </div>
 
@@ -1763,7 +1919,7 @@ export default function SuiviEntreesTable() {
         row={editingRow}
         onClose={() => setEditingRow(null)}
         onSuccess={(updatedNoOr) => {
-          setNotice(`Dossier ${updatedNoOr || ""} mis à jour avec succès dans Google Sheets.`);
+          setNotice(`Dossier ${updatedNoOr || ""} mis à jour dans PostgreSQL.`);
           loadData();
         }}
       />
@@ -1774,32 +1930,109 @@ export default function SuiviEntreesTable() {
         row={deletingRow}
         onClose={() => setDeletingRow(null)}
         onSuccess={(deletedNoOr) => {
-          setNotice(`Dossier ${deletedNoOr || ""} supprimé avec succès de Google Sheets.`);
-          loadData();
-        }}
-      />
-
-      {/* Modal de configuration de l'écriture directe Google Sheets */}
-      <GoogleSheetConfigModal
-        isOpen={isConfigModalOpen}
-        onClose={() => setIsConfigModalOpen(false)}
-        onConfigured={() => {
-          setWriteActive(isGoogleSheetWriteConfigured());
+          setNotice(`Dossier ${deletedNoOr || ""} supprimé de PostgreSQL.`);
           loadData();
         }}
       />
 
       {/* Modal de consultation des détails complets et de la condition du véhicule */}
       <DetailVehiculeModal
-        isOpen={Boolean(detailRow)}
+        isOpen={canManageEntries && Boolean(detailRow)}
         onClose={() => setDetailRow(null)}
         vehicule={detailRow}
         onEdit={(v) => {
           const target = items.find((i) => i.id === v.id) || detailRow;
           if (target) setEditingRow(target);
         }}
-        canEdit={permissions.canAddEntree || permissions.canViewAll}
+        canEdit={canManageEntries && (permissions.canAddEntree || permissions.canViewAll)}
       />
+
+      {/* ═══════════════ MODAL MODE DE PAIEMENT ══════════════════════════════ */}
+      {paiementModal && (
+        <div
+          className="fixed inset-0 z-[999] flex items-center justify-center p-4"
+          style={{ backgroundColor: "rgba(0,0,0,0.55)", backdropFilter: "blur(4px)" }}
+          onClick={(e) => { if (e.target === e.currentTarget) setPaiementModal(null); }}
+        >
+          <div className="bg-white rounded-2xl shadow-2xl w-full max-w-md overflow-hidden animate-fade-in">
+            {/* Header */}
+            <div className="bg-gradient-to-r from-emerald-600 to-teal-600 px-6 py-4 flex items-center justify-between">
+              <div className="flex items-center gap-3">
+                <div className="w-9 h-9 rounded-xl bg-white/20 flex items-center justify-center">
+                  <CheckCircle2 className="w-5 h-5 text-white" />
+                </div>
+                <div>
+                  <h2 className="text-base font-extrabold text-white leading-tight">Livraison du véhicule</h2>
+                  <p className="text-emerald-100 text-xs font-medium">N° OR : {paiementModal.item.noOr}</p>
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={() => setPaiementModal(null)}
+                className="w-7 h-7 rounded-lg bg-white/20 hover:bg-white/30 flex items-center justify-center text-white font-bold transition-colors cursor-pointer"
+              >
+                ×
+              </button>
+            </div>
+
+            {/* Body */}
+            <div className="px-6 py-5">
+              <p className="text-sm font-semibold text-slate-700 mb-4">
+                Sélectionnez le <span className="text-emerald-700">mode de paiement</span> avant de confirmer la livraison :
+              </p>
+
+              <div className="grid grid-cols-2 gap-3">
+                {MODES_PAIEMENT.map(({ value, icon }) => (
+                  <button
+                    key={value}
+                    type="button"
+                    onClick={() => setPaiementModal((p) => p ? { ...p, mode: value } : p)}
+                    className={`flex items-center gap-2.5 px-4 py-3 rounded-xl border-2 text-sm font-bold transition-all cursor-pointer ${
+                      paiementModal.mode === value
+                        ? "border-emerald-500 bg-emerald-50 text-emerald-800 shadow-sm"
+                        : "border-slate-200 hover:border-emerald-300 hover:bg-emerald-50/50 text-slate-700"
+                    }`}
+                  >
+                    <span className="text-lg leading-none">{icon}</span>
+                    <span>{value}</span>
+                    {paiementModal.mode === value && (
+                      <Check className="w-4 h-4 text-emerald-600 ml-auto shrink-0" />
+                    )}
+                  </button>
+                ))}
+              </div>
+
+              {/* Info box */}
+              <div className="mt-4 flex items-start gap-2 bg-blue-50 border border-blue-200 rounded-xl px-3 py-2.5">
+                <AlertCircle className="w-4 h-4 text-blue-500 mt-0.5 shrink-0" />
+                <p className="text-xs text-blue-700 font-medium">
+                  Après confirmation, l’état passera à <strong>« Livré »</strong> et l’emplacement sera défini à <strong>« Livraison au client »</strong>.
+                </p>
+              </div>
+            </div>
+
+            {/* Footer */}
+            <div className="px-6 pb-5 flex items-center justify-end gap-3">
+              <button
+                type="button"
+                onClick={() => setPaiementModal(null)}
+                className="px-4 py-2 rounded-xl text-sm font-bold text-slate-600 bg-slate-100 hover:bg-slate-200 transition-colors cursor-pointer"
+              >
+                Annuler
+              </button>
+              <button
+                type="button"
+                disabled={!paiementModal.mode}
+                onClick={handleConfirmLivraison}
+                className="flex items-center gap-2 px-5 py-2 rounded-xl text-sm font-extrabold text-white bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-700 hover:to-teal-700 disabled:opacity-40 disabled:cursor-not-allowed transition-all cursor-pointer shadow-sm"
+              >
+                <CheckCircle2 className="w-4 h-4" />
+                Confirmer la livraison
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

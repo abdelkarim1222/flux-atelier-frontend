@@ -26,10 +26,10 @@ import {
   marquerDevisRefuse,
   marquerDevisRelance,
   saveDevisAccordNotification,
-  updateGoogleSheetStatutDevis,
+  updateDatabaseStatutDevis,
   getAvancementOptionsForTeam,
   type DemandeDevis,
-} from "../services/googleSheets";
+} from "../services/database";
 
 interface DevisViewProps {
   vehicles: Flux[];
@@ -363,7 +363,7 @@ export default function DevisView({
     const finalCaller = callerName.trim() || currentUser?.name || "Réception";
     const updated = marquerDevisAppele(key, finalCaller, formattedDateAppel, modalVehicle, callNotes);
     if (updated) {
-      void updateGoogleSheetStatutDevis(modalVehicle, updated, "Client appelé");
+      void updateDatabaseStatutDevis(modalVehicle, updated, "Client appelé");
     }
 
     setActionSuccessNotice({
@@ -386,7 +386,7 @@ export default function DevisView({
     const key = (row.no || row.ordre || row.chassis || String(row.id)).trim();
     const updated = marquerDevisRelance(key, currentUser?.name || "Réception");
     if (updated) {
-      void updateGoogleSheetStatutDevis(row, updated, "Client appelé");
+      void updateDatabaseStatutDevis(row, updated, "Client appelé");
     }
     setActionSuccessNotice({
       message: `⚠️ Relance client enregistrée pour le devis ${row.no || row.ordre}.`,
@@ -404,7 +404,7 @@ export default function DevisView({
 
     const updated = marquerDevisAccepte(key);
     if (updated) {
-      void updateGoogleSheetStatutDevis(row, updated, "Accepté");
+      void updateDatabaseStatutDevis(row, updated, "Accepté");
     }
 
     // Récupérer l'équipe d'origine pour renvoyer le véhicule exactement à son équipe
@@ -487,7 +487,7 @@ export default function DevisView({
 
     const updated = marquerDevisRefuse(key);
     if (updated) {
-      void updateGoogleSheetStatutDevis(row, updated, "Refusé");
+      void updateDatabaseStatutDevis(row, updated, "Refusé");
     }
 
     // Passer automatiquement l'avancement à "Terminer" (Attente Client pour restitution)
@@ -1186,7 +1186,7 @@ export default function DevisView({
                   </div>
                 </div>
                 <p className="text-[10px] text-slate-500">
-                  Cette date et heure sera visible dans le tableau, la fiche véhicule et enregistrée dans le Google Sheet.
+                  Cette date et heure sera visible dans le tableau, la fiche véhicule et enregistrée dans le PostgreSQL.
                 </p>
               </div>
 

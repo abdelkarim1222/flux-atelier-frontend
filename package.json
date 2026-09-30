@@ -4,17 +4,24 @@
   "version": "0.0.0",
   "type": "module",
   "scripts": {
-    "dev": "vite",
+    "dev": "node --env-file-if-exists=.env scripts/dev.mjs",
+    "api": "node --env-file-if-exists=.env server/index.mjs",
+    "start": "node --env-file-if-exists=.env server/index.mjs",
+    "import:data": "node --env-file-if-exists=.env scripts/import-postgres-bundle.mjs",
+    "import:accounts": "node --env-file-if-exists=.env scripts/import-legacy-accounts.mjs",
+    "import:vehicle-inventory": "node --env-file-if-exists=.env scripts/import-vehicle-inventory.mjs",
     "build": "tsc -b && vite build",
     "lint": "oxlint",
     "preview": "vite preview"
   },
   "dependencies": {
     "lucide-react": "^1.34.0",
+    "pg": "^8.23.0",
     "react": "^19.2.8",
     "react-dom": "^19.2.8",
     "react-router-dom": "^7.18.2",
-    "recharts": "^3.10.1"
+    "recharts": "^3.10.1",
+    "xlsx": "^0.18.5"
   },
   "devDependencies": {
     "@tailwindcss/vite": "^4.3.3",

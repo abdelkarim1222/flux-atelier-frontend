@@ -1,4 +1,4 @@
-// The 7 canonical workshop teams matching the Google Sheets structure
+// The 7 canonical workshop teams matching the PostgreSQL structure
 export const CANONICAL_TEAMS = [
   "Daily1",
   "Service Rapide",
@@ -115,13 +115,10 @@ export function isVehicleMatchingTeam(vehicleTeam: string, userTeam: string): bo
     return true;
   }
 
-  // Cas spécial Daily : si le véhicule est pour Daily, visible pour Daily1 ET Daily2
-  if (vNorm === "daily") {
+  // Cas spécial Daily : si le véhicule est pour Daily (Daily1 ou Daily2)
+  if (vNorm.includes("daily")) {
     return uNorm.includes("daily");
   }
-
-  if (vNorm === "daily1") return uNorm.includes("daily1") || uNorm === "daily";
-  if (vNorm === "daily2") return uNorm.includes("daily2") || uNorm === "daily";
 
   // Service Rapide
   if (vNorm.includes("rapide") || vNorm.includes("serv")) {
@@ -139,8 +136,18 @@ export function isVehicleMatchingTeam(vehicleTeam: string, userTeam: string): bo
   }
 
   // Elictrique / Electrique
-  if (vNorm.includes("electrique") || vNorm.includes("elictrique")) {
-    return uNorm.includes("electrique") || uNorm.includes("elictrique");
+  if (
+    vNorm.includes("electrique") ||
+    vNorm.includes("elictrique") ||
+    vNorm.includes("elect") ||
+    vNorm.includes("elict")
+  ) {
+    return (
+      uNorm.includes("electrique") ||
+      uNorm.includes("elictrique") ||
+      uNorm.includes("elect") ||
+      uNorm.includes("elict")
+    );
   }
 
   // Changan

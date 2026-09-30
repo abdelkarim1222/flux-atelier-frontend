@@ -3,7 +3,6 @@ import {
   BarChart3,
   Calendar,
   Download,
-  FileSpreadsheet,
   Printer,
   RefreshCw,
   Search,
@@ -15,6 +14,7 @@ import {
   RotateCcw,
   Info,
   ShieldAlert,
+  Clock,
 } from "lucide-react";
 import {
   ResponsiveContainer,
@@ -30,13 +30,14 @@ import {
 import { useRole } from "../context/RoleContext";
 import {
   fetchMoyennesSheetData,
-  updateGoogleSheetMoyennesPeriode,
-  fetchGoogleSheetFluxData,
+  updateDatabaseMoyennesPeriode,
+  fetchDatabaseFluxData,
   DEFAULT_MOYENNES_DATA,
-  MOYENNES_SHEET_URL,
   type MoyennesSheetData,
-} from "../services/googleSheets";
+} from "../services/database";
 import type { Flux } from "../data/mockData";
+import { calculateVehicleTimes, formatMinutes } from "../services/timeTracking";
+import { isVehicleFinished, getActiveVehicleForTech } from "./AffecterTechnicienModal";
 
 const MONTH_NAMES = [
   "Janvier", "Février", "Mars", "Avril", "Mai", "Juin",
@@ -83,42 +84,67 @@ const MODEL_COLORS: Record<string, string> = {
 
 const AVAILABLE_YEARS = [2024, 2025, 2026, 2027, 2028, 2029, 2030];
 
-export default function MoyennesView() {
+interface MoyennesViewProps {
+  /** Flux vehicles already loaded by Dashboard — avoids a second DB round-trip */
+  vehicles?: Flux[];
+}
+
+export default function MoyennesView({ vehicles: vehiclesProp }: MoyennesViewProps = {}) {
   const { role, roleInfo } = useRole();
   const [sheetData, setSheetData] = useState<MoyennesSheetData>(DEFAULT_MOYENNES_DATA);
-  const [vehicles, setVehicles] = useState<Flux[]>([]);
+  // Internal vehicles state — seeded from prop when available, otherwise fetched from DB
+  const [vehicles, setVehicles] = useState<Flux[]>(vehiclesProp ?? []);
   const [selectedYear, setSelectedYear] = useState<number>(2026);
   const [selectedMonth, setSelectedMonth] = useState<number>(9);
   const [hasInitializedPeriod, setHasInitializedPeriod] = useState<boolean>(false);
-  const [loading, setLoading] = useState(true);
+  const [loading, setLoading] = useState(!vehiclesProp); // skip loading if prop already provided
   const [refreshing, setRefreshing] = useState(false);
   const [syncingPeriod, setSyncingPeriod] = useState(false);
-  const [viewMode, setViewMode] = useState<"sheet" | "charts">("sheet");
+  const [viewMode, setViewMode] = useState<"sheet" | "techniciens" | "charts">("sheet");
   const [searchFilter, setSearchFilter] = useState("");
   const [notification, setNotification] = useState<string | null>(null);
+  // Déclenche un nouveau calcul lorsque les attentes/interruptions sont modifiées dans Chronométrie.
+  const [timeTrackingRevision, setTimeTrackingRevision] = useState(0);
 
   // Security check: only Administration and Chef d'Atelier can access
   const isAuthorized = role === "administration" || role === "chef_atelier";
+
+  // Keep internal vehicles in sync when Dashboard updates the prop (live data)
+  useEffect(() => {
+    if (vehiclesProp && vehiclesProp.length > 0) {
+      setVehicles(vehiclesProp);
+    }
+  }, [vehiclesProp]);
 
   const loadData = async (isManual = false) => {
     if (isManual) setRefreshing(true);
     else setLoading(true);
     try {
-      const [fetchedMoyennes, fetchedFlux] = await Promise.all([
-        fetchMoyennesSheetData(),
-        fetchGoogleSheetFluxData().catch(() => []),
-      ]);
-      setSheetData(fetchedMoyennes);
-      setVehicles(fetchedFlux);
-
-      if (!hasInitializedPeriod) {
-        setSelectedYear(fetchedMoyennes.annee || 2026);
-        setSelectedMonth(fetchedMoyennes.mois || 9);
-        setHasInitializedPeriod(true);
+      // If vehicles are provided via prop, only fetch the moyennes sheet metadata
+      if (vehiclesProp) {
+        const fetchedMoyennes = await fetchMoyennesSheetData();
+        setSheetData(fetchedMoyennes);
+        if (!hasInitializedPeriod) {
+          setSelectedYear(fetchedMoyennes.annee || 2026);
+          setSelectedMonth(fetchedMoyennes.mois || 9);
+          setHasInitializedPeriod(true);
+        }
+      } else {
+        const [fetchedMoyennes, fetchedFlux] = await Promise.all([
+          fetchMoyennesSheetData(),
+          fetchDatabaseFluxData().catch(() => []),
+        ]);
+        setSheetData(fetchedMoyennes);
+        setVehicles(fetchedFlux);
+        if (!hasInitializedPeriod) {
+          setSelectedYear(fetchedMoyennes.annee || 2026);
+          setSelectedMonth(fetchedMoyennes.mois || 9);
+          setHasInitializedPeriod(true);
+        }
       }
 
       if (isManual) {
-        showNotification("Données Moyennes actualisées avec succès depuis Google Sheets !");
+        showNotification("Données Moyennes actualisées avec succès depuis PostgreSQL !");
       }
     } catch (err) {
       console.error("Erreur lors du chargement des moyennes:", err);
@@ -135,160 +161,184 @@ export default function MoyennesView() {
     loadData();
   }, []);
 
+  useEffect(() => {
+    const handleTimeTrackingUpdate = () => setTimeTrackingRevision((value) => value + 1);
+    window.addEventListener("vehicle_time_tracking_updated", handleTimeTrackingUpdate);
+    return () => window.removeEventListener("vehicle_time_tracking_updated", handleTimeTrackingUpdate);
+  }, []);
+
   const showNotification = (msg: string) => {
     setNotification(msg);
     setTimeout(() => setNotification(null), 3500);
   };
 
-  // Is the current view matching the active period configured in Google Sheets?
-  const isGoogleSheetsPeriodActive =
+  // Is the current view matching the active period configured in PostgreSQL?
+  const isDatabasesPeriodActive =
     selectedYear === (sheetData.annee || 2026) &&
     selectedMonth === (sheetData.mois || 9);
 
-  // Synchronize chosen period to cell B1 (Année) and B2 (Mois) in Google Sheets
-  const handleSyncGoogleSheetsPeriod = async () => {
+  // Synchronize chosen period to cell B1 (Année) and B2 (Mois) in PostgreSQL
+  const handleSyncDatabasesPeriod = async () => {
     setSyncingPeriod(true);
     try {
-      const res = await updateGoogleSheetMoyennesPeriode(selectedYear, selectedMonth);
+      const res = await updateDatabaseMoyennesPeriode(selectedYear, selectedMonth);
       showNotification(
         res.message ||
-          `Période ${MONTH_NAMES[selectedMonth - 1]} ${selectedYear} définie dans Google Sheets !`
+          `Période ${MONTH_NAMES[selectedMonth - 1]} ${selectedYear} définie dans PostgreSQL !`
       );
       await loadData(true);
     } catch (err) {
-      console.error("Erreur mise à jour période Sheets:", err);
-      showNotification("Erreur lors de la synchronisation avec Google Sheets.");
+      console.error("Erreur mise à jour de la période PostgreSQL:", err);
+      showNotification("Erreur lors de la synchronisation avec PostgreSQL.");
     } finally {
       setSyncingPeriod(false);
     }
   };
 
-  // Compute or select the effective data displayed for selectedYear & selectedMonth
-  const displayData = useMemo<MoyennesSheetData>(() => {
-    // If selected period matches the sheet's configured month, return the exact Google Sheets sheetData
-    if (
-      selectedYear === (sheetData.annee || 2026) &&
-      selectedMonth === (sheetData.mois || 9)
-    ) {
-      return sheetData;
-    }
+  // Helper: compute display data from live vehicles for a given year/month.
+  // Uses dateEntree (Suivi des Entrées) as the primary date — counts vehicles
+  // entered each day, regardless of whether the repair has started.
+  const computeLiveData = (yr: number, mo: number): MoyennesSheetData => {
+    // Exact number of days in the selected month (e.g. Sept = 30, Feb = 28/29)
+    const daysInMonth = new Date(yr, mo, 0).getDate();
 
-    // Otherwise, compute dynamic distribution from recorded vehicles for selectedYear and selectedMonth
     const teamDays: Record<string, number[]> = {};
-    STANDARD_TEAMS.forEach((t) => (teamDays[t] = Array(31).fill(0)));
-
     const modelDays: Record<string, number[]> = {};
-    STANDARD_MODELS.forEach((m) => (modelDays[m] = Array(31).fill(0)));
+    const ensureTeam = (name: string) => {
+      if (!teamDays[name]) teamDays[name] = Array(daysInMonth).fill(0);
+    };
+    const ensureModel = (name: string) => {
+      if (!modelDays[name]) modelDays[name] = Array(daysInMonth).fill(0);
+    };
+    STANDARD_TEAMS.forEach(ensureTeam);
+    STANDARD_MODELS.forEach(ensureModel);
 
-    // Map Code Modèle -> Famille using sheet correspondances
     const codeToFamille = new Map<string, string>();
     (sheetData.correspondances || []).forEach((c) => {
       codeToFamille.set(c.codeModele.toUpperCase().trim(), c.famille.trim());
     });
 
-    // Tally interventions from vehicles
     vehicles.forEach((veh) => {
-      if (!veh.date || veh.date.includes("1899")) return;
-      const match = veh.date.match(/^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{4})/);
+      // Prioritize dateEntree (entry date from Suivi des Entrées). Strip time
+      // component if present: "28/09/2026 08:30" → "28/09/2026"
+      const rawDate = (veh.dateEntree || veh.date || "").trim().split(" ")[0];
+      if (!rawDate || rawDate.includes("1899")) return;
+      const match = rawDate.match(/^(\d{1,2})[/\-](\d{1,2})[/\-](\d{4})$/);
       if (!match) return;
       const d = parseInt(match[1], 10);
       const m = parseInt(match[2], 10);
       const y = parseInt(match[3], 10);
+      if (y !== yr || m !== mo || d < 1 || d > daysInMonth) return;
 
-      if (y === selectedYear && m === selectedMonth && d >= 1 && d <= 31) {
-        // Team matching
-        const teamName = STANDARD_TEAMS.find(
-          (t) => t.toLowerCase() === (veh.equipe || "").toLowerCase()
-        );
-        if (teamName) {
-          teamDays[teamName][d - 1] += 1;
-        }
+      // ─── Tableau 1 : répartition par équipe ───────────────────────────────
+      const enteredTeamName = (veh.equipe || "Non affectée").trim() || "Non affectée";
+      // Conserver un libellé cohérent pour les données saisies avec une casse différente.
+      const teamName = STANDARD_TEAMS.find(
+        (team) => team.toLowerCase() === enteredTeamName.toLowerCase()
+      ) || enteredTeamName;
+      ensureTeam(teamName);
+      teamDays[teamName][d - 1] += 1;
 
-        // Model matching
-        let modelFamille: string | undefined = undefined;
-        const modUpper = (veh.modele || "").toUpperCase().trim();
-        if (codeToFamille.has(modUpper)) {
-          modelFamille = codeToFamille.get(modUpper);
-        } else {
-          // Fuzzy match on full description
-          const fullDesc = `${veh.modele || ""} ${veh.atelier || ""}`.toUpperCase();
-          if (fullDesc.includes("EUROCARGO") || fullDesc.includes("ML")) modelFamille = "Eurocargo";
-          else if (fullDesc.includes("DAILY")) modelFamille = "Daily";
-          else if (fullDesc.includes("SWAY") || fullDesc.includes("S-WAY") || fullDesc.includes("AS440")) modelFamille = "S-Way";
-          else if (fullDesc.includes("CHANGAN") || fullDesc.includes("HUNTER") || fullDesc.includes("STAR")) modelFamille = "Changan";
-          else if (fullDesc.includes("IRISBUS") || fullDesc.includes("BUS")) modelFamille = "IRISBUS";
-          else if (fullDesc.includes("JMC") || fullDesc.includes("VIGUS")) modelFamille = "JMC";
-        }
-
-        if (modelFamille && STANDARD_MODELS.includes(modelFamille)) {
-          modelDays[modelFamille][d - 1] += 1;
-        }
+      // ─── Tableau 2 : répartition par famille de modèles ───────────────────
+      let modelFamille: string | undefined;
+      const modUpper = (veh.modele || "").toUpperCase().trim();
+      if (codeToFamille.has(modUpper)) {
+        modelFamille = codeToFamille.get(modUpper);
+      } else {
+        const fullDesc = `${veh.modele || ""} ${veh.atelier || ""}`.toUpperCase();
+        if (fullDesc.includes("EUROCARGO") || fullDesc.includes("ML")) modelFamille = "Eurocargo";
+        else if (fullDesc.includes("DAILY")) modelFamille = "Daily";
+        else if (fullDesc.includes("SWAY") || fullDesc.includes("S-WAY") || fullDesc.includes("AS440") || fullDesc.includes("AT4") || fullDesc.includes("AT7") || fullDesc.includes("AS4") || fullDesc.includes("AD")) modelFamille = "S-Way";
+        else if (fullDesc.includes("CHANGAN") || fullDesc.includes("HUNTER") || fullDesc.includes("STAR") || fullDesc.includes("CS35") || fullDesc.includes("GRAND AVENUE")) modelFamille = "Changan";
+        else if (fullDesc.includes("IRISBUS") || fullDesc.includes("BUS") || fullDesc.includes("IV-AUTRES")) modelFamille = "IRISBUS";
+        else if (fullDesc.includes("JMC") || fullDesc.includes("VIGUS")) modelFamille = "JMC";
+      }
+      if (modelFamille) {
+        ensureModel(modelFamille);
+        modelDays[modelFamille][d - 1] += 1;
       }
     });
 
-    // Count active days (days where at least 1 team has interventions)
+    // Active days = days where at least one vehicle entered
     let activeDaysCount = 0;
-    for (let dayIdx = 0; dayIdx < 31; dayIdx++) {
-      const sumDay = STANDARD_TEAMS.reduce((acc, t) => acc + teamDays[t][dayIdx], 0);
+    for (let dayIdx = 0; dayIdx < daysInMonth; dayIdx++) {
+      const sumDay = Object.values(teamDays).reduce((acc, days) => acc + days[dayIdx], 0);
       if (sumDay > 0) activeDaysCount++;
     }
 
-    // Build equipes rows
-    const equipesRows = STANDARD_TEAMS.map((name) => {
+    const baseEquipesRows = Object.keys(teamDays).map((name) => {
       const days = teamDays[name];
       const total = days.reduce((a, b) => a + b, 0);
-      const moyenne = activeDaysCount > 0 ? total / activeDaysCount : 0;
-      return { name, days, total, moyenne };
+      return { name, days, total, moyenne: activeDaysCount > 0 ? total / activeDaysCount : 0 };
     });
 
-    // Build equipes total
-    const equipesTotalDays = Array.from({ length: 31 }, (_, dIdx) =>
-      STANDARD_TEAMS.reduce((acc, t) => acc + teamDays[t][dIdx], 0)
+    // La ligne Daily est une synthèse automatique : Daily1 + Daily2.
+    // Elle est affichée dans le tableau sans être ajoutée au total général,
+    // afin d'éviter de compter les mêmes véhicules deux fois.
+    const dailyDays = Array.from({ length: daysInMonth }, (_, index) =>
+      (teamDays.Daily1?.[index] || 0) + (teamDays.Daily2?.[index] || 0)
+    );
+    const dailyTotal = dailyDays.reduce((sum, value) => sum + value, 0);
+    const dailyRow = {
+      name: "Daily",
+      days: dailyDays,
+      total: dailyTotal,
+      moyenne: activeDaysCount > 0 ? dailyTotal / activeDaysCount : 0,
+    };
+    // Daily1 et Daily2 restent utilisées dans le calcul, mais ne sont plus affichées
+    // séparément : le tableau présente uniquement leur synthèse « Daily ».
+    const equipesRows = [
+      dailyRow,
+      ...baseEquipesRows.filter((row) => row.name !== "Daily1" && row.name !== "Daily2" && row.name !== "Daily"),
+    ];
+    const equipesTotalDays = Array.from({ length: daysInMonth }, (_, i) =>
+      Object.values(teamDays).reduce((acc, days) => acc + days[i], 0)
     );
     const equipesTotalVal = equipesTotalDays.reduce((a, b) => a + b, 0);
-    const equipesTotalMoy = activeDaysCount > 0 ? equipesTotalVal / activeDaysCount : 0;
 
-    // Build modeles rows
-    const modelesRows = STANDARD_MODELS.map((name) => {
+    const modelesRows = Object.keys(modelDays).map((name) => {
       const days = modelDays[name];
       const total = days.reduce((a, b) => a + b, 0);
-      const moyenne = activeDaysCount > 0 ? total / activeDaysCount : 0;
-      return { name, days, total, moyenne };
+      return { name, days, total, moyenne: activeDaysCount > 0 ? total / activeDaysCount : 0 };
     });
-
-    // Build modeles total
-    const modelesTotalDays = Array.from({ length: 31 }, (_, dIdx) =>
-      STANDARD_MODELS.reduce((acc, m) => acc + modelDays[m][dIdx], 0)
+    const modelesTotalDays = Array.from({ length: daysInMonth }, (_, i) =>
+      Object.values(modelDays).reduce((acc, days) => acc + days[i], 0)
     );
     const modelesTotalVal = modelesTotalDays.reduce((a, b) => a + b, 0);
-    const modelesTotalMoy = activeDaysCount > 0 ? modelesTotalVal / activeDaysCount : 0;
 
     return {
-      annee: selectedYear,
-      mois: selectedMonth,
+      annee: yr,
+      mois: mo,
       equipes: equipesRows,
       equipesTotal: {
-        name: "Total",
-        days: equipesTotalDays,
-        total: equipesTotalVal,
-        moyenne: equipesTotalMoy,
-        isTotal: true,
+        name: "Total", days: equipesTotalDays, total: equipesTotalVal,
+        moyenne: activeDaysCount > 0 ? equipesTotalVal / activeDaysCount : 0, isTotal: true,
       },
       modeles: modelesRows,
       modelesTotal: {
-        name: "Total",
-        days: modelesTotalDays,
-        total: modelesTotalVal,
-        moyenne: modelesTotalMoy,
-        isTotal: true,
+        name: "Total", days: modelesTotalDays, total: modelesTotalVal,
+        moyenne: activeDaysCount > 0 ? modelesTotalVal / activeDaysCount : 0, isTotal: true,
       },
       correspondances: sheetData.correspondances || DEFAULT_MOYENNES_DATA.correspondances,
       lastUpdated: new Date().toISOString(),
     };
-  }, [selectedYear, selectedMonth, sheetData, vehicles]);
+  };
 
-  // Days list: 1 to 31
-  const daysList = useMemo(() => Array.from({ length: 31 }, (_, i) => i + 1), []);
+  // Always compute from live vehicles (Suivi des Entrées + Avancement Atelier)
+  const displayData = useMemo<MoyennesSheetData>(
+    () => computeLiveData(selectedYear, selectedMonth),
+    [selectedYear, selectedMonth, sheetData, vehicles, timeTrackingRevision]
+  );
+
+  // Days list: 1 to N where N = exact days in the selected month
+  const daysInSelectedMonth = useMemo(
+    () => new Date(selectedYear, selectedMonth, 0).getDate(),
+    [selectedYear, selectedMonth]
+  );
+  const daysList = useMemo(
+    () => Array.from({ length: daysInSelectedMonth }, (_, i) => i + 1),
+    [daysInSelectedMonth]
+  );
 
   // Compute active days (days where total > 0 across teams)
   const activeDays = useMemo(() => {
@@ -351,6 +401,115 @@ export default function MoyennesView() {
     );
   }, [displayData.correspondances, searchFilter]);
 
+  // 1. Filtrer les véhicules pour le mois et l'année sélectionnés
+  const periodVehicles = useMemo(() => {
+    return vehicles.filter((veh) => {
+      const dStr = veh.date || veh.dateEntree || veh.dateDebutRep || "";
+      if (!dStr || dStr.includes("1899")) return false;
+      const match = dStr.match(/^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{4})/);
+      if (!match) return true;
+      const m = parseInt(match[2], 10);
+      const y = parseInt(match[3], 10);
+      return y === selectedYear && m === selectedMonth;
+    });
+  }, [vehicles, selectedYear, selectedMonth]);
+
+  // 2. Calcul des 8 indicateurs d'atelier pour la page Moyennes
+  const atelierStats = useMemo(() => {
+    const totalEntres = periodVehicles.length;
+    let totalTermines = 0;
+    let totalEnCours = 0;
+    let sumDureeRepMin = 0;
+    let countDureeRep = 0;
+    let sumTravailNetMin = 0;
+
+    const techMap = new Map<string, {
+      matricule: string;
+      name: string;
+      equipe: string;
+      total: number;
+      termines: number;
+      enCours: number;
+      sumDureeNetMin: number;
+      countDuree: number;
+    }>();
+
+    periodVehicles.forEach((veh) => {
+      const isFin = isVehicleFinished(veh);
+      if (isFin) {
+        totalTermines++;
+      } else {
+        totalEnCours++;
+      }
+
+      const stats = calculateVehicleTimes(veh);
+      if (stats.tempsTravailEffectifMin > 0) {
+        sumTravailNetMin += stats.tempsTravailEffectifMin;
+      }
+      if (isFin && stats.tempsPresenceTotalMin > 0) {
+        sumDureeRepMin += stats.tempsPresenceTotalMin;
+        countDureeRep++;
+      }
+
+      // Ventilation par mécanicien
+      const mat = (veh.technicien || "").trim();
+      const nom = (veh.nomTechnicien || "").trim();
+      if ((mat && mat !== "-") || (nom && nom !== "-")) {
+        const key = mat && mat !== "-" ? mat : nom;
+        const existing = techMap.get(key) || {
+          matricule: mat && mat !== "-" ? mat : "-",
+          name: nom && nom !== "-" ? nom : mat,
+          equipe: veh.equipe || "-",
+          total: 0,
+          termines: 0,
+          enCours: 0,
+          sumDureeNetMin: 0,
+          countDuree: 0,
+        };
+        existing.total++;
+        if (isFin) {
+          existing.termines++;
+        } else {
+          existing.enCours++;
+        }
+        if (stats.tempsTravailEffectifMin > 0) {
+          existing.sumDureeNetMin += stats.tempsTravailEffectifMin;
+          existing.countDuree++;
+        }
+        techMap.set(key, existing);
+      }
+    });
+
+    const tauxTermines = totalEntres > 0 ? Math.round((totalTermines / totalEntres) * 100) : 0;
+    const dureeMoyenneRepMin = countDureeRep > 0 ? Math.round(sumDureeRepMin / countDureeRep) : 0;
+    const travailNetMoyenMin = totalTermines > 0 ? Math.round(sumTravailNetMin / totalTermines) : (totalEntres > 0 ? Math.round(sumTravailNetMin / totalEntres) : 0);
+
+    const techniciensList = Array.from(techMap.values()).map((t) => {
+      const avgNet = t.countDuree > 0 ? Math.round(t.sumDureeNetMin / t.countDuree) : 0;
+      const activeCar = getActiveVehicleForTech(t.matricule, t.name, vehicles);
+      return {
+        ...t,
+        avgNetMin: avgNet,
+        avgNetFormat: formatMinutes(avgNet),
+        activeCar,
+        isOccupied: Boolean(activeCar),
+      };
+    }).sort((a, b) => b.total - a.total);
+
+    return {
+      totalEntres,
+      totalTermines,
+      totalEnCours,
+      tauxTermines,
+      dureeMoyenneRepMin,
+      dureeMoyenneRepFormat: formatMinutes(dureeMoyenneRepMin),
+      sumTravailNetMin,
+      travailNetTotalFormat: formatMinutes(sumTravailNetMin),
+      travailNetMoyenFormat: formatMinutes(travailNetMoyenMin),
+      techniciensList,
+    };
+  }, [periodVehicles, vehicles, timeTrackingRevision]);
+
   // CSV Export handler
   const handleExportCSV = () => {
     let csvContent = `Tableau des Moyennes - ${MONTH_NAMES[(selectedMonth || 9) - 1]} ${selectedYear || 2026}\n\n`;
@@ -405,7 +564,7 @@ export default function MoyennesView() {
       <div className="p-16 max-w-xl mx-auto my-12 bg-white rounded-2xl border border-slate-200 shadow-sm text-center">
         <RefreshCw size={28} className="animate-spin text-blue-700 mx-auto mb-3" />
         <h3 className="text-base font-bold text-slate-800 mb-1">Chargement des tableaux Moyennes...</h3>
-        <p className="text-xs text-slate-500">Connexion à Google Sheets (GID: 965668700)</p>
+        <p className="text-xs text-slate-500">Connexion à PostgreSQL (source PostgreSQL)</p>
       </div>
     );
   }
@@ -435,8 +594,25 @@ export default function MoyennesView() {
     );
   };
 
+  const printedAt = new Intl.DateTimeFormat("fr-FR", {
+    dateStyle: "long",
+    timeStyle: "short",
+  }).format(new Date());
+
   return (
-    <div className="w-full h-full flex-1 overflow-y-auto overflow-x-hidden p-3 md:p-4 flex flex-col gap-3 bg-slate-100/80">
+    <div className="moyennes-print-root w-full h-full flex-1 overflow-y-auto overflow-x-hidden p-3 md:p-4 flex flex-col gap-3 bg-slate-100/80">
+      <header className="moyennes-print-header hidden">
+        <div>
+          <p className="moyennes-print-kicker">ITALCAR · FLUX ATELIER</p>
+          <h1>Rendement Journalier &amp; Moyennes</h1>
+          <p className="moyennes-print-period">Période analysée : {MONTH_NAMES[selectedMonth - 1]} {selectedYear}</p>
+        </div>
+        <div className="moyennes-print-meta">
+          <strong>Rapport atelier</strong>
+          <span>Édité le {printedAt}</span>
+          <span>Source : données temps réel</span>
+        </div>
+      </header>
       {/* Toast Notification */}
       {notification && (
         <div className="fixed top-16 right-6 z-50 flex items-center gap-2.5 px-4 py-2.5 bg-emerald-600 text-white rounded-xl shadow-2xl animate-fade-in border border-emerald-500/40 text-xs font-bold">
@@ -446,7 +622,7 @@ export default function MoyennesView() {
       )}
 
       {/* Compact Header & Controls Bar matching page dimension */}
-      <div className="bg-white rounded-xl px-4 py-2.5 border border-slate-200/90 shadow-2xs flex flex-wrap items-center justify-between gap-3 shrink-0">
+      <div className="moyennes-print-hide bg-white rounded-xl px-4 py-2.5 border border-slate-200/90 shadow-2xs flex flex-wrap items-center justify-between gap-3 shrink-0">
         {/* Title & Interactive Date selectors */}
         <div className="flex items-center gap-3 flex-wrap">
           <div className="flex items-center gap-2">
@@ -503,27 +679,27 @@ export default function MoyennesView() {
               </select>
             </div>
 
-            {/* Status indicator / Google Sheets sync button */}
-            {isGoogleSheetsPeriodActive ? (
+            {/* Status indicator / PostgreSQL sync button */}
+            {isDatabasesPeriodActive ? (
               <span className="hidden sm:inline-flex items-center gap-1 px-2 py-0.5 rounded text-[10px] font-bold bg-emerald-100 text-emerald-800 border border-emerald-300">
                 <CheckCircle2 size={11} className="text-emerald-600" />
-                <span>Mois actif Sheets</span>
+                <span>Mois actif</span>
               </span>
             ) : (
               <div className="inline-flex items-center gap-1">
                 <button
                   type="button"
-                  onClick={handleSyncGoogleSheetsPeriod}
+                  onClick={handleSyncDatabasesPeriod}
                   disabled={syncingPeriod}
                   className="inline-flex items-center gap-1 px-2 py-0.5 rounded bg-blue-700 hover:bg-blue-800 text-white text-[10px] font-bold shadow-2xs transition-all cursor-pointer disabled:opacity-50"
-                  title="Définir ce mois et année dans les cellules B1 et B2 de Google Sheets"
+                  title="Enregistrer ce mois et cette année comme période active"
                 >
                   {syncingPeriod ? (
                     <RefreshCw size={10} className="animate-spin" />
                   ) : (
                     <Sparkles size={10} className="text-amber-300" />
                   )}
-                  <span>Appliquer à Sheets</span>
+                  <span>Enregistrer la période</span>
                 </button>
                 <button
                   type="button"
@@ -532,10 +708,10 @@ export default function MoyennesView() {
                     setSelectedMonth(sheetData.mois || 9);
                   }}
                   className="inline-flex items-center gap-0.5 px-1.5 py-0.5 text-[10px] font-semibold text-slate-500 hover:text-blue-700 bg-white hover:bg-slate-100 rounded border border-slate-200 transition-colors cursor-pointer"
-                  title={`Revenir au mois Google Sheets (${MONTH_NAMES[(sheetData.mois || 9) - 1]} ${sheetData.annee || 2026})`}
+                  title={`Revenir à la période active (${MONTH_NAMES[(sheetData.mois || 9) - 1]} ${sheetData.annee || 2026})`}
                 >
                   <RotateCcw size={10} />
-                  <span className="hidden xl:inline">Mois Sheets</span>
+                  <span className="hidden xl:inline">Période active</span>
                 </button>
               </div>
             )}
@@ -570,6 +746,15 @@ export default function MoyennesView() {
 
         {/* Action buttons */}
         <div className="flex items-center gap-2">
+          {/* ─── Source fixe : toujours Temps Réel ─── */}
+          <span
+            className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg bg-emerald-600 text-white text-xs font-extrabold shadow-sm select-none"
+            title="Données calculées en temps réel depuis Suivi des Entrées & Avancement Atelier"
+          >
+            <span>⚡</span>
+            <span>Temps Réel</span>
+          </span>
+
           {/* View Mode Toggle */}
           <div className="flex items-center bg-slate-100 p-0.5 rounded-lg border border-slate-200 text-xs font-bold">
             <button
@@ -581,6 +766,16 @@ export default function MoyennesView() {
             >
               <TableIcon size={13} />
               <span>Tableaux</span>
+            </button>
+            <button
+              type="button"
+              onClick={() => setViewMode("techniciens")}
+              className={`flex items-center gap-1 px-2.5 py-1 rounded-md transition-all cursor-pointer ${
+                viewMode === "techniciens" ? "bg-white text-blue-800 shadow-2xs font-extrabold" : "text-slate-600 hover:text-slate-900"
+              }`}
+            >
+              <Users size={13} />
+              <span>Par Technicien ({atelierStats.techniciensList.length})</span>
             </button>
             <button
               type="button"
@@ -600,7 +795,7 @@ export default function MoyennesView() {
             onClick={() => loadData(true)}
             disabled={refreshing}
             className="flex items-center gap-1 px-2.5 py-1 rounded-lg bg-blue-700 hover:bg-blue-800 text-white text-xs font-bold shadow-2xs transition-all cursor-pointer disabled:opacity-50"
-            title="Actualiser depuis Google Sheets"
+            title="Actualiser depuis PostgreSQL"
           >
             <RefreshCw size={13} className={refreshing ? "animate-spin" : ""} />
             <span className="hidden sm:inline">Actualiser</span>
@@ -617,40 +812,100 @@ export default function MoyennesView() {
             <span className="hidden sm:inline">CSV</span>
           </button>
 
-          {/* Google Sheets Link */}
-          <a
-            href={MOYENNES_SHEET_URL}
-            target="_blank"
-            rel="noopener noreferrer"
-            className="flex items-center gap-1 px-2.5 py-1 rounded-lg bg-emerald-50 hover:bg-emerald-100 border border-emerald-200 text-emerald-800 text-xs font-bold transition-colors"
-            title="Ouvrir dans Google Sheets"
-          >
-            <FileSpreadsheet size={13} />
-            <span className="hidden md:inline">Sheets</span>
-          </a>
-
           {/* Print */}
           <button
             type="button"
             onClick={() => window.print()}
-            className="p-1.5 rounded-lg bg-slate-100 hover:bg-slate-200 border border-slate-200 text-slate-600 transition-colors cursor-pointer"
-            title="Imprimer"
+            className="flex items-center gap-1 p-1.5 sm:px-2.5 rounded-lg bg-slate-100 hover:bg-slate-200 border border-slate-200 text-slate-600 transition-colors cursor-pointer"
+            title="Imprimer la vue affichée (tableaux ou graphiques)"
           >
             <Printer size={14} />
+            <span className="hidden sm:inline text-xs font-bold">Imprimer</span>
           </button>
         </div>
       </div>
 
+      {/* Executive Workshop KPI Dashboard - 8 Indicateurs de l'Atelier */}
+      <div className="moyennes-print-kpis grid grid-cols-2 sm:grid-cols-4 gap-2.5 shrink-0">
+        {/* KPI 1 : Véhicules Entrés */}
+        <div className="bg-white rounded-xl p-3 border border-slate-200 shadow-2xs flex flex-col justify-between">
+          <div className="flex items-center justify-between text-slate-500">
+            <span className="text-[11px] font-bold uppercase tracking-wider">Véhicules Entrés</span>
+            <div className="p-1.5 rounded-lg bg-blue-50 text-blue-700">
+              <Truck size={14} />
+            </div>
+          </div>
+          <div className="mt-2 flex items-baseline justify-between">
+            <span className="text-2xl font-black text-slate-900">{atelierStats.totalEntres}</span>
+            <span className="text-[10px] font-bold text-blue-600 bg-blue-50 px-1.5 py-0.5 rounded">
+              {MONTH_NAMES[selectedMonth - 1]} {selectedYear}
+            </span>
+          </div>
+          <span className="text-[10px] text-slate-400 mt-1">Reçus en atelier pour la période</span>
+        </div>
+
+        {/* KPI 2 : Véhicules Terminés & Taux */}
+        <div className="bg-white rounded-xl p-3 border border-slate-200 shadow-2xs flex flex-col justify-between">
+          <div className="flex items-center justify-between text-slate-500">
+            <span className="text-[11px] font-bold uppercase tracking-wider">Véhicules Terminés</span>
+            <div className="p-1.5 rounded-lg bg-emerald-50 text-emerald-700">
+              <CheckCircle2 size={14} />
+            </div>
+          </div>
+          <div className="mt-2 flex items-baseline justify-between">
+            <span className="text-2xl font-black text-emerald-700">{atelierStats.totalTermines}</span>
+            <span className="text-[10px] font-black text-emerald-800 bg-emerald-100 px-1.5 py-0.5 rounded border border-emerald-300">
+              Taux : {atelierStats.tauxTermines}%
+            </span>
+          </div>
+          <span className="text-[10px] text-slate-400 mt-1">{atelierStats.totalEnCours} en cours ou attente</span>
+        </div>
+
+        {/* KPI 3 : Temps Moyen de Réparation */}
+        <div className="bg-white rounded-xl p-3 border border-slate-200 shadow-2xs flex flex-col justify-between">
+          <div className="flex items-center justify-between text-slate-500">
+            <span className="text-[11px] font-bold uppercase tracking-wider">Temps Moyen Rép.</span>
+            <div className="p-1.5 rounded-lg bg-amber-50 text-amber-700">
+              <Clock size={14} />
+            </div>
+          </div>
+          <div className="mt-2 flex items-baseline justify-between">
+            <span className="text-xl font-black text-slate-900">{atelierStats.dureeMoyenneRepFormat}</span>
+            <span className="text-[10px] font-bold text-amber-800 bg-amber-50 px-1.5 py-0.5 rounded">
+              Début → Fin
+            </span>
+          </div>
+          <span className="text-[10px] text-slate-400 mt-1">Durée moyenne de prise en charge</span>
+        </div>
+
+        {/* KPI 4 : Travail Net Effectif */}
+        <div className="bg-white rounded-xl p-3 border border-slate-200 shadow-2xs flex flex-col justify-between">
+          <div className="flex items-center justify-between text-slate-500">
+            <span className="text-[11px] font-bold uppercase tracking-wider">Travail Net Effectif</span>
+            <div className="p-1.5 rounded-lg bg-indigo-50 text-indigo-700">
+              <Sparkles size={14} />
+            </div>
+          </div>
+          <div className="mt-2 flex items-baseline justify-between">
+            <span className="text-xl font-black text-indigo-900">{atelierStats.travailNetTotalFormat}</span>
+            <span className="text-[10px] font-bold text-indigo-800 bg-indigo-50 px-1.5 py-0.5 rounded">
+              Moy: {atelierStats.travailNetMoyenFormat}
+            </span>
+          </div>
+          <span className="text-[10px] text-slate-400 mt-1">Après déduction des temps d'attente</span>
+        </div>
+      </div>
+
       {/* Info notice if custom month/year selected */}
-      {!isGoogleSheetsPeriodActive && (
-        <div className="bg-amber-50 border border-amber-200/90 rounded-xl px-3.5 py-2 text-xs flex flex-wrap items-center justify-between gap-2 text-amber-900 shadow-2xs">
+      {!isDatabasesPeriodActive && (
+        <div className="moyennes-print-hide bg-amber-50 border border-amber-200/90 rounded-xl px-3.5 py-2 text-xs flex flex-wrap items-center justify-between gap-2 text-amber-900 shadow-2xs">
           <div className="flex items-center gap-2">
             <Info size={15} className="text-amber-600 shrink-0" />
             <span>
               Consultation de la période : <strong>{MONTH_NAMES[selectedMonth - 1]} {selectedYear}</strong>.
               {isDataEmpty ? (
                 <span className="ml-1 text-amber-700">
-                  (Aucune intervention enregistrée pour ce mois. La feuille Google Sheets est actuellement sur{" "}
+                  (Aucune intervention enregistrée pour ce mois. La période active enregistrée est{" "}
                   <strong>{MONTH_NAMES[(sheetData.mois || 9) - 1]} {sheetData.annee || 2026}</strong>).
                 </span>
               ) : (
@@ -663,12 +918,12 @@ export default function MoyennesView() {
           <div className="flex items-center gap-2">
             <button
               type="button"
-              onClick={handleSyncGoogleSheetsPeriod}
+              onClick={handleSyncDatabasesPeriod}
               disabled={syncingPeriod}
               className="px-2.5 py-1 rounded-md bg-amber-600 hover:bg-amber-700 text-white font-bold text-[11px] transition-colors cursor-pointer disabled:opacity-50 flex items-center gap-1"
             >
               <Sparkles size={11} />
-              <span>Définir ce mois dans Google Sheets (B1/B2)</span>
+              <span>Définir la période active dans PostgreSQL</span>
             </button>
             <button
               type="button"
@@ -685,14 +940,14 @@ export default function MoyennesView() {
         </div>
       )}
 
-      {/* Main View Mode: SPREADSHEET SIDE-BY-SIDE DIMENSION (Exactly matching the sheet) */}
+      {/* Grille mensuelle des moyennes par jour */}
       {viewMode === "sheet" && (
-        <div className="w-full grid grid-cols-1 xl:grid-cols-12 gap-3 items-start">
+        <div className="moyennes-print-content w-full grid grid-cols-1 xl:grid-cols-12 gap-3 items-start">
           {/* LEFT SIDE: TABLE 1 (EQUIPES) & TABLE 2 (MODELES) - xl:col-span-9 */}
           <div className="xl:col-span-9 space-y-3">
             
             {/* TABLEAU 1: EQUIPE (1..31, Total, Moyenne) */}
-            <div className="bg-white rounded-xl border border-slate-300 shadow-2xs overflow-hidden">
+            <div className="moyennes-print-table bg-white rounded-xl border border-slate-300 shadow-2xs overflow-hidden">
               <div className="overflow-x-auto">
                 <table className="w-full text-center border-collapse text-[11px]">
                   <thead>
@@ -793,7 +1048,7 @@ export default function MoyennesView() {
             </div>
 
             {/* TABLEAU 2: MODÈLES (1..31, Total, Moyenne) */}
-            <div className="bg-white rounded-xl border border-slate-300 shadow-2xs overflow-hidden">
+            <div className="moyennes-print-table bg-white rounded-xl border border-slate-300 shadow-2xs overflow-hidden">
               <div className="overflow-x-auto">
                 <table className="w-full text-center border-collapse text-[11px]">
                   <thead>
@@ -896,7 +1151,7 @@ export default function MoyennesView() {
           </div>
 
           {/* RIGHT SIDE: TABLE 3 (CORRESPONDANCE DES MODELES) - xl:col-span-3 */}
-          <div className="xl:col-span-3 bg-white rounded-xl border border-slate-300 shadow-2xs overflow-hidden flex flex-col">
+          <div className="moyennes-print-hide xl:col-span-3 bg-white rounded-xl border border-slate-300 shadow-2xs overflow-hidden flex flex-col">
             {/* Header matching Excel sheet */}
             <div className="bg-[#1f4e79] text-white px-3 py-1.5 border-b border-[#1b3a57] flex items-center justify-between">
               <span className="font-black text-xs tracking-wide">
@@ -954,9 +1209,116 @@ export default function MoyennesView() {
         </div>
       )}
 
+      {/* Alternative View Mode: PAR TECHNICIEN */}
+      {viewMode === "techniciens" && (
+        <div className="moyennes-print-content bg-white rounded-xl border border-slate-300 shadow-2xs overflow-hidden flex flex-col">
+          <div className="bg-[#1f4e79] text-white px-4 py-2.5 border-b border-[#1b3a57] flex flex-wrap items-center justify-between gap-2">
+            <div>
+              <span className="font-black text-sm tracking-wide flex items-center gap-2">
+                <Users size={16} />
+                <span>RENDEMENT & DISPONIBILITÉ PAR TECHNICIEN ({MONTH_NAMES[selectedMonth - 1]} {selectedYear})</span>
+              </span>
+              <p className="text-[11px] text-blue-200 mt-0.5">
+                Nombre de véhicules traités, interventions terminées, durée de travail net effectif et statut en temps réel
+              </p>
+            </div>
+            <div className="flex items-center gap-2">
+              <span className="text-xs font-bold bg-[#183d5f] px-2.5 py-1 rounded text-white">
+                {atelierStats.techniciensList.length} collaborateurs actifs
+              </span>
+            </div>
+          </div>
+
+          <div className="overflow-x-auto">
+            <table className="w-full text-xs text-left border-collapse">
+              <thead>
+                <tr className="bg-slate-100 text-slate-700 font-extrabold border-b border-slate-200">
+                  <th className="py-2.5 px-3">N° Matricule</th>
+                  <th className="py-2.5 px-3">NOM DE TECHNICIEN</th>
+                  <th className="py-2.5 px-3">Équipe</th>
+                  <th className="py-2.5 px-3 text-center">Véhicules Reçus</th>
+                  <th className="py-2.5 px-3 text-center">Terminés</th>
+                  <th className="py-2.5 px-3 text-center">En cours</th>
+                  <th className="py-2.5 px-3 text-center">Travail Net Moyen</th>
+                  <th className="py-2.5 px-3 text-center">Statut Actuel</th>
+                  <th className="py-2.5 px-3">Intervention Active</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-slate-200">
+                {atelierStats.techniciensList.length === 0 ? (
+                  <tr>
+                    <td colSpan={9} className="py-8 text-center text-slate-400">
+                      Aucune intervention affectée à un technicien sur la période {MONTH_NAMES[selectedMonth - 1]} {selectedYear}.
+                    </td>
+                  </tr>
+                ) : (
+                  atelierStats.techniciensList.map((tech) => (
+                    <tr key={`${tech.matricule}_${tech.name}`} className="hover:bg-slate-50/80 transition-colors">
+                      <td className="py-2.5 px-3 font-mono font-bold text-slate-800">
+                        {tech.matricule}
+                      </td>
+                      <td className="py-2.5 px-3 font-extrabold text-slate-900">
+                        {tech.name}
+                      </td>
+                      <td className="py-2.5 px-3">
+                        <span className="px-2 py-0.5 rounded text-[11px] font-bold bg-slate-100 text-slate-700 border border-slate-200">
+                          {tech.equipe}
+                        </span>
+                      </td>
+                      <td className="py-2.5 px-3 text-center font-black text-slate-900">
+                        {tech.total}
+                      </td>
+                      <td className="py-2.5 px-3 text-center font-bold text-emerald-700">
+                        {tech.termines}
+                      </td>
+                      <td className="py-2.5 px-3 text-center font-bold text-blue-700">
+                        {tech.enCours}
+                      </td>
+                      <td className="py-2.5 px-3 text-center font-mono font-semibold text-slate-700">
+                        {tech.avgNetFormat}
+                      </td>
+                      <td className="py-2.5 px-3 text-center">
+                        {tech.isOccupied ? (
+                          <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded text-[10px] font-extrabold bg-rose-100 text-rose-800 border border-rose-300">
+                            <span className="w-1.5 h-1.5 rounded-full bg-rose-600"></span>
+                            Occupé
+                          </span>
+                        ) : (
+                          <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded text-[10px] font-extrabold bg-emerald-100 text-emerald-800 border border-emerald-300">
+                            <span className="w-1.5 h-1.5 rounded-full bg-emerald-600"></span>
+                            Disponible
+                          </span>
+                        )}
+                      </td>
+                      <td className="py-2.5 px-3 text-[11px]">
+                        {tech.activeCar ? (
+                          <div className="flex items-center gap-1.5 text-slate-700 flex-wrap">
+                            <strong className="text-slate-900 font-mono">OR {tech.activeCar.no || tech.activeCar.serie}</strong>
+                            <span>•</span>
+                            <span>{tech.activeCar.marque} {tech.activeCar.modele || ""}</span>
+                            <span>•</span>
+                            <span className="font-mono text-blue-700 font-bold">Emp: {tech.activeCar.emplacement || "-"}</span>
+                            <span>•</span>
+                            <span>{tech.activeCar.avancement || "En cours"}</span>
+                            <span>•</span>
+                            <span className="text-slate-500">Début: {tech.activeCar.heureDebutTravail || tech.activeCar.dateDebutRep?.split(" ")[1] || "-"}</span>
+                          </div>
+                        ) : (
+                          <span className="text-slate-400 italic">Aucun véhicule actif</span>
+                        )}
+                      </td>
+                    </tr>
+                  ))
+                )}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      )}
+
       {/* Alternative View Mode: VISUAL CHARTS */}
       {viewMode === "charts" && (
-        <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+        <div className="moyennes-print-content moyennes-print-charts grid grid-cols-1 lg:grid-cols-2 gap-4">
           {/* Bar Chart: Par Équipe */}
           <div className="bg-white rounded-xl p-5 border border-slate-200 shadow-2xs flex flex-col">
             <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 mb-2">

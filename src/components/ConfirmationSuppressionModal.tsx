@@ -8,8 +8,8 @@ import {
 } from "lucide-react";
 import {
   supprimerDossierEntree,
-  isGoogleSheetWriteConfigured,
-} from "../services/googleSheets";
+  isDatabaseWriteConfigured,
+} from "../services/database";
 import type { UnifiedReceptionRow } from "./SuiviEntreesTable";
 
 interface ConfirmationSuppressionModalProps {
@@ -48,9 +48,9 @@ export default function ConfirmationSuppressionModal({
   if (!isOpen || !row) return null;
 
   const handleConfirmDelete = async () => {
-    if (!isGoogleSheetWriteConfigured()) {
+    if (!isDatabaseWriteConfigured()) {
       setError(
-        "L'URL d'écriture Google Sheets n'est pas configurée. Veuillez renseigner VITE_SHEET_WRITE_URL dans la synchronisation."
+        "Le serveur PostgreSQL n'est pas disponible. Vérifiez sa configuration puis réessayez."
       );
       return;
     }
@@ -60,9 +60,12 @@ export default function ConfirmationSuppressionModal({
       setError("");
 
       await supprimerDossierEntree({
+        id: row.id,
+        recordKey: String(row.id || ""),
         noOr: row.noOr,
         cs: row.cs,
         chassis: row.chassis,
+        immatriculation: row.immatriculation,
         rowSuivi: row.suiviRowNumber,
         rowNumber: row.chargementRowNumber,
       });
@@ -73,7 +76,7 @@ export default function ConfirmationSuppressionModal({
       setError(
         err instanceof Error
           ? err.message
-          : "Erreur lors de la suppression du dossier dans Google Sheets."
+          : "Erreur lors de la suppression du dossier dans PostgreSQL."
       );
     } finally {
       setLoading(false);
@@ -110,7 +113,7 @@ export default function ConfirmationSuppressionModal({
                 Confirmer la suppression
               </h3>
               <p className="text-xs text-red-100/80">
-                Action irréversible sur Google Sheets
+                Action irréversible sur PostgreSQL
               </p>
             </div>
           </div>
@@ -139,8 +142,8 @@ export default function ConfirmationSuppressionModal({
             <AlertTriangle className="w-5 h-5 text-red-600 shrink-0 mt-0.5" />
             <div>
               Êtes-vous sûr de vouloir supprimer définitivement ce dossier ? Cette
-              ligne sera supprimée de la feuille <b>Suivi des entrées</b> et de la
-              feuille <b>tableaux de chargement</b>.
+              ligne sera supprimée du <b>Suivi des entrées</b> et des
+              <b> Tableaux de chargement</b>.
             </div>
           </div>
 

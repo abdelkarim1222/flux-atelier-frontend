@@ -13,7 +13,7 @@ import {
   getAvancementOptionsForTeam,
   getEssaisControleLocal,
   type DemandeEssaiControle,
-} from "../services/googleSheets";
+} from "../services/database";
 import ValidationEssaiModal, {
   type EssaiValidationPayload,
 } from "./ValidationEssaiModal";
@@ -90,7 +90,7 @@ export default function EssaiView({
   canEdit,
   activeChefEquipeTeam: _activeChefEquipeTeam,
   userTeam: _userTeam,
-  role: _role = "chef_equipe",
+  role = "chef_equipe",
   isChefEquipe: _isChefEquipe,
   onViewDetail,
   onSelectVehicle,
@@ -102,7 +102,7 @@ export default function EssaiView({
   const [search, setSearch] = useState("");
   const [selectedEquipe, setSelectedEquipe] = useState("Toutes");
   const [essaiModalVehicle, setEssaiModalVehicle] = useState<Flux | null>(null);
-  const [essaisHistory, setEssaisHistory] = useState<Record<string, DemandeEssaiControle>>(() =>
+  const [essaisHistory, setEssaisHistory] = useState<DemandeEssaiControle[]>(() =>
     getEssaisControleLocal()
   );
 
@@ -117,30 +117,50 @@ export default function EssaiView({
   }, []);
 
 
-  // Filtre les véhicules qui sont actuellement en "Essai"
+  const isCurrentlyInEssai = (vehicle: Flux) => {
+    const av = (vehicle.avancement || "").trim().toLowerCase();
+    const etat = (vehicle.etatIntervention || "").trim().toLowerCase();
+    return av === "essai" || etat === "essai";
+  };
+
+  const hasEssaiHistory = (vehicle: Flux) => essaisHistory.some((essai) =>
+    (essai.vehicleId != null && essai.vehicleId === vehicle.id) ||
+    (Boolean(essai.or) && [vehicle.no, vehicle.ordre].includes(essai.or)) ||
+    (Boolean(essai.chassis) && essai.chassis === vehicle.chassis)
+  );
+
+  // Les essais en cours restent visibles pour tout profil autorisé à cette page.
+  // Les essais anciens (conformes ou non conformes) sont une archive réservée
+  // à l'Administration et aux Chefs d'équipe.
+  const canViewEssaiHistory = role === "administration" || role === "chef_equipe";
+
+  // Les véhicules sortis d'essai restent visibles tant qu'ils ont un historique :
+  // le tableau constitue ainsi la preuve des essais effectués.
   const essaiVehicles = useMemo(() => {
-    return vehicles.filter((v) => {
-      const av = (v.avancement || "").trim().toLowerCase();
-      const etat = (v.etatIntervention || "").trim().toLowerCase();
-      return av === "essai" || etat === "essai";
-    });
+    return vehicles.filter((v) => isCurrentlyInEssai(v));
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [vehicles]);
+
+  const tracedVehicles = useMemo(() =>
+    vehicles.filter((vehicle) => isCurrentlyInEssai(vehicle) || (canViewEssaiHistory && hasEssaiHistory(vehicle))),
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  [vehicles, essaisHistory, canViewEssaiHistory]);
 
   // Équipes présentes parmi les véhicules en essai
   const availableEquipes = useMemo(() => {
     const set = new Set<string>();
-    essaiVehicles.forEach((v) => {
+    tracedVehicles.forEach((v) => {
       if (v.equipe && v.equipe !== "-") {
         set.add(v.equipe.trim());
       }
     });
     return ["Toutes", ...Array.from(set).sort()];
-  }, [essaiVehicles]);
+  }, [tracedVehicles]);
 
   // Données filtrées pour l'affichage
   const filteredData = useMemo(() => {
     const q = search.trim().toLowerCase();
-    return essaiVehicles.filter((row) => {
+    return tracedVehicles.filter((row) => {
       if (selectedEquipe !== "Toutes") {
         if (!row.equipe || row.equipe.trim().toLowerCase() !== selectedEquipe.toLowerCase()) {
           return false;
@@ -167,8 +187,8 @@ export default function EssaiView({
         .toLowerCase();
 
       return haystack.includes(q);
-    });
-  }, [essaiVehicles, selectedEquipe, search]);
+    }).sort((a, b) => Number(b.creationTimestamp || b.id || 0) - Number(a.creationTimestamp || a.id || 0));
+  }, [tracedVehicles, selectedEquipe, search]);
 
   return (
     <div className="p-4 sm:p-6 space-y-6 animate-in fade-in duration-200">
@@ -224,10 +244,10 @@ export default function EssaiView({
             </div>
           </div>
           <div className="col-span-2 sm:col-span-1 bg-white/5 rounded-xl p-3 border border-white/10">
-            <div className="text-[11px] text-purple-200/70 font-semibold">Validation finale</div>
+            <div className="text-[11px] text-purple-200/70 font-semibold">Historique des essais</div>
             <div className="text-xs font-medium text-purple-100 mt-1 flex items-center gap-1">
               <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400" />
-              <span>Prêt pour passage à Terminer</span>
+              <span>{canViewEssaiHistory ? "Conformes et non-conformes conservés" : "Réservé à l'Administration et aux Chefs d'équipe"}</span>
             </div>
           </div>
         </div>
@@ -295,12 +315,16 @@ export default function EssaiView({
               ) : (
                 filteredData.map((row) => {
                   const isSaving = savingVehicleId === row.id;
+                  const isActiveEssai = isCurrentlyInEssai(row);
                   const allowedOptions = getAvancementOptionsForTeam(row.equipe, row);
-                  const vehicleKey = String(row.id || row.no || row.chassis);
-                  const lastEssai =
-                    essaisHistory[vehicleKey] ||
-                    (row.no ? essaisHistory[row.no] : undefined) ||
-                    (row.chassis ? essaisHistory[row.chassis] : undefined);
+                  const essaisForVehicle = essaisHistory
+                    .filter((essai) =>
+                      (essai.vehicleId != null && essai.vehicleId === row.id) ||
+                      (Boolean(essai.or) && [row.no, row.ordre].includes(essai.or)) ||
+                      (Boolean(essai.chassis) && essai.chassis === row.chassis)
+                    )
+                    .sort((a, b) => b.timestamp - a.timestamp);
+                  const lastEssai = essaisForVehicle[0];
 
                   return (
                     <tr
@@ -369,30 +393,37 @@ export default function EssaiView({
                         className="py-3 px-3.5 whitespace-nowrap"
                         onClick={(e) => e.stopPropagation()}
                       >
-                        <div className="flex flex-col gap-1.5 items-start">
+                        <div className="flex flex-col gap-1.5 items-start whitespace-normal">
                           <button
                             type="button"
-                            disabled={isSaving || !canEdit}
+                            disabled={isSaving || !canEdit || !isActiveEssai}
                             onClick={() => setEssaiModalVehicle(row)}
                             className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-gradient-to-r from-purple-700 to-indigo-700 hover:from-purple-800 hover:to-indigo-800 text-white font-bold text-xs shadow-xs hover:shadow active:scale-95 transition-all cursor-pointer disabled:opacity-50"
-                            title="Ouvrir le formulaire de contrôle de l'essayeur"
+                            title={isActiveEssai ? "Ouvrir le formulaire de contrôle de l'essayeur" : "Historique : le véhicule n'est plus en essai"}
                           >
                             <Gauge className="w-3.5 h-3.5 text-purple-200" />
                             <span>Contrôle Essai</span>
                           </button>
 
                           {lastEssai ? (
-                            <div className="text-[10px] flex items-center gap-1 px-2 py-0.5 rounded-md bg-slate-100 text-slate-700 border border-slate-200">
-                              <span className="font-semibold text-slate-600">{lastEssai.essayeur}:</span>
-                              <span
-                                className={`font-bold ${
-                                  lastEssai.resultat === "CONFORME"
-                                    ? "text-emerald-700"
-                                    : "text-rose-700"
-                                }`}
-                              >
-                                {lastEssai.resultat}
-                              </span>
+                            <div className="w-full space-y-1.5">
+                              <div className="text-[10px] flex flex-wrap items-center gap-1 px-2 py-1 rounded-md bg-slate-100 text-slate-700 border border-slate-200">
+                                <span className="font-semibold text-slate-600">{essaisForVehicle.length} essai{essaisForVehicle.length > 1 ? "s" : ""} • dernier :</span>
+                                <span className="font-semibold">{lastEssai.dateControle}</span>
+                                <span className={`font-bold ${lastEssai.resultat === "CONFORME" ? "text-emerald-700" : "text-rose-700"}`}>
+                                  {lastEssai.resultat}
+                                </span>
+                              </div>
+                              <div className="space-y-1 border-l-2 border-purple-200 pl-2">
+                                {essaisForVehicle.map((essai) => (
+                                  <div key={essai.id} className="text-[10px] leading-snug text-slate-600">
+                                    <span className="font-bold text-slate-800">{essai.dateControle}</span>
+                                    <span> — {essai.essayeur} : </span>
+                                    <span className={essai.resultat === "CONFORME" ? "font-bold text-emerald-700" : "font-bold text-rose-700"}>{essai.resultat}</span>
+                                    {essai.remarque && <span> — {essai.remarque}</span>}
+                                  </div>
+                                ))}
+                              </div>
                             </div>
                           ) : (
                             <div className="flex items-center gap-1">
@@ -455,10 +486,10 @@ export default function EssaiView({
                         <div className="flex items-center justify-center gap-1.5">
                           <button
                             type="button"
-                            disabled={isSaving || !canEdit}
+                            disabled={isSaving || !canEdit || !isActiveEssai}
                             onClick={() => setEssaiModalVehicle(row)}
                             className="p-1.5 rounded-lg text-purple-700 bg-purple-50 hover:bg-purple-100 hover:text-purple-900 border border-purple-200 transition-colors cursor-pointer"
-                            title="Effectuer le contrôle de l'essayeur"
+                            title={isActiveEssai ? "Effectuer le contrôle de l'essayeur" : "Historique : le véhicule n'est plus en essai"}
                           >
                             <Gauge className="w-4 h-4" />
                           </button>
@@ -503,4 +534,3 @@ export default function EssaiView({
     </div>
   );
 }
-

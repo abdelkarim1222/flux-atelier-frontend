@@ -26,7 +26,8 @@ import {
   resetCustomEquipeMembers,
   fetchEquipeSheetData,
   normalizePersonName,
-} from "../services/googleSheets";
+  getMemberTeams,
+} from "../services/database";
 
 import {
   CANONICAL_TEAMS,
@@ -36,7 +37,7 @@ import {
   removeCustomTeam,
 } from "../config/teams";
 
-// Layout columns matching the 3 vertical columns of the Google Sheets screenshot
+// Layout columns réparties en trois colonnes
 const COLUMN_1_TEAMS = ["Daily1", "Service Rapide"];
 const COLUMN_2_TEAMS = ["Daily2", "Lourd"];
 const COLUMN_3_TEAMS = ["Changan", "Carrosserie", "Elictrique"];
@@ -73,6 +74,8 @@ export default function GestionEquipesView() {
   const [formMatricule, setFormMatricule] = useState("");
   const [formNom, setFormNom] = useState("");
   const [formPoste, setFormPoste] = useState("MECANICIEN");
+  const [formTravailleSamedi, setFormTravailleSamedi] = useState(false);
+  const [formEquipesSupplementaires, setFormEquipesSupplementaires] = useState<string[]>([]);
   const [formError, setFormError] = useState<string | null>(null);
   const [formSuccess, setFormSuccess] = useState<string | null>(null);
 
@@ -84,7 +87,7 @@ export default function GestionEquipesView() {
   // Delete State
   const [deletingMember, setDeletingMember] = useState<EquipeMember | null>(null);
 
-  // Load from Sheets or local on mount
+  // Chargement initial des équipes depuis PostgreSQL ou le cache local
   useEffect(() => {
     const custom = getCustomEquipeMembers();
     if (!custom) {
@@ -123,23 +126,18 @@ export default function GestionEquipesView() {
     saveCustomEquipeMembers(updated);
   };
 
-  const handleResetToSheet = async () => {
+  const handleResetTeams = async () => {
     if (
       window.confirm(
-        "Voulez-vous réinitialiser les tableaux aux 7 équipes d'origine de Google Sheets (Daily1, Daily2, Changan, Service Rapide, Lourd, Carrosserie, Elictrique) ?"
-      )
+        "Voulez-vous réinitialiser les tableaux aux 7 équipes d'origine de PostgreSQL (Daily1, Daily2, Changan, Service Rapide, Lourd, Carrosserie, Elictrique) ?"
+    )
     ) {
-      resetCustomEquipeMembers();
-      setCustomTeams([]);
       try {
-        const res = await fetchEquipeSheetData();
-        if (res.members && res.members.length > 0) {
-          setMembers(res.members);
-        } else {
-          setMembers(DEFAULT_EQUIPE_MAPPINGS);
-        }
-      } catch {
+        await resetCustomEquipeMembers();
+        setCustomTeams([]);
         setMembers(DEFAULT_EQUIPE_MAPPINGS);
+      } catch (error) {
+        window.alert(error instanceof Error ? error.message : "Impossible de réinitialiser les équipes dans PostgreSQL.");
       }
     }
   };
@@ -152,6 +150,8 @@ export default function GestionEquipesView() {
     setFormMatricule("");
     setFormNom("");
     setFormPoste("MECANICIEN");
+    setFormTravailleSamedi(false);
+    setFormEquipesSupplementaires([]);
     setFormError(null);
     setFormSuccess(null);
     setIsMemberModalOpen(true);
@@ -165,6 +165,8 @@ export default function GestionEquipesView() {
     setFormMatricule(member.matricule || "");
     setFormNom(member.name);
     setFormPoste(member.poste || "MECANICIEN");
+    setFormTravailleSamedi(member.travailleSamedi === true);
+    setFormEquipesSupplementaires(member.equipesSupplementaires || []);
     setFormError(null);
     setFormSuccess(null);
     setIsMemberModalOpen(true);
@@ -193,6 +195,8 @@ export default function GestionEquipesView() {
       matricule: cleanMat,
       team: cleanTeam,
       poste: cleanPoste,
+      travailleSamedi: formTravailleSamedi,
+      equipesSupplementaires: formEquipesSupplementaires.filter((team) => team !== cleanTeam),
     };
 
     if (editingMember) {
@@ -263,8 +267,10 @@ export default function GestionEquipesView() {
       if (t && t.trim()) set.add(t.trim());
     });
     members.forEach((m) => {
-      if (m.team && m.team.trim()) set.add(m.team.trim());
+      getMemberTeams(m).forEach((team) => set.add(team));
     });
+    // JMC est une compétence atelier utilisable sans créer une nouvelle fiche technicien.
+    set.add("JMC");
     return Array.from(set);
   }, [members, customTeams]);
 
@@ -278,7 +284,7 @@ export default function GestionEquipesView() {
     };
   }, [members, allTeams]);
 
-  // Group teams into 3 columns matching Google Sheets
+  // Group teams into 3 columns réparties en colonnes
   const columns = useMemo(() => {
     const col1: string[] = [];
     const col2: string[] = [];
@@ -336,10 +342,10 @@ export default function GestionEquipesView() {
     );
   }
 
-  // Render a Single Team Table exactly like the Google Sheet
+  // Render a Single Team Table comme la maquette
   const renderTeamTable = (teamName: string) => {
     const teamMembers = members.filter(
-      (m) => m.team.toLowerCase() === teamName.toLowerCase()
+      (m) => getMemberTeams(m).some((team) => team.toLowerCase() === teamName.toLowerCase())
     );
 
     const query = search.trim().toLowerCase();
@@ -349,7 +355,7 @@ export default function GestionEquipesView() {
         key={teamName}
         className="bg-white rounded-xl border border-slate-300 shadow-md overflow-hidden flex flex-col transition-all hover:shadow-lg"
       >
-        {/* Navy Blue Header Banner matching Google Sheets screenshot */}
+        {/* Navy Blue Header Banner réparties en colonnes screenshot */}
         <div className="bg-[#0b3c70] text-white px-3 py-2 flex items-center justify-between border-b border-[#082a50]">
           <div className="flex items-center gap-2">
             {/* Sheet / Table Icon Badge */}
@@ -453,7 +459,14 @@ export default function GestionEquipesView() {
                       {/* NOM DE Technicien */}
                       <td className="py-2 px-3 border-r border-slate-200 font-bold text-slate-900 text-xs">
                         <div className="flex items-center justify-between">
-                          <span className="truncate">{member.name}</span>
+                          <div className="min-w-0">
+                            <span className="block truncate">{member.name}</span>
+                            {member.equipesSupplementaires && member.equipesSupplementaires.length > 0 && (
+                              <span className="block truncate text-[9px] font-semibold text-blue-600">
+                                Aussi : {member.equipesSupplementaires.join(", ")}
+                              </span>
+                            )}
+                          </div>
                           {/* Actions on hover */}
                           <div className="opacity-0 group-hover:opacity-100 flex items-center gap-1 transition-opacity shrink-0 ml-1">
                             <button
@@ -528,11 +541,11 @@ export default function GestionEquipesView() {
                 </h1>
                 <span className="px-2.5 py-0.5 rounded-full text-[11px] font-extrabold bg-blue-100 text-blue-800 border border-blue-200 flex items-center gap-1">
                   <ShieldCheck size={12} />
-                  Feuille EQUIPE
+                  Équipes atelier
                 </span>
               </div>
               <p className="text-xs text-slate-500 mt-0.5">
-                Tableaux par équipe organisés fidèlement comme la feuille Google Sheets originale ITALCAR.
+                Organisez les collaborateurs par équipe, matricule et fonction.
               </p>
             </div>
           </div>
@@ -558,12 +571,12 @@ export default function GestionEquipesView() {
 
             <button
               type="button"
-              onClick={handleResetToSheet}
+              onClick={handleResetTeams}
               className="inline-flex items-center gap-1.5 px-3 py-2 text-xs font-bold text-slate-600 bg-white border border-slate-200 hover:bg-slate-50 rounded-xl transition-all cursor-pointer"
-              title="Recharger exactement les données de la feuille Google Sheets EQUIPE"
+              title="Revenir aux équipes configurées par défaut"
             >
               <RotateCcw className="w-3.5 h-3.5" />
-              <span className="hidden sm:inline">Réinitialiser Sheets</span>
+              <span className="hidden sm:inline">Réinitialiser les équipes</span>
             </button>
           </div>
         </div>
@@ -614,14 +627,14 @@ export default function GestionEquipesView() {
         </div>
       </div>
 
-      {/* 3-Column Layout Matching the Google Sheets Screenshot */}
+      {/* 3-Column Layout Matching the PostgreSQL Screenshot */}
       {selectedTeamFilter !== "all" ? (
         // When filtered by a single team
         <div className="max-w-xl mx-auto w-full">
           {renderTeamTable(selectedTeamFilter)}
         </div>
       ) : (
-        // Full 3 Columns Grid exactly like screenshot
+        // Full 3 Columns Grid par équipe
         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-5 items-start">
           {/* Column 1: Daily1, Service Rapide */}
           <div className="flex flex-col gap-5">
@@ -653,7 +666,7 @@ export default function GestionEquipesView() {
                   <h3 className="text-base font-black tracking-tight">
                     {editingMember ? "Modifier le Technicien" : "Ajouter un Technicien"}
                   </h3>
-                  <p className="text-xs text-blue-200 font-medium">Tableaux ÉQUIPE (Google Sheets)</p>
+                  <p className="text-xs text-blue-200 font-medium">Tableaux ÉQUIPE (PostgreSQL)</p>
                 </div>
               </div>
               <button
@@ -748,6 +761,35 @@ export default function GestionEquipesView() {
                     </option>
                   ))}
                 </select>
+              </div>
+
+              <label className="flex items-center gap-2.5 rounded-xl border border-slate-200 bg-slate-50 px-3 py-2.5 text-xs font-bold text-slate-700 cursor-pointer">
+                <input
+                  type="checkbox"
+                  checked={formTravailleSamedi}
+                  onChange={(e) => setFormTravailleSamedi(e.target.checked)}
+                  className="h-4 w-4 rounded border-slate-300 text-blue-600 focus:ring-blue-500"
+                />
+                Travaille le samedi (08:00 à 12:30)
+              </label>
+
+              <div>
+                <p className="mb-1.5 text-xs font-bold text-slate-700">Équipes / spécialités supplémentaires</p>
+                <div className="grid grid-cols-2 gap-2 rounded-xl border border-slate-200 bg-slate-50 p-3">
+                  {allTeams.filter((team) => team !== formTeam).map((team) => (
+                    <label key={team} className="flex items-center gap-2 text-xs font-semibold text-slate-700 cursor-pointer">
+                      <input
+                        type="checkbox"
+                        checked={formEquipesSupplementaires.includes(team)}
+                        onChange={(e) => setFormEquipesSupplementaires((current) =>
+                          e.target.checked ? [...current, team] : current.filter((value) => value !== team)
+                        )}
+                        className="h-3.5 w-3.5 rounded border-slate-300 text-blue-600 focus:ring-blue-500"
+                      />
+                      {team}
+                    </label>
+                  ))}
+                </div>
               </div>
 
               {/* Modal Buttons */}

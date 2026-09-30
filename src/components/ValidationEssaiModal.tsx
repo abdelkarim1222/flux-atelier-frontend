@@ -43,6 +43,7 @@ export interface EssaiValidationPayload {
   actionNonConforme?: "transfert_vr" | "attente_client";
   targetVr?: string;
   descriptionPanne?: string;
+  remarque?: string;
   dateControle: string;
 }
 
@@ -74,6 +75,7 @@ export default function ValidationEssaiModal({
   const [actionNonConforme, setActionNonConforme] = useState<"transfert_vr" | "attente_client">("transfert_vr");
   const [targetVr, setTargetVr] = useState<string>("vrService Rapide");
   const [descriptionPanne, setDescriptionPanne] = useState<string>("");
+  const [remarque, setRemarque] = useState<string>("");
   const [error, setError] = useState<string | null>(null);
   const [isSubmitting, setIsSubmitting] = useState<boolean>(false);
 
@@ -84,6 +86,7 @@ export default function ValidationEssaiModal({
       setActionNonConforme("transfert_vr");
       setTargetVr("vrService Rapide");
       setDescriptionPanne("");
+      setRemarque("");
       setError(null);
       setIsSubmitting(false);
     }
@@ -138,6 +141,7 @@ export default function ValidationEssaiModal({
           resultat === "NON-CONFORME" && actionNonConforme === "attente_client"
             ? descriptionPanne.trim()
             : undefined,
+        remarque: remarque.trim() || undefined,
         dateControle: getNowFormatted(),
       };
 
@@ -334,6 +338,20 @@ export default function ValidationEssaiModal({
                 </div>
               </button>
             </div>
+          </div>
+
+          <div>
+            <label className="block text-xs font-bold text-slate-800 mb-1.5 flex items-center gap-1.5">
+              <FileText className="w-4 h-4 text-purple-700" />
+              <span>Remarque de l'essai</span>
+            </label>
+            <textarea
+              rows={3}
+              value={remarque}
+              onChange={(e) => setRemarque(e.target.value)}
+              placeholder="Observations de l'essayeur : comportement du véhicule, contrôle effectué, anomalie…"
+              className="w-full p-2.5 text-xs bg-white border border-slate-300 rounded-xl focus:ring-2 focus:ring-purple-500/20 focus:border-purple-600 outline-none transition-all resize-none shadow-2xs text-slate-800 placeholder:text-slate-400"
+            />
           </div>
 
           {/* Section conditionnelle CONFORME */}

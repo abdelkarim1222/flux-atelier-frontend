@@ -20,9 +20,10 @@ import {
   type EquipeMember,
   DEFAULT_EQUIPE_MAPPINGS,
   getCustomEquipeMembers,
+  getMemberTeams,
   getReaffectationsLocal,
   type ReaffectationRecord,
-} from "../services/googleSheets";
+} from "../services/database";
 
 import { CANONICAL_TEAMS, getCustomTeams } from "../config/teams";
 
@@ -108,6 +109,14 @@ export function isVehicleReaffecteActive(
   const normAv = (v.avancement || "").trim().toLowerCase();
   const normEtat = (v.etatIntervention || "").trim().toLowerCase();
 
+  // L'avancement est prioritaire sur l'ancien état interne. Seul un avancement
+  // explicitement « En cours » / avec pourcentage occupe le technicien.
+  // Un OR « Attente réparation » issu d'une réaffectation peut conserver un
+  // ancien état « En cours » en base : il doit malgré tout libérer le technicien.
+  if (normAv.startsWith("en cours") || normAv.includes("%")) {
+    return false;
+  }
+
   // 1. Détection directe dans les chaînes d'avancement ou d'état
   if (
     normAv.includes("réaffect") ||
@@ -160,7 +169,9 @@ export function isVehicleReaffecteActive(
  *
  * RÈGLE D'ATELIER :
  * - Un mécanicien n'est OCCUPÉ que si le véhicule est activement "En cours" (avec travail effectif / %).
- * - Si le technicien a été RÉAFFECTÉ ("Technicien réaffecté", pause), le mécanicien redevient LIBRE !
+ * - Une réaffectation libère le mécanicien uniquement tant que ce véhicule est réellement en attente.
+ * - Dès qu'un véhicule est explicitement « En cours » ou possède un pourcentage, il garde le mécanicien OCCUPÉ,
+ *   même si un ancien enregistrement de réaffectation existe encore localement.
  * - Si le véhicule est en "Attente réparation", "Attente devis", "Attente pièces" ou "Essai", le mécanicien est LIBRE !
  * - Si le véhicule est terminé / livré / sorti / attente client, le mécanicien est LIBRE !
  */
@@ -168,50 +179,75 @@ export function isVehicleActivelyOccupyingTech(
   v: Flux,
   reaffectationsMap?: Record<string, ReaffectationRecord>
 ): boolean {
-  // 1. Véhicule terminé / livré / sorti / attente client -> LIBRE
+  // 1. Véhicule terminé / livré / sorti / attente client -> LIBRE / DISPONIBLE
   if (isVehicleFinished(v)) {
     return false;
   }
 
-  // 2. Technicien réaffecté (actif et non repris) -> Le mécanicien est LIBRE !
+  const normAv = (v.avancement || "")
+    .trim()
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "");
+  const normEtat = (v.etatIntervention || "")
+    .trim()
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "");
+
+  // 2. Un travail déclaré « En cours » est prioritaire : il occupe le technicien.
+  // Cela protège le cas où une ancienne réaffectation n'a pas encore été marquée reprise.
+  const isEnCoursActif =
+    normAv.startsWith("en cours") ||
+    normAv.includes("%") ||
+    (!normAv && normEtat === "en cours");
+  if (isEnCoursActif) {
+    return true;
+  }
+
+  // 3. Technicien réaffecté (actif et non repris) -> disponible seulement si ce véhicule est bien en attente.
   if (isVehicleReaffecteActive(v, reaffectationsMap)) {
     return false;
   }
 
-  const normAv = (v.avancement || "").trim().toLowerCase();
-  const normEtat = (v.etatIntervention || "").trim().toLowerCase();
-
-  // 3. Statut en Attente Réparation ou toute attente -> Le travail est suspendu, le mécanicien est LIBRE !
-  if (
-    normAv.includes("attente") ||
-    normEtat.includes("attente") ||
-    normAv.includes("repar") ||
-    normEtat.includes("repar")
-  ) {
+  // 4. Transferts VR : Fin du travail de l'équipe actuelle -> Ancien technicien LIBÉRÉ
+  if (normAv.startsWith("vr")) {
     return false;
   }
 
-  // 4. Véhicule en Attente Devis, Attente Pièces / Achat ou Essai -> Le mécanicien est LIBRE !
+  // 5. Attente PDR : Le travail est arrêté car une pièce de rechange est nécessaire.
+  // Le véhicule reste associé à l'intervention du technicien -> 🔴/🟠 Occupé / Réservé
+  if (normAv === "attente pdr" || normAv.includes("pdr")) {
+    return true;
+  }
+
+  // 6. Essai routier : La réparation nécessite un essai avant validation finale -> 🟠 Intervention active (Occupé)
+  if (normAv === "essai" || normEtat === "essai") {
+    return true;
+  }
+
+  // 7. Technicien réaffecté, attends acheter, ATENDE DEVIS -> Le mécanicien est DISPONIBLE
   if (
-    normAv.includes("devis") ||
-    normEtat.includes("devis") ||
+    normAv.includes("reaffect") ||
+    normAv === "attends acheter" ||
     normAv.includes("achet") ||
-    normEtat.includes("achet") ||
-    normAv.includes("pièce") ||
-    normAv.includes("piece") ||
-    normAv === "essai" ||
-    normEtat === "essai"
+    normAv === "atende devis" ||
+    normAv.includes("devis")
   ) {
     return false;
   }
 
-  // 5. Seul un véhicule dont les travaux sont véritablement En cours occupe le mécanicien
-  const isEnCoursActif =
-    (normAv.startsWith("en cours") || normAv.includes("%") || normEtat === "en cours") &&
-    !normAv.includes("attente") &&
-    !normEtat.includes("attente");
+  // 8. Statut en Attente Réparation générale -> LIBRE
+  if (
+    normAv.includes("repar") ||
+    normEtat.includes("repar") ||
+    normAv === "attente" ||
+    normEtat === "attente"
+  ) {
+    return false;
+  }
 
-  return isEnCoursActif;
+  return false;
 }
 
 /**
@@ -411,7 +447,7 @@ export default function AffecterTechnicienModal({
       if (t && t.trim()) set.add(t.trim());
     });
     allMembers.forEach((m) => {
-      if (m.team && m.team.trim()) set.add(m.team.trim());
+      getMemberTeams(m).forEach((team) => set.add(team));
     });
     return Array.from(set);
   }, [allMembers]);
@@ -423,7 +459,7 @@ export default function AffecterTechnicienModal({
     const others: EquipeMember[] = [];
 
     allMembers.forEach((m) => {
-      if (normalizeTeamName(m.team) === norm) {
+      if (getMemberTeams(m).some((team) => normalizeTeamName(team) === norm)) {
         inTeam.push(m);
       } else {
         others.push(m);
@@ -756,13 +792,20 @@ export default function AffecterTechnicienModal({
                       <X size={14} />
                     </button>
                   </div>
-                  <p className="mt-1 text-[11px] leading-relaxed">
-                    <strong>{occupiedAlert.member.name}</strong> (Mat: {occupiedAlert.member.matricule}) est actuellement affecté au véhicule{" "}
-                    <strong className="text-rose-950 font-mono">
-                      OR {occupiedAlert.car.no || occupiedAlert.car.serie || occupiedAlert.car.id}
-                    </strong>{" "}
-                    ({occupiedAlert.car.marque} {occupiedAlert.car.modele || ""} - {occupiedAlert.car.avancement || occupiedAlert.car.etatIntervention || "En cours"}).
-                  </p>
+                  <div className="mt-1.5 p-2 bg-white/95 rounded-lg border border-rose-300 text-xs space-y-1">
+                    <div className="font-extrabold text-rose-950 flex items-center justify-between">
+                      <span>{occupiedAlert.member.matricule} – {occupiedAlert.member.name}</span>
+                      <span className="px-2 py-0.5 rounded text-[10px] font-black bg-rose-200 text-rose-900 border border-rose-400">
+                        🔴 Occupé
+                      </span>
+                    </div>
+                    <div className="grid grid-cols-2 gap-x-2 gap-y-0.5 text-[11px] text-slate-800 pt-1 border-t border-rose-200">
+                      <div><span className="text-slate-500 font-semibold">Véhicule :</span> <strong>{occupiedAlert.car.marque} {occupiedAlert.car.modele || ""}</strong></div>
+                      <div><span className="text-slate-500 font-semibold">Emplacement :</span> <strong className="font-mono text-slate-900">{occupiedAlert.car.emplacement || "-"}</strong></div>
+                      <div><span className="text-slate-500 font-semibold">Avancement :</span> <strong className="text-blue-700">{occupiedAlert.car.avancement || occupiedAlert.car.etatIntervention || "En cours"}</strong></div>
+                      <div><span className="text-slate-500 font-semibold">Début :</span> <strong className="font-mono text-slate-900">{occupiedAlert.car.heureDebutTravail || (occupiedAlert.car.dateDebutRep ? occupiedAlert.car.dateDebutRep.split(" ")[1] : "-")}</strong></div>
+                    </div>
+                  </div>
                   <p className="mt-1 text-[10px] text-rose-700 font-semibold bg-rose-100/70 p-1 rounded border border-rose-200">
                     🔒 Règle atelier : Un mécanicien ne peut prendre en charge qu'une seule voiture à la fois jusqu'à ce qu'elle soit terminée.
                   </p>
@@ -835,7 +878,7 @@ export default function AffecterTechnicienModal({
                           ) : (
                             <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[9px] font-extrabold bg-emerald-100 text-emerald-800 border border-emerald-300 shrink-0">
                               <span className="w-1.5 h-1.5 rounded-full bg-emerald-600"></span>
-                              Libre
+                              Disponible
                             </span>
                           )}
                         </div>
@@ -852,8 +895,15 @@ export default function AffecterTechnicienModal({
                           </span>
                         </div>
                         {isOccupied && activeCar && (
-                          <div className="mt-1 text-[9.5px] font-semibold text-rose-700 bg-rose-100/60 px-1.5 py-0.5 rounded border border-rose-200 truncate">
-                            OR {activeCar.no || activeCar.serie || "Sans N°"} : {activeCar.marque} {activeCar.modele || ""} ({activeCar.avancement || activeCar.etatIntervention || "En cours"})
+                          <div className="mt-1 text-[9.5px] font-semibold text-rose-800 bg-rose-100/70 p-1 rounded border border-rose-200">
+                            <div className="truncate">Véhicule : <strong>{activeCar.marque} {activeCar.modele || ""}</strong> (OR {activeCar.no || activeCar.serie || ""})</div>
+                            <div className="flex items-center gap-1 text-[9px] text-rose-700 mt-0.5 flex-wrap">
+                              <span>Emp: <strong className="font-mono">{activeCar.emplacement || "-"}</strong></span>
+                              <span>•</span>
+                              <span>{activeCar.avancement || "En cours"}</span>
+                              <span>•</span>
+                              <span>Début: <strong className="font-mono">{activeCar.heureDebutTravail || (activeCar.dateDebutRep ? activeCar.dateDebutRep.split(" ")[1] : "-")}</strong></span>
+                            </div>
                           </div>
                         )}
                       </div>
@@ -877,6 +927,46 @@ export default function AffecterTechnicienModal({
                   </button>
                 );
               })}
+            </div>
+          </div>
+
+          {/* N° Matricule et Nom de Technicien Inputs */}
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 p-3.5 bg-slate-50 rounded-xl border border-slate-200">
+            <div>
+              <label htmlFor="input-tech-matricule" className="block text-[11px] font-bold text-slate-700 mb-1">
+                N° Matricule <span className="text-red-500">*</span>
+              </label>
+              <input
+                id="input-tech-matricule"
+                type="text"
+                value={selectedMatricule}
+                onChange={(e) => {
+                  const val = e.target.value;
+                  setSelectedMatricule(val);
+                  const match = allMembers.find((m) => m.matricule.toLowerCase() === val.trim().toLowerCase());
+                  if (match) {
+                    setSelectedNom(match.name);
+                    setSelectedPoste(match.poste);
+                  }
+                }}
+                placeholder="Ex: 1214, 8701..."
+                className="w-full text-xs font-mono font-bold text-slate-900 bg-white border border-slate-300 rounded-lg px-3 py-2 focus:ring-2 focus:ring-blue-500 focus:border-blue-500 transition-all"
+                required
+              />
+            </div>
+            <div>
+              <label htmlFor="input-tech-nom" className="block text-[11px] font-bold text-slate-700 mb-1">
+                NOM DE TECHNICIEN <span className="text-red-500">*</span>
+              </label>
+              <input
+                id="input-tech-nom"
+                type="text"
+                value={selectedNom}
+                onChange={(e) => setSelectedNom(e.target.value)}
+                placeholder="Ex: WAJIH TOUIL, Montassar Bjaoui..."
+                className="w-full text-xs font-bold text-slate-900 bg-white border border-slate-300 rounded-lg px-3 py-2 focus:ring-2 focus:ring-blue-500 focus:border-blue-500 transition-all"
+                required
+              />
             </div>
           </div>
 
@@ -922,7 +1012,7 @@ export default function AffecterTechnicienModal({
                   </div>
                 ) : (
                   <span className="text-amber-800 font-semibold italic text-xs">
-                    Veuillez cliquer sur un mécanicien libre ci-dessus.
+                    Veuillez cliquer sur un mécanicien ci-dessus ou saisir son N° Matricule et Nom.
                   </span>
                 )}
               </div>
@@ -934,7 +1024,7 @@ export default function AffecterTechnicienModal({
               </span>
             ) : selectedMatricule ? (
               <span className="px-2 py-0.5 rounded-md font-extrabold text-[11px] bg-emerald-200 text-emerald-800 border border-emerald-300 shrink-0">
-                Disponible
+                Prêt
               </span>
             ) : null}
           </div>
@@ -1010,7 +1100,7 @@ export default function AffecterTechnicienModal({
                             value={m.matricule}
                             disabled={Boolean(busy)}
                           >
-                            {busy ? `⛔ [OCCUPÉ - OR ${busy.no || busy.serie || busy.id}] ` : "🟢 [LIBRE] "}
+                            {busy ? `⛔ [OCCUPÉ - OR ${busy.no || busy.serie || busy.id}] ` : "🟢 [DISPONIBLE] "}
                             [{m.team}] {m.name} ({m.poste}) - Mat: {m.matricule}
                           </option>
                         );
@@ -1048,9 +1138,9 @@ export default function AffecterTechnicienModal({
 
               <button
                 type="submit"
-                disabled={isSubmitting || !selectedMatricule || Boolean(selectedMemberBusyCar)}
+                disabled={isSubmitting || !selectedMatricule.trim() || !selectedNom.trim() || Boolean(selectedMemberBusyCar)}
                 className={`inline-flex items-center justify-center gap-2 px-5 py-2.5 text-xs font-bold text-white rounded-xl shadow-md transition-all cursor-pointer ${
-                  selectedMatricule && !selectedMemberBusyCar
+                  selectedMatricule.trim() && selectedNom.trim() && !selectedMemberBusyCar
                     ? "bg-blue-600 hover:bg-blue-700 shadow-blue-600/30 hover:scale-[1.02] active:scale-[0.98]"
                     : "bg-slate-300 text-slate-500 cursor-not-allowed shadow-none"
                 }`}

@@ -1,10 +1,9 @@
-import { useState, useEffect, type FormEvent } from "react";
+import { useState, type FormEvent } from "react";
 import { useNavigate, useLocation, Navigate } from "react-router-dom";
 import {
   Eye,
   EyeOff,
   AlertCircle,
-  Sparkles,
 } from "lucide-react";
 import { useAuth } from "../context/AuthContext";
 
@@ -20,35 +19,6 @@ export default function AuthPage() {
   const [showPassword, setShowPassword] = useState(false);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
-
-  // Check if a new account was just created in this session / device
-  const [lastCreated, setLastCreated] = useState<{
-    name: string;
-    email: string;
-    password?: string;
-    role?: string;
-  } | null>(() => {
-    try {
-      const stored = localStorage.getItem("flux_atelier_last_created_account");
-      if (stored) return JSON.parse(stored);
-    } catch {}
-    return null;
-  });
-
-  useEffect(() => {
-    const handleAccountUpdate = () => {
-      try {
-        const stored = localStorage.getItem("flux_atelier_last_created_account");
-        if (stored) setLastCreated(JSON.parse(stored));
-      } catch {}
-    };
-    window.addEventListener("storage", handleAccountUpdate);
-    window.addEventListener("accounts_updated", handleAccountUpdate);
-    return () => {
-      window.removeEventListener("storage", handleAccountUpdate);
-      window.removeEventListener("accounts_updated", handleAccountUpdate);
-    };
-  }, []);
 
   if (isAuthenticated) {
     return <Navigate to={destination} replace />;
@@ -94,52 +64,6 @@ export default function AuthPage() {
             LOG IN
           </h1>
         </div>
-
-        {/* Quick Helper for Newly Created Account */}
-        {lastCreated && (
-          <div style={{
-            marginBottom: "16px",
-            padding: "10px 14px",
-            borderRadius: "14px",
-            background: "rgba(124, 58, 237, 0.35)",
-            border: "1px solid rgba(192, 132, 252, 0.5)",
-            display: "flex",
-            alignItems: "center",
-            justifyContent: "space-between",
-            gap: "10px",
-            boxShadow: "0 4px 12px rgba(124, 58, 237, 0.25)"
-          }}>
-            <div style={{ display: "flex", alignItems: "center", gap: "8px", minWidth: 0 }}>
-              <Sparkles style={{ width: "16px", height: "16px", color: "#fde047", flexShrink: 0 }} />
-              <div style={{ minWidth: 0, textOverflow: "ellipsis", overflow: "hidden", whiteSpace: "nowrap" }}>
-                <span style={{ fontSize: "11px", fontWeight: 800, color: "#ffffff" }}>Dernier compte créé : </span>
-                <span style={{ fontSize: "11px", color: "#f5d0fe", fontWeight: 700 }}>{lastCreated.name}</span>
-              </div>
-            </div>
-            <button
-              type="button"
-              onClick={() => {
-                setUsername(lastCreated.email);
-                if (lastCreated.password) setPassword(lastCreated.password);
-                setError(null);
-              }}
-              style={{
-                padding: "4px 10px",
-                borderRadius: "8px",
-                background: "#fde047",
-                color: "#0f172a",
-                fontWeight: 800,
-                fontSize: "11px",
-                border: "none",
-                cursor: "pointer",
-                flexShrink: 0
-              }}
-              title="Remplir les identifiants de ce compte"
-            >
-              Remplir
-            </button>
-          </div>
-        )}
 
         {/* Error Alert */}
         {error && (

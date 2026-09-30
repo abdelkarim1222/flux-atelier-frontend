@@ -14,6 +14,155 @@
     sans-serif;
 }
 
+/* Rapport imprimable : Rendement Journalier & Moyennes */
+@media print {
+  @page {
+    size: A4 landscape;
+    margin: 10mm;
+  }
+
+  html,
+  body,
+  #root {
+    width: 100% !important;
+    min-height: auto !important;
+    height: auto !important;
+    overflow: visible !important;
+    background: #fff !important;
+  }
+
+  .monitor-topbar,
+  .dashboard-sidebar,
+  .moyennes-print-hide,
+  .fixed {
+    display: none !important;
+  }
+
+  .dashboard-layout,
+  .dashboard-content-area,
+  .moyennes-print-root {
+    display: block !important;
+    width: 100% !important;
+    height: auto !important;
+    min-height: auto !important;
+    overflow: visible !important;
+  }
+
+  .moyennes-print-root {
+    padding: 0 !important;
+    gap: 0 !important;
+    background: #fff !important;
+    color: #172033 !important;
+  }
+
+  .moyennes-print-header {
+    display: flex !important;
+    align-items: flex-start;
+    justify-content: space-between;
+    margin: 0 0 7mm !important;
+    padding: 0 0 4mm !important;
+    border-bottom: 2px solid #1f4e79;
+  }
+
+  .moyennes-print-kicker {
+    margin: 0 0 1mm;
+    color: #1f4e79;
+    font-size: 8pt;
+    font-weight: 800;
+    letter-spacing: .16em;
+  }
+
+  .moyennes-print-header h1 {
+    margin: 0;
+    color: #102a43;
+    font-size: 19pt;
+    font-weight: 800;
+  }
+
+  .moyennes-print-period {
+    margin: 1.5mm 0 0;
+    color: #52677c;
+    font-size: 10pt;
+    font-weight: 600;
+  }
+
+  .moyennes-print-meta {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-end;
+    gap: 1mm;
+    color: #52677c;
+    font-size: 8pt;
+    text-align: right;
+  }
+
+  .moyennes-print-meta strong {
+    color: #1f4e79;
+    font-size: 10pt;
+  }
+
+  .moyennes-print-kpis {
+    margin: 0 0 5mm !important;
+    gap: 3mm !important;
+    break-inside: avoid;
+  }
+
+  .moyennes-print-kpis > div {
+    padding: 3mm !important;
+    border: 1px solid #cbd5e1 !important;
+    border-radius: 2mm !important;
+    box-shadow: none !important;
+  }
+
+  .moyennes-print-content {
+    page-break-inside: avoid;
+    break-inside: avoid;
+  }
+
+  .moyennes-print-table {
+    margin-bottom: 5mm !important;
+    overflow: visible !important;
+    box-shadow: none !important;
+    page-break-inside: avoid;
+    break-inside: avoid;
+  }
+
+  .moyennes-print-table .overflow-x-auto,
+  .moyennes-print-content .overflow-x-auto {
+    overflow: visible !important;
+  }
+
+  .moyennes-print-root .sticky {
+    position: static !important;
+  }
+
+  .moyennes-print-root table {
+    width: 100% !important;
+    font-size: 7pt !important;
+  }
+
+  .moyennes-print-root th,
+  .moyennes-print-root td {
+    padding-top: 1mm !important;
+    padding-bottom: 1mm !important;
+  }
+
+  .moyennes-print-charts {
+    grid-template-columns: repeat(2, minmax(0, 1fr)) !important;
+    gap: 5mm !important;
+  }
+
+  .moyennes-print-charts > div {
+    padding: 4mm !important;
+    border-color: #cbd5e1 !important;
+    box-shadow: none !important;
+  }
+
+  .moyennes-print-charts .h-72 {
+    height: 74mm !important;
+  }
+}
+
 * {
   box-sizing: border-box;
 }
@@ -1525,6 +1674,56 @@ button {
   box-shadow: 0 12px 32px rgba(0, 0, 0, 0.09), 0 2px 8px rgba(0, 0, 0, 0.04);
   pointer-events: auto;
   width: 215px;
+}
+
+.plan-stage .map-toolbar-close-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  border-radius: 8px;
+  border: 1px solid transparent;
+  color: #64748b;
+  background: transparent;
+  cursor: pointer;
+  transition: all 150ms ease;
+  flex-shrink: 0;
+}
+
+.plan-stage .map-toolbar-close-btn:hover {
+  background: #f1f5f9;
+  border-color: #cbd5e1;
+  color: #0f172a;
+}
+
+.plan-stage .map-toolbar-collapsed-btn {
+  position: absolute;
+  top: 14px;
+  left: 16px;
+  z-index: 25;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  background: rgba(255, 255, 255, 0.94);
+  border: 1px solid #cbd5e1;
+  border-radius: 12px;
+  padding: 8px 14px;
+  color: #0f172a;
+  font-size: 12px;
+  font-weight: 800;
+  backdrop-filter: blur(16px);
+  -webkit-backdrop-filter: blur(16px);
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.09);
+  cursor: pointer;
+  transition: all 150ms ease;
+}
+
+.plan-stage .map-toolbar-collapsed-btn:hover {
+  background: #ffffff;
+  border-color: #94a3b8;
+  transform: translateY(-1px);
+  box-shadow: 0 14px 36px rgba(0, 0, 0, 0.12);
 }
 
 .plan-stage .map-toolbar-brand {

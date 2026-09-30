@@ -15,8 +15,8 @@ import {
 } from "lucide-react";
 import {
   ajouterNouveauVin,
-  isGoogleSheetWriteConfigured,
-} from "../services/googleSheets";
+  isDatabaseWriteConfigured,
+} from "../services/database";
 
 interface NouveauVinModalProps {
   isOpen: boolean;
@@ -98,9 +98,9 @@ export default function NouveauVinModal({
       return;
     }
 
-    if (!isGoogleSheetWriteConfigured()) {
+    if (!isDatabaseWriteConfigured()) {
       setError(
-        "L'URL de synchronisation Google Sheets n'est pas configurée dans l'application."
+        "Le serveur PostgreSQL n'est pas disponible. Vérifiez sa configuration puis réessayez."
       );
       return;
     }
@@ -136,7 +136,7 @@ export default function NouveauVinModal({
       setError(
         err instanceof Error
           ? err.message
-          : "Erreur lors de l'enregistrement du VIN dans Google Sheets."
+          : "Erreur lors de l'enregistrement du VIN dans PostgreSQL."
       );
     } finally {
       setLoading(false);
@@ -179,7 +179,7 @@ export default function NouveauVinModal({
                 </span>
               </div>
               <p className="text-xs text-blue-100/80 mt-0.5">
-                Enregistre le véhicule directement dans le tableau VIN de Google Sheets
+                Enregistrer cette fiche VIN dans PostgreSQL
               </p>
             </div>
           </div>

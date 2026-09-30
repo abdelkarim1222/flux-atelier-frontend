@@ -18,11 +18,12 @@ import {
 } from "lucide-react";
 import {
   modifierDossierEntree,
-  isGoogleSheetWriteConfigured,
+  isDatabaseWriteConfigured,
   searchVehicleByVin,
   type VinVehicleInfo,
-} from "../services/googleSheets";
+} from "../services/database";
 import { getAllDestinationTeams } from "../config/teams";
+import { ALL_EMPLACEMENTS, DELIVERED_EMPLACEMENT } from "../services/emplacementService";
 import type { UnifiedReceptionRow } from "./SuiviEntreesTable";
 
 interface ModifierEntreeModalProps {
@@ -152,9 +153,9 @@ export default function ModifierEntreeModal({
       return;
     }
 
-    if (!isGoogleSheetWriteConfigured()) {
+    if (!isDatabaseWriteConfigured()) {
       setError(
-        "L'URL d'écriture Google Sheets n'est pas configurée. Veuillez renseigner VITE_SHEET_WRITE_URL dans la synchronisation."
+        "Le serveur PostgreSQL n'est pas disponible. Vérifiez sa configuration puis réessayez."
       );
       return;
     }
@@ -191,7 +192,7 @@ export default function ModifierEntreeModal({
       setError(
         err instanceof Error
           ? err.message
-          : "Erreur lors de la modification du dossier dans Google Sheets."
+          : "Erreur lors de la modification du dossier dans PostgreSQL."
       );
     } finally {
       setLoading(false);
@@ -234,7 +235,7 @@ export default function ModifierEntreeModal({
                 </span>
               </h3>
               <p className="text-xs text-blue-100/80">
-                Met à jour la ligne dans Google Sheets (Suivi des entrées & Tableaux de chargement)
+                Met à jour la ligne dans PostgreSQL (Suivi des entrées & Tableaux de chargement)
               </p>
             </div>
           </div>
@@ -262,7 +263,7 @@ export default function ModifierEntreeModal({
           {success && (
             <div className="p-3.5 bg-emerald-50 border border-emerald-200 rounded-xl flex items-center gap-3 text-emerald-800 text-xs font-semibold animate-in fade-in">
               <CheckCircle2 className="w-5 h-5 text-emerald-600 shrink-0" />
-              <span>Dossier modifié avec succès dans Google Sheets ! Actualisation...</span>
+              <span>Dossier modifié avec succès dans PostgreSQL ! Actualisation...</span>
             </div>
           )}
 
@@ -524,7 +525,8 @@ export default function ModifierEntreeModal({
                 <div className="relative">
                   <input
                     type="text"
-                    placeholder="ex: L1, D3, J2, S11..."
+                    list="modifier-emplacement-options"
+                    placeholder="ex: D1, J11, E1, S21, L1, P1..."
                     value={formData.emplacement}
                     onChange={(e) =>
                       setFormData((prev) => ({
@@ -534,6 +536,12 @@ export default function ModifierEntreeModal({
                     }
                     className="w-full pl-8 pr-3 py-2 text-xs border border-slate-300 rounded-xl focus:ring-2 focus:ring-blue-500/20 focus:border-blue-500 outline-none transition-all font-mono font-bold"
                   />
+                  <datalist id="modifier-emplacement-options">
+                    <option value={DELIVERED_EMPLACEMENT} />
+                    {ALL_EMPLACEMENTS.map((p) => (
+                      <option key={p} value={p} />
+                    ))}
+                  </datalist>
                   <MapPin className="w-3.5 h-3.5 text-slate-400 absolute left-2.5 top-2.5" />
                 </div>
               </div>

@@ -9,14 +9,15 @@
  */
 
 import type { Flux } from "../data/mockData";
-import type { SuiviEntree } from "./googleSheets";
+import type { SuiviEntree } from "./database";
 import {
   getDemandesAchatLocal,
   getDemandesDevisLocal,
+  getCustomEquipeMembers,
   getReaffectationsLocal,
   getVehicleEssaisLocal,
   getVehicleTransfersLocal,
-} from "./googleSheets";
+} from "./database";
 
 export type TimeStepType =
   | "reception"
@@ -24,6 +25,7 @@ export type TimeStepType =
   | "attente_reparation"
   | "attente_pieces"
   | "attente_devis"
+  | "attente_mecanicien"
   | "reaffectation"
   | "essai"
   | "attente_client"
@@ -36,6 +38,8 @@ export interface VehicleTimeStep {
   label: string;
   dateDebut: string; // "DD/MM/YYYY HH:mm" ou ISO
   dateFin?: string;  // "DD/MM/YYYY HH:mm" ou ISO
+  /** Date/heure annoncée pour la reprise; ne clôture pas l'attente. */
+  datePrevueFin?: string;
   dureeMinutes?: number;
   commentaire?: string;
   automatique?: boolean;
@@ -109,6 +113,18 @@ export interface VehicleTimeCalculation {
 
   // Liste ordonnée de toutes les étapes chronologiques
   steps: VehicleTimeStep[];
+
+  // Demandes d'achat en cours (non livrées) — pour affichage temps réel d'attente
+  achatsEnCours: Array<{
+    id: string;
+    designation: string;
+    ref: string;
+    qt: number;
+    dateDemandeTs: number;   // timestamp ms de la demande
+    dateDemandeStr: string;  // date formatée lisible
+  }>;
+  /** Vrai lorsque l'avancement actuel du véhicule est « Attente PDR ». */
+  isAttentePiecesActive: boolean;
 }
 
 const STORAGE_KEY_TIME_LOGS = "flux_atelier_vehicle_time_logs";
@@ -145,17 +161,17 @@ export function parseDateTimestamp(dateStr?: string): number {
   const str = String(dateStr).trim();
   if (str.includes("1899") || str === "-" || str.toLowerCase() === "na") return 0;
 
-  // Google GVIZ format Date(yyyy,m,d,h,m,s)
-  const gvizMatch = str.match(
+  // Ancien format de date sérialisé Date(yyyy,m,d,h,m,s)
+  const serializedDateMatch = str.match(
     /Date\((\d{4}),\s*(\d{1,2}),\s*(\d{1,2})(?:,\s*(\d{1,2}))?(?:,\s*(\d{1,2}))?(?:,\s*(\d{1,2}))?\)/i
   );
-  if (gvizMatch) {
-    const y = Number(gvizMatch[1]);
-    const m = Number(gvizMatch[2]);
-    const d = Number(gvizMatch[3]);
-    const h = Number(gvizMatch[4] || 0);
-    const min = Number(gvizMatch[5] || 0);
-    const s = Number(gvizMatch[6] || 0);
+  if (serializedDateMatch) {
+    const y = Number(serializedDateMatch[1]);
+    const m = Number(serializedDateMatch[2]);
+    const d = Number(serializedDateMatch[3]);
+    const h = Number(serializedDateMatch[4] || 0);
+    const min = Number(serializedDateMatch[5] || 0);
+    const s = Number(serializedDateMatch[6] || 0);
     if (y <= 1900) return 0;
     return new Date(y, m, d, h, min, s).getTime();
   }
@@ -178,6 +194,65 @@ export function parseDateTimestamp(dateStr?: string): number {
   // ISO standard ou fallback Date.parse
   const parsed = Date.parse(str);
   return isNaN(parsed) ? 0 : parsed;
+}
+
+/**
+ * Calendrier réel de l'atelier. Les minutes hors horaires (pause, nuit et
+ * dimanche) ne doivent jamais gonfler le chronométrage.
+ *
+ * Lun-jeu : 08:00-12:30 / 13:30-17:30 (8 h 30)
+ * Vendredi : 08:00-12:30 / 14:00-17:30 (8 h)
+ * Samedi : 08:00-12:30, seulement pour un technicien autorisé.
+ */
+export function getWorkshopWorkingMillisecondsBetween(
+  startTimestamp: number,
+  endTimestamp: number,
+  worksSaturday = false,
+): number {
+  if (!Number.isFinite(startTimestamp) || !Number.isFinite(endTimestamp) || endTimestamp <= startTimestamp) return 0;
+
+  const start = new Date(startTimestamp);
+  const end = new Date(endTimestamp);
+  let day = new Date(start.getFullYear(), start.getMonth(), start.getDate());
+  const lastDay = new Date(end.getFullYear(), end.getMonth(), end.getDate());
+  let totalMs = 0;
+
+  while (day <= lastDay) {
+    const weekday = day.getDay();
+    const ranges: Array<[number, number]> =
+      weekday >= 1 && weekday <= 4
+        ? [[8 * 60, 12 * 60 + 30], [13 * 60 + 30, 17 * 60 + 30]]
+        : weekday === 5
+          ? [[8 * 60, 12 * 60 + 30], [14 * 60, 17 * 60 + 30]]
+          : weekday === 6 && worksSaturday
+            ? [[8 * 60, 12 * 60 + 30]]
+            : [];
+
+    for (const [fromMinute, toMinute] of ranges) {
+      const rangeStart = new Date(day.getFullYear(), day.getMonth(), day.getDate(), 0, fromMinute).getTime();
+      const rangeEnd = new Date(day.getFullYear(), day.getMonth(), day.getDate(), 0, toMinute).getTime();
+      totalMs += Math.max(0, Math.min(endTimestamp, rangeEnd) - Math.max(startTimestamp, rangeStart));
+    }
+    day.setDate(day.getDate() + 1);
+  }
+  return Math.max(0, totalMs);
+}
+
+export function getWorkshopWorkingMinutesBetween(
+  startTimestamp: number,
+  endTimestamp: number,
+  worksSaturday = false,
+): number {
+  return Math.round(getWorkshopWorkingMillisecondsBetween(startTimestamp, endTimestamp, worksSaturday) / 60000);
+}
+
+function vehicleWorksSaturday(vehicle: Partial<Flux> & Record<string, unknown>): boolean {
+  if (vehicle.travailleSamedi === true || vehicle.worksSaturday === true) return true;
+  const technician = String(vehicle.nomTechnicien || vehicle.technicien || "").trim().toLocaleUpperCase();
+  if (!technician) return false;
+  return (getCustomEquipeMembers() || []).some((member) =>
+    member.travailleSamedi === true && String(member.name || "").trim().toLocaleUpperCase() === technician,
+  );
 }
 
 /**
@@ -303,6 +378,14 @@ export function saveVehicleTimeLog(log: VehicleTimeLog): void {
       updatedAt: Date.now(),
     };
     localStorage.setItem(STORAGE_KEY_TIME_LOGS, JSON.stringify(all));
+    if (typeof window !== 'undefined') {
+      void fetch('/api/data/vehicle_times', {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ...all[key], recordKey: key }),
+      }).catch((error) => console.warn('Enregistrement des temps dans PostgreSQL impossible:', error));
+    }
     window.dispatchEvent(new Event("vehicle_time_tracking_updated"));
   } catch (e) {
     console.warn("Erreur sauvegarde time log:", e);
@@ -336,9 +419,12 @@ export function calculateVehicleTimes(
     etatIntervention?: string;
     dateEntree?: string;
     dateEntreeHeure?: string;
+    dateEntreeReception?: string;
     heureEntree?: string;
     dateDebutRep?: string;
+    datePriseEnChargeEquipe?: string;
     dateFinRep?: string;
+    dateFinReparation?: string;
     heureFin?: string;
     avancement?: string;
   }
@@ -350,6 +436,8 @@ export function calculateVehicleTimes(
   const equipe = vehicle.equipe || "Daily";
   const etat = vehicle.etatIntervention || vehicle.etat || vehicle.statut || "En cours";
   const avancement = vehicle.avancement || "0%";
+  const worksSaturday = vehicleWorksSaturday(vehicle as Partial<Flux> & Record<string, unknown>);
+  const workingMinutes = (from: number, to: number) => getWorkshopWorkingMinutesBetween(from, to, worksSaturday);
 
   const key = normalizeVehicleKey(or !== "-" ? or : chassis);
   const timeLogs = getVehicleTimeLogs();
@@ -358,6 +446,9 @@ export function calculateVehicleTimes(
   // 1. Détermination de la date d'entrée réception
   const dateEntreeRaw =
     customLog?.dateEntreeReception ||
+    // Chronométrie transmet parfois déjà un VehicleTimeCalculation : dans ce
+    // cas la date est stockée sous dateEntreeReception, pas dateEntreeHeure.
+    vehicle.dateEntreeReception ||
     vehicle.dateEntreeHeure ||
     (vehicle.dateEntree && vehicle.heureEntree ? `${vehicle.dateEntree} ${vehicle.heureEntree}`.trim() : vehicle.dateEntree) ||
     vehicle.date ||
@@ -375,9 +466,15 @@ export function calculateVehicleTimes(
     avancement.toLowerCase().includes("attente r") ||
     avancement.toLowerCase() === "attente réparation";
 
+  // Règle atelier : l'avancement « Attente PDR » représente toujours une attente pièces.
+  // Normalisation des espaces pour accepter les valeurs saisies avec des espaces multiples.
+  const normalizedAvancement = avancement.toLowerCase().replace(/\s+/g, " ").trim();
+  const isAttentePdr = normalizedAvancement === "attente pdr";
+
   // 2. Détermination de la date de prise en charge en atelier (entrée équipe)
   let datePriseEnChargeRaw =
     customLog?.datePriseEnChargeEquipe ||
+    vehicle.datePriseEnChargeEquipe ||
     vehicle.dateDebutRep ||
     "";
 
@@ -403,6 +500,7 @@ export function calculateVehicleTimes(
 
   const dateFinRaw =
     customLog?.dateFinReparation ||
+    vehicle.dateFinReparation ||
     (vehicle.dateFinRep && vehicle.heureFin ? `${vehicle.dateFinRep} ${vehicle.heureFin}`.trim() : vehicle.dateFinRep) ||
     "";
 
@@ -438,13 +536,17 @@ export function calculateVehicleTimes(
     tsFinEffective = Math.max(Date.now(), tsEntree);
   }
 
-  // Helper pour matcher le véhicule sur OR, châssis, immatriculation ou vehicleId
+  // OR et châssis sont les identifiants métier. Un id technique peut être
+  // réutilisé par un import, donc il ne doit pas mélanger deux dossiers.
   const matchVehicle = (item: { or?: string; chassis?: string; immatriculation?: string; vehicleId?: any; id?: string }) => {
-    if (vehicle.id && item.vehicleId && String(item.vehicleId) === String(vehicle.id)) return true;
-    if (vehicle.id && item.id && String(item.id) === String(vehicle.id)) return true;
-    if (item.or && normalizeVehicleKey(item.or) === key) return true;
-    if (item.chassis && normalizeVehicleKey(item.chassis) === normalizeVehicleKey(chassis)) return true;
+    const vehicleOr = or !== "-" ? normalizeVehicleKey(or) : "";
+    const vehicleChassis = chassis !== "-" ? normalizeVehicleKey(chassis) : "";
+    const itemOr = normalizeVehicleKey(item.or);
+    const itemChassis = normalizeVehicleKey(item.chassis);
+    if (itemOr) return Boolean(vehicleOr) && itemOr === vehicleOr;
+    if (itemChassis) return Boolean(vehicleChassis) && itemChassis === vehicleChassis;
     if (item.immatriculation && immat && normalizeVehicleKey(item.immatriculation) === normalizeVehicleKey(immat)) return true;
+    if (vehicle.id && item.vehicleId && String(item.vehicleId) === String(vehicle.id)) return true;
     return false;
   };
 
@@ -455,7 +557,10 @@ export function calculateVehicleTimes(
   let totalAttentePiecesMin = 0;
   const piecesSteps: VehicleTimeStep[] = [];
 
-  vehicleAchats.forEach((achat, idx) => {
+  // Une demande d'achat ne devient un temps d'attente que lorsque le Chef d'équipe
+  // choisit explicitement l'avancement « Attente PDR ». Ainsi, une ancienne demande
+  // de pièce ne pénalise pas le travail net d'un véhicule passé en « Attente devis ».
+  if (isAttentePdr) vehicleAchats.forEach((achat, idx) => {
     const tsAchatDemande = parseDateTimestamp(achat.date);
     if (tsAchatDemande > 0) {
       let tsAchatLivre = parseDateTimestamp(achat.dateLivraison);
@@ -469,7 +574,7 @@ export function calculateVehicleTimes(
         tsAchatLivre = adjustDateOnlyTimestamp(tsAchatLivre, tsAchatDemande);
       }
 
-      const diffMin = Math.max(0, Math.round((tsAchatLivre - tsAchatDemande) / (1000 * 60)));
+      const diffMin = workingMinutes(tsAchatDemande, tsAchatLivre);
       totalAttentePiecesMin += diffMin;
 
       piecesSteps.push({
@@ -488,14 +593,11 @@ export function calculateVehicleTimes(
   // Détection automatique si le véhicule est en Attente PDR ou attends acheter sans fiche achat préalable
   if (
     totalAttentePiecesMin === 0 &&
-    (avancement.toLowerCase().includes("pdr") ||
-      avancement.toLowerCase().includes("achet") ||
-      etat.toLowerCase().includes("pdr") ||
-      etat.toLowerCase().includes("achet"))
+    isAttentePdr
   ) {
     const tsModif = parseDateTimestamp(vehicle.dateModification);
     const tsDebutPieces = tsModif > 0 ? tsModif : (tsPriseEnCharge > 0 ? tsPriseEnCharge : (tsEntree > 0 ? tsEntree : Date.now()));
-    const diffMin = Math.max(0, Math.round((tsFinEffective - tsDebutPieces) / (1000 * 60)));
+    const diffMin = workingMinutes(tsDebutPieces, tsFinEffective);
     totalAttentePiecesMin = diffMin;
 
     piecesSteps.push({
@@ -551,7 +653,7 @@ export function calculateVehicleTimes(
         tsDevisAccord = adjustDateOnlyTimestamp(tsDevisAccord, tsDevisDemande);
       }
 
-      const diffMin = Math.max(0, Math.round((tsDevisAccord - tsDevisDemande) / (1000 * 60)));
+      const diffMin = workingMinutes(tsDevisDemande, tsDevisAccord);
       totalAttenteDevisMin += diffMin;
 
       devisSteps.push({
@@ -577,7 +679,7 @@ export function calculateVehicleTimes(
   ) {
     const tsModif = parseDateTimestamp(vehicle.dateModification);
     const tsDebutDevis = tsModif > 0 ? tsModif : (tsPriseEnCharge > 0 ? tsPriseEnCharge : (tsEntree > 0 ? tsEntree : Date.now()));
-    const diffMin = Math.max(0, Math.round((tsFinEffective - tsDebutDevis) / (1000 * 60)));
+    const diffMin = workingMinutes(tsDebutDevis, tsFinEffective);
     totalAttenteDevisMin = diffMin;
 
     devisSteps.push({
@@ -617,7 +719,7 @@ export function calculateVehicleTimes(
         tsFin = adjustDateOnlyTimestamp(tsFin, tsDebut);
       }
 
-      const diffMin = Math.max(0, Math.round((tsFin - tsDebut) / (1000 * 60)));
+      const diffMin = workingMinutes(tsDebut, tsFin);
       totalReaffecteMin += diffMin;
 
       reaffectSteps.push({
@@ -640,7 +742,7 @@ export function calculateVehicleTimes(
   ) {
     const tsModif = parseDateTimestamp(vehicle.dateModification);
     const tsDebutReaff = tsModif > 0 ? tsModif : (tsPriseEnCharge > 0 ? tsPriseEnCharge : (tsEntree > 0 ? tsEntree : Date.now()));
-    const diffMin = Math.max(0, Math.round((tsFinEffective - tsDebutReaff) / (1000 * 60)));
+    const diffMin = workingMinutes(tsDebutReaff, tsFinEffective);
     totalReaffecteMin = diffMin;
 
     reaffectSteps.push({
@@ -662,9 +764,15 @@ export function calculateVehicleTimes(
   let totalEssaiMin = 0;
   const essaiSteps: VehicleTimeStep[] = [];
   const treatedEssaiIds = new Set<string>();
+  const vehicleIsCurrentlyInEssai = avancement.toLowerCase().includes("essai") || etat.toLowerCase().includes("essai");
+  const latestOpenEssaiId = vehicleIsCurrentlyInEssai ? vehicleEssais
+    .filter((essai) => !essai.isTermine)
+    .sort((a, b) => (b.timestampDebut || 0) - (a.timestampDebut || 0))[0]?.id : undefined;
 
   vehicleEssais.forEach((essai, idx) => {
     if (treatedEssaiIds.has(essai.id)) return;
+    if (!essai.isTermine && !vehicleIsCurrentlyInEssai) return;
+    if (!essai.isTermine && latestOpenEssaiId && essai.id !== latestOpenEssaiId) return;
     treatedEssaiIds.add(essai.id);
 
     const tsDebut = essai.timestampDebut || parseDateTimestamp(essai.dateDebut);
@@ -680,7 +788,7 @@ export function calculateVehicleTimes(
         tsFin = adjustDateOnlyTimestamp(tsFin, tsDebut);
       }
 
-      const diffMin = Math.max(0, Math.round((tsFin - tsDebut) / (1000 * 60)));
+      const diffMin = workingMinutes(tsDebut, tsFin);
       totalEssaiMin += diffMin;
 
       essaiSteps.push({
@@ -703,7 +811,7 @@ export function calculateVehicleTimes(
   ) {
     const tsModif = parseDateTimestamp(vehicle.dateModification);
     const tsDebutEssai = tsModif > 0 ? tsModif : (tsPriseEnCharge > 0 ? tsPriseEnCharge : (tsEntree > 0 ? tsEntree : Date.now()));
-    const diffMin = Math.max(0, Math.round((tsFinEffective - tsDebutEssai) / (1000 * 60)));
+    const diffMin = workingMinutes(tsDebutEssai, tsFinEffective);
     totalEssaiMin = diffMin;
 
     essaiSteps.push({
@@ -736,7 +844,7 @@ export function calculateVehicleTimes(
       } else if (!tsFin) {
         tsFin = tsFinEffective;
       }
-      const diffMin = Math.max(0, Math.round((tsFin - tsDebut) / (1000 * 60)));
+      const diffMin = workingMinutes(tsDebut, tsFin);
 
       transferSteps.push({
         id: `transfer-${idx}`,
@@ -754,7 +862,7 @@ export function calculateVehicleTimes(
   if (transferSteps.length === 0 && avancement.toLowerCase().startsWith("vr")) {
     const tsModif = parseDateTimestamp(vehicle.dateModification);
     const tsDebutTransfer = tsModif > 0 ? tsModif : Date.now();
-    const diffMin = Math.max(0, Math.round((tsFinEffective - tsDebutTransfer) / (1000 * 60)));
+    const diffMin = workingMinutes(tsDebutTransfer, tsFinEffective);
     transferSteps.push({
       id: "transfer-active-auto",
       type: "travail",
@@ -773,16 +881,24 @@ export function calculateVehicleTimes(
     customLog.customSteps.forEach((cs) => {
       const tsD = parseDateTimestamp(cs.dateDebut);
       const tsF = cs.dateFin ? parseDateTimestamp(cs.dateFin) : (isTermine ? tsFinEffective : Date.now());
-      const min = cs.dureeMinutes ?? (tsD > 0 && tsF > tsD ? Math.round((tsF - tsD) / 60000) : 0);
+      const min = cs.dureeMinutes ?? (tsD > 0 && tsF > tsD ? workingMinutes(tsD, tsF) : 0);
 
       if (cs.type === "attente_reparation") {
         customAttenteReparationMin += min;
       } else if (cs.type === "attente_pieces") {
-        totalAttentePiecesMin += min;
-        piecesSteps.push({ ...cs, dureeMinutes: min });
+        // Même règle pour l'historique local : il est compté uniquement pendant
+        // l'avancement actif « Attente PDR ».
+        if (isAttentePdr) {
+          totalAttentePiecesMin += min;
+          piecesSteps.push({ ...cs, dureeMinutes: min });
+        }
       } else if (cs.type === "attente_devis") {
         totalAttenteDevisMin += min;
         devisSteps.push({ ...cs, dureeMinutes: min });
+      } else if (cs.type === "attente_mecanicien") {
+        // Une attente déclarée par le mécanicien est une interruption de production.
+        totalReaffecteMin += min;
+        reaffectSteps.push({ ...cs, dureeMinutes: min });
       } else if (cs.type === "reaffectation") {
         totalReaffecteMin += min;
         reaffectSteps.push({ ...cs, dureeMinutes: min });
@@ -800,7 +916,7 @@ export function calculateVehicleTimes(
   if (typeof customLog?.tempsEssaiMin === "number") {
     totalEssaiMin = customLog.tempsEssaiMin;
   }
-  if (typeof customLog?.tempsAttentePiecesMin === "number") {
+  if (isAttentePdr && typeof customLog?.tempsAttentePiecesMin === "number") {
     totalAttentePiecesMin = customLog.tempsAttentePiecesMin;
   }
   if (typeof customLog?.tempsAttenteDevisMin === "number") {
@@ -815,7 +931,7 @@ export function calculateVehicleTimes(
   if (typeof customLog?.tempsPresenceTotalMin === "number" && customLog.tempsPresenceTotalMin > 0) {
     tempsPresenceTotalMin = customLog.tempsPresenceTotalMin;
   } else if (tsEntree > 0) {
-    tempsPresenceTotalMin = Math.max(0, Math.round((tsFinEffective - tsEntree) / (1000 * 60)));
+    tempsPresenceTotalMin = workingMinutes(tsEntree, tsFinEffective);
   }
 
   // B. Attente Réparation (Entrée atelier - Réception, ou tout le séjour si pas encore pris en charge)
@@ -825,7 +941,7 @@ export function calculateVehicleTimes(
   } else if (customAttenteReparationMin > 0) {
     tempsAttenteReparationMin = customAttenteReparationMin;
   } else if (tsEntree > 0 && tsPriseEnCharge > tsEntree) {
-    tempsAttenteReparationMin = Math.round((tsPriseEnCharge - tsEntree) / (1000 * 60));
+    tempsAttenteReparationMin = workingMinutes(tsEntree, tsPriseEnCharge);
   } else if (tsEntree > 0 && (isEnAttenteReparation || !tsPriseEnCharge) && !isTermine) {
     // Le véhicule attend toujours sa prise en charge en atelier
     tempsAttenteReparationMin = tempsPresenceTotalMin;
@@ -981,8 +1097,22 @@ export function calculateVehicleTimes(
     tempsPresenceTotalFormat: formatMinutes(tempsPresenceTotalMin),
 
     steps,
+
+    achatsEnCours: (isAttentePdr ? vehicleAchats : [])
+      .filter((a) => !a.dateLivraison && a.statutAchat !== "Livré" && a.statutAchat !== "Pièce retirée")
+      .map((a, idx) => ({
+        id: a.id || `achat-${idx}`,
+        designation: a.designation || a.ref || "Pièces",
+        ref: a.ref || "",
+        qt: a.qt || 1,
+        dateDemandeTs: parseDateTimestamp(a.date),
+        dateDemandeStr: a.date || "",
+      })),
+    isAttentePiecesActive: isAttentePdr && !isTermine,
   };
 }
+
+export const calculateVehicleTimeStats = calculateVehicleTimes;
 
 /**
  * Enregistre immédiatement l'horodatage exact (DD/MM/YYYY HH:mm) de chaque modification d'avancement
@@ -1050,7 +1180,7 @@ export function recordAvancementStatusChange(
       const tsD = parseDateTimestamp(lastStep.dateDebut);
       const tsF = parseDateTimestamp(nowFormatted);
       if (tsD > 0 && tsF >= tsD) {
-        lastStep.dureeMinutes = Math.round((tsF - tsD) / 60000);
+        lastStep.dureeMinutes = getWorkshopWorkingMinutesBetween(tsD, tsF, vehicleWorksSaturday(vehicle as Partial<Flux> & Record<string, unknown>));
       }
     }
   }

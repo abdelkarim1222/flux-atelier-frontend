@@ -6,6 +6,7 @@ import {
   ChevronLeft,
   CircleGauge,
   ClipboardList,
+  Database,
   Clock,
   Gauge,
   LogOut,
@@ -47,14 +48,19 @@ import {
 
 import { atelierMapSvg } from "../components/atelierMapMarkup";
 import SuiviEntreesTable from "../components/SuiviEntreesTable";
+import VehicleInventoryView from "../components/VehicleInventoryView";
 import GestionAccesView from "../components/GestionAccesView";
 import GestionEquipesView from "../components/GestionEquipesView";
 import MoyennesView from "../components/MoyennesView";
 import EssaiView from "../components/EssaiView";
 import AcheterView from "../components/AcheterView";
 import DetailVehiculeModal from "../components/DetailVehiculeModal";
-import AffecterTechnicienModal, { getActiveVehicleForTech } from "../components/AffecterTechnicienModal";
 import DemandeAchatModal from "../components/DemandeAchatModal";
+import AffecterTechnicienModal, {
+  getActiveVehicleForTech,
+  isVehicleFinished,
+  isVehicleActivelyOccupyingTech,
+} from "../components/AffecterTechnicienModal";
 import DemandeDevisModal from "../components/DemandeDevisModal";
 import DevisView, { isDevisDepassee24h } from "../components/DevisView";
 import SuiviTempsView from "../components/SuiviTempsView";
@@ -72,21 +78,24 @@ import {
   fetchEquipeSheetData,
   getCustomEquipeMembers,
   normalizePersonName,
-  fetchGoogleSheetFluxData,
+  fetchDatabaseFluxData,
+  fetchSuiviEntreesData,
   synchroniserTableauxDeChargement,
   getTeamForChefEquipe,
-  isGoogleSheetWriteConfigured,
+  isDatabaseWriteConfigured,
   isSheetEmplacementOutsideMap,
   normalizeSheetEmplacement,
-  updateGoogleSheetEtat,
-  updateGoogleSheetTechnicien,
-  updateGoogleSheetAvancement,
-  updateGoogleSheetEmplacement,
+  updateDatabaseEtat,
+  updateDatabaseTechnicien,
+  updateDatabaseAvancement,
+  updateDatabaseEmplacement,
   getAvancementOptionsForTeam,
   saveDemandeAchatLocal,
+  getDemandesAchatLocal,
   marquerDemandeAchatLivree,
+  marquerDemandeAchatAccepteeParEquipe,
   marquerDemandeAchatAttente,
-  updateGoogleSheetStatutAchat,
+  updateDatabaseStatutAchat,
   type DemandeAchat,
   saveEssaiControleLocal,
   saveDemandeDevisLocal,
@@ -95,7 +104,7 @@ import {
   marquerDevisAccepte,
   marquerDevisRefuse,
   marquerDevisRelance,
-  updateGoogleSheetStatutDevis,
+  updateDatabaseStatutDevis,
   type DemandeDevis,
   type ReaffectationRecord,
   getReaffectationsLocal,
@@ -105,23 +114,36 @@ import {
   getDevisAccordNotifications,
   saveDevisAccordNotification,
   removeDevisAccordNotification,
-  VEHICLE_SHEET_URL,
+  type NouvelleEntreeNotification,
+  getNouvelleEntreeNotifications,
+  accepterEntreeParChefEquipe,
+  removeNouvelleEntreeNotification,
   type EquipeSheetResult,
   mergeRecentAddedVehicles,
   getNowFormatted,
   marquerDebutTransfertVR,
+  marquerTransfertAccepte,
+  getTeamFromVr,
   marquerDebutEssai,
   marquerFinEssai,
-} from "../services/googleSheets";
+} from "../services/database";
 import {
   recordAvancementStatusChange,
   saveVehicleTimeLog,
 } from "../services/timeTracking";
 import type { EssaiValidationPayload } from "../components/ValidationEssaiModal";
 import { normalizeTeamName, isVehicleMatchingTeam } from "../config/teams";
+import {
+  calculerEmplacementAutomatique,
+  ALL_EMPLACEMENTS,
+  DELIVERED_EMPLACEMENT as AUTO_DELIVERED_EMPLACEMENT,
+  FULL_PARKING_EMPLACEMENT,
+  getZoneForEmplacement,
+  normalizeEmplacementCode,
+} from "../services/emplacementService";
 
 type StatusFilter = "Tous" | "Attentes" | WorkshopStatus;
-type SheetStatus = "loading" | "ready" | "fallback";
+type DatabaseStatus = "loading" | "ready" | "fallback";
 const ALL_DATES = "Toutes";
 const atelierMapDisplaySvg = atelierMapSvg;
 
@@ -154,9 +176,13 @@ const mapZoneIds = new Set(
   )
 );
 
-const editableMapZoneIds = Array.from(mapZoneIds)
-  .filter((zone) => /^[A-Z]+\d+$/.test(zone))
-  .sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
+const editableMapZoneIds = Array.from(
+  new Set([
+    AUTO_DELIVERED_EMPLACEMENT,
+    ...ALL_EMPLACEMENTS,
+    ...Array.from(mapZoneIds).filter((zone) => /^[A-Z]+\d+$/.test(zone)),
+  ])
+);
 
 function removeDraft(
   drafts: Record<number, string>,
@@ -378,17 +404,17 @@ function normalizeDateLabel(value: string | undefined) {
   return String(value ?? "").trim().replace(/\s+/g, " ");
 }
 
-function parseSheetDate(value: string | undefined) {
+function parseStoredDate(value: string | undefined) {
   const text = normalizeDateLabel(value);
-  const gvizDate = text.match(
+  const serializedDate = text.match(
     /^Date\((\d{4}),\s*(\d{1,2}),\s*(\d{1,2})/
   );
 
-  if (gvizDate) {
+  if (serializedDate) {
     return new Date(
-      Number(gvizDate[1]),
-      Number(gvizDate[2]),
-      Number(gvizDate[3])
+      Number(serializedDate[1]),
+      Number(serializedDate[2]),
+      Number(serializedDate[3])
     ).getTime();
   }
 
@@ -422,6 +448,19 @@ function parseSheetDate(value: string | undefined) {
 
 function getStatusColor(status: WorkshopStatus) {
   return statusLookup.get(status)?.color ?? "#64748b";
+}
+
+/** Couleurs stables des postes libres : elles ne disparaissent pas après le chargement. */
+function getFreeEmplacementStyle(zone: string): { fill: string; stroke: string } {
+  const prefix = zone.charAt(0).toUpperCase();
+  if (prefix === "D") return { fill: "#dbeafe", stroke: "#60a5fa" };
+  if (prefix === "J") return { fill: "#dcfce7", stroke: "#34d399" };
+  if (prefix === "E") return { fill: "#f3e8ff", stroke: "#c084fc" };
+  if (prefix === "S") return { fill: "#d1fae5", stroke: "#34d399" };
+  if (prefix === "C") return { fill: "#fae8ff", stroke: "#d946ef" };
+  if (prefix === "T" || prefix === "M") return { fill: "#e0f2fe", stroke: "#38bdf8" };
+  if (prefix === "L") return { fill: "#ffedd5", stroke: "#fb923c" };
+  return { fill: "#f1f5f9", stroke: "#94a3b8" };
 }
 
 function badgeStyle(status: WorkshopStatus): CSSProperties {
@@ -476,7 +515,7 @@ function MetricCard({
 export default function Dashboard() {
   const { currentUser, logout } = useAuth();
   const { role, roleInfo, permissions } = useRole();
-  type TabType = "chargement" | "en_cours" | "essai" | "attente_achat" | "devis" | "plan_atelier" | "suivi_entrees" | "suivi_temps" | "gestion_acces" | "gestion_equipes" | "moyennes";
+  type TabType = "chargement" | "en_cours" | "essai" | "attente_achat" | "devis" | "plan_atelier" | "suivi_entrees" | "suivi_temps" | "gestion_acces" | "gestion_equipes" | "moyennes" | "vehicle_inventory";
 
   const [activeTab, setActiveTabState] = useState<TabType>(() => {
     try {
@@ -494,7 +533,8 @@ export default function Dashboard() {
         saved === "suivi_temps" ||
         saved === "gestion_acces" ||
         saved === "gestion_equipes" ||
-        saved === "moyennes"
+        saved === "moyennes" ||
+        saved === "vehicle_inventory"
       ) {
         // Sécurité sur les onglets restreints
         if (
@@ -507,10 +547,11 @@ export default function Dashboard() {
         }
         if (
           role === "chef_equipe" &&
-          (saved === "attente_achat" || saved === "devis" || saved === "suivi_temps")
+          (saved === "attente_achat" || saved === "devis" || saved === "suivi_temps" || saved === "vehicle_inventory")
         ) {
           return "chargement";
         }
+        if (role === "reception" && saved === "vehicle_inventory") return "suivi_entrees";
         return saved;
       }
     } catch { }
@@ -519,20 +560,21 @@ export default function Dashboard() {
 
   const setActiveTab = useCallback(
     (tab: TabType) => {
-      // Sécurité : la réception ne peut pas consulter Attente Achat, Essai ou Suivi Temps (Devis est autorisé)
+      // Sécurité : la réception ne peut pas consulter Attente Achat, Essai, Suivi Temps ou Parc véhicules
       if (
         role === "reception" &&
         (tab === "attente_achat" ||
           tab === "essai" ||
-          tab === "suivi_temps")
+          tab === "suivi_temps" ||
+          tab === "vehicle_inventory")
       ) {
         setActiveTabState("suivi_entrees");
         return;
       }
-      // Sécurité : le chef d'équipe ne peut pas consulter Attente Achat, Devis ou Suivi Temps
+      // Sécurité : le chef d'équipe ne peut pas consulter Attente Achat, Devis, Suivi Temps ou Parc véhicules
       if (
         role === "chef_equipe" &&
-        (tab === "attente_achat" || tab === "devis" || tab === "suivi_temps")
+        (tab === "attente_achat" || tab === "devis" || tab === "suivi_temps" || tab === "vehicle_inventory")
       ) {
         setActiveTabState("chargement");
         return;
@@ -562,14 +604,15 @@ export default function Dashboard() {
       role === "reception" &&
       (activeTab === "attente_achat" ||
         activeTab === "essai" ||
-        activeTab === "suivi_temps")
+        activeTab === "suivi_temps" ||
+        activeTab === "vehicle_inventory")
     ) {
       setActiveTab("suivi_entrees");
       return;
     }
     if (
       role === "chef_equipe" &&
-      (activeTab === "attente_achat" || activeTab === "devis" || activeTab === "suivi_temps")
+      (activeTab === "attente_achat" || activeTab === "devis" || activeTab === "suivi_temps" || activeTab === "vehicle_inventory")
     ) {
       setActiveTab("chargement");
       return;
@@ -632,9 +675,9 @@ export default function Dashboard() {
   const [isDetailPinned, setIsDetailPinned] = useState(false);
   const [vehiculeModalData, setVehiculeModalData] = useState<Flux | null>(null);
   const [vehicles, setVehicles] = useState<Flux[]>(fluxData);
-  const [sheetStatus, setSheetStatus] =
-    useState<SheetStatus>("loading");
-  const [sheetError, setSheetError] = useState("");
+  const [databaseStatus, setDatabaseStatus] =
+    useState<DatabaseStatus>("loading");
+  const [databaseError, setDatabaseError] = useState("");
   const [lastRefresh, setLastRefresh] = useState("26/03/2026 08:57");
   const [search, setSearch] = useState("");
   const [dateFilter, setDateFilter] = useState(ALL_DATES);
@@ -643,17 +686,25 @@ export default function Dashboard() {
   const [writeNotice, setWriteNotice] = useState("");
   const [writeError, setWriteError] = useState("");
   const [showStatusDashboard, setShowStatusDashboard] = useState(false);
-  const canWriteToSheet = isGoogleSheetWriteConfigured();
+  const [showMapLegend, setShowMapLegend] = useState(true);
+  const canWriteToDatabase = isDatabaseWriteConfigured();
 
   const [equipeData, setEquipeData] = useState<EquipeSheetResult | null>(null);
   const [pendingEnCoursVehicle, setPendingEnCoursVehicle] = useState<Flux | null>(null);
+  const [repriseChooserVehicle, setRepriseChooserVehicle] = useState<Flux | null>(null);
   const [pendingAchatVehicle, setPendingAchatVehicle] = useState<Flux | null>(null);
   const [pendingDevisVehicle, setPendingDevisVehicle] = useState<Flux | null>(null);
   const [demandesDevisMap, setDemandesDevisMap] = useState<Record<string, DemandeDevis>>(getDemandesDevisLocal);
   const [reaffectationsMap, setReaffectationsMap] = useState<Record<string, ReaffectationRecord>>(getReaffectationsLocal);
   const [devisAccordNotifications, setDevisAccordNotifications] = useState<DevisAccordNotification[]>(getDevisAccordNotifications);
+  const [nouvelleEntreeNotifications, setNouvelleEntreeNotifications] = useState<NouvelleEntreeNotification[]>(getNouvelleEntreeNotifications);
+  const [dismissedEntreeNotifIds, setDismissedEntreeNotifIds] = useState<Set<string>>(new Set());
+  const [dismissedReadyNotifIds, setDismissedReadyNotifIds] = useState<Set<number>>(new Set());
   const [deliveredAchatNotifications, setDeliveredAchatNotifications] = useState<
     Array<{ vehicle: Flux; demande: DemandeAchat; timestamp: string }>
+  >([]);
+  const [returnedEssaiNotifications, setReturnedEssaiNotifications] = useState<
+    Array<{ vehicle: Flux; equipe: string; timestamp: string }>
   >([]);
 
   useEffect(() => {
@@ -666,21 +717,52 @@ export default function Dashboard() {
     const handleDevisAccordUpdate = () => {
       setDevisAccordNotifications(getDevisAccordNotifications());
     };
+    const handleNouvelleEntreeNotifUpdate = () => {
+      setNouvelleEntreeNotifications(getNouvelleEntreeNotifications());
+    };
     window.addEventListener("demandes_devis_updated", handleDevisUpdate);
     window.addEventListener("reaffectations_updated", handleReaffectationUpdate);
     window.addEventListener("devis_accord_updated", handleDevisAccordUpdate);
+    window.addEventListener("nouvelle_entree_notification_updated", handleNouvelleEntreeNotifUpdate);
     window.addEventListener("storage", handleDevisUpdate);
     window.addEventListener("storage", handleReaffectationUpdate);
     window.addEventListener("storage", handleDevisAccordUpdate);
+    window.addEventListener("storage", handleNouvelleEntreeNotifUpdate);
     return () => {
       window.removeEventListener("demandes_devis_updated", handleDevisUpdate);
       window.removeEventListener("reaffectations_updated", handleReaffectationUpdate);
       window.removeEventListener("devis_accord_updated", handleDevisAccordUpdate);
+      window.removeEventListener("nouvelle_entree_notification_updated", handleNouvelleEntreeNotifUpdate);
       window.removeEventListener("storage", handleDevisUpdate);
       window.removeEventListener("storage", handleReaffectationUpdate);
       window.removeEventListener("storage", handleDevisAccordUpdate);
+      window.removeEventListener("storage", handleNouvelleEntreeNotifUpdate);
     };
   }, []);
+
+  // Une livraison est persistée avec la demande : l'équipe qui l'a créée reçoit
+  // donc encore la notification après une actualisation ou une nouvelle connexion.
+  useEffect(() => {
+    const delivered = Object.values(getDemandesAchatLocal())
+      .filter((demande) => demande.statutAchat === "Livré" && !demande.dateAcceptationEquipe)
+      .map((demande) => {
+        const vehicle = vehicles.find((item) =>
+          (demande.vehicleId && String(item.id) === String(demande.vehicleId)) ||
+          (demande.or && [item.no, item.ordre].filter(Boolean).some((key) => key === demande.or)) ||
+          (demande.chassis && item.chassis === demande.chassis)
+        );
+        return vehicle && demande.dateLivraison
+          ? { vehicle, demande, timestamp: demande.dateLivraison.split(" ").slice(-1)[0] || demande.dateLivraison }
+          : null;
+      })
+      .filter((item): item is { vehicle: Flux; demande: DemandeAchat; timestamp: string } => Boolean(item));
+
+    setDeliveredAchatNotifications((previous) => {
+      const previousKeys = new Set(previous.map((item) => String(item.vehicle.id)));
+      const missing = delivered.filter((item) => !previousKeys.has(String(item.vehicle.id)));
+      return missing.length > 0 ? [...previous, ...missing] : previous;
+    });
+  }, [vehicles]);
 
   const getReaffectationForVehicle = useCallback(
     (v: Flux): ReaffectationRecord | undefined => {
@@ -846,26 +928,81 @@ export default function Dashboard() {
 
   const loadVehicles = useCallback(async (silent = false) => {
     if (!silent) {
-      setSheetStatus("loading");
+      setDatabaseStatus("loading");
     }
     setDraftEmplacements({});
     setWriteError("");
     setWriteNotice("");
 
     try {
-      const rows = await fetchGoogleSheetFluxData();
-      const mergedRows = mergeRecentAddedVehicles(rows);
+      const [rows, entrees] = await Promise.all([
+        fetchDatabaseFluxData(),
+        fetchSuiviEntreesData().catch(() => []),
+      ]);
+      // Le plan reprend aussi les emplacements saisis dans le suivi des entrées.
+      // Une ligne du flux reste prioritaire pour l'état, le technicien et les
+      // autres données de travail ; l'emplacement du suivi complète les lignes
+      // historiques qui ne sont pas encore présentes dans le tableau Flux.
+      const rowsByKey = new Map<string, Flux>();
+      rows.forEach((row) => {
+        [row.ordre, row.no, row.chassis].filter(Boolean).forEach((key) =>
+          rowsByKey.set(String(key).trim().toUpperCase(), row)
+        );
+      });
+      const withReceptionLocations = [...rows];
+      entrees.forEach((entree) => {
+        const emplacement = normalizeSheetEmplacement(entree.emplacement || "");
+        if (isSheetEmplacementOutsideMap(emplacement)) return;
+        const existing = [entree.noOr, entree.chassis]
+          .map((key) => rowsByKey.get(String(key || "").trim().toUpperCase()))
+          .find(Boolean);
+        if (existing) {
+          existing.emplacement = emplacement;
+          return;
+        }
+        withReceptionLocations.push({
+          id: Number(entree.id) || Date.now(),
+          ordre: entree.noOr || "-",
+          no: entree.noOr || "-",
+          chassis: entree.chassis || "-",
+          immatriculation: entree.immatriculation || "-",
+          marque: entree.marque || "-",
+          modele: entree.modele || "-",
+          modelePowerBI: entree.modele || "-",
+          atelier: entree.categorie || "-",
+          operation: "Entrée atelier",
+          statut: (entree.etat || "En attente") as WorkshopStatus,
+          etatIntervention: (entree.etat || "En attente") as WorkshopStatus,
+          montant: 0,
+          temps: 0,
+          nbIntervention: 0,
+          client: entree.nomClient || "Client non spécifié",
+          categorie: entree.categorie || "-",
+          date: entree.dateEntreeHeure || "",
+          dateEntree: entree.dateEntreeHeure || "",
+          equipe: entree.equipe || "-",
+          technicien: entree.technicien || "-",
+          nomTechnicien: entree.nomTechnicien || "-",
+          avancement: entree.avancement || "-",
+          dateDebutRep: entree.dateDebutRep || "",
+          dateFinRep: entree.dateFinRep || "",
+          emplacement,
+          serie: entree.immatriculation || "-",
+          cs: entree.cs || "-",
+        });
+      });
+      const mergedRows = mergeRecentAddedVehicles(withReceptionLocations);
       setVehicles(mergedRows);
-      setSheetStatus("ready");
-      setSheetError("");
+      setDatabaseStatus("ready");
+      setDatabaseError("");
     } catch (error) {
       if (!silent) {
         setVehicles(mergeRecentAddedVehicles(fluxData));
-        setSheetStatus("fallback");
-        setSheetError(
+        setDatabaseStatus("fallback");
+        setDatabaseError(
           error instanceof Error
             ? error.message
-            : "Impossible de lire Google Sheets."
+            : "Impossible de lire PostgreSQL."
         );
       }
     } finally {
@@ -935,8 +1072,8 @@ export default function Dashboard() {
       }
       const res = await synchroniserTableauxDeChargement();
       setVehicles(res.rows);
-      setSheetStatus("ready");
-      setSheetError("");
+      setDatabaseStatus("ready");
+      setDatabaseError("");
       setWriteNotice(
         `Tableaux de chargement actualisé à l'instant : ${res.count} véhicules chargés en direct.`
       );
@@ -966,6 +1103,22 @@ export default function Dashboard() {
         return;
       }
 
+      const locationCanBeOccupied = nextEmplacement !== "NA" &&
+        nextEmplacement !== AUTO_DELIVERED_EMPLACEMENT &&
+        nextEmplacement !== FULL_PARKING_EMPLACEMENT;
+      const occupiedBy = locationCanBeOccupied
+        ? vehicles.find((vehicle) => {
+            if (vehicle.id === row.id) return false;
+            if (normalizeEmplacementCode(vehicle.emplacement || "") !== normalizeEmplacementCode(nextEmplacement)) return false;
+            const status = `${vehicle.etatIntervention || ""} ${vehicle.avancement || ""}`.toLowerCase();
+            return !status.includes("livr");
+          })
+        : undefined;
+      if (occupiedBy) {
+        setWriteError(`L'emplacement ${nextEmplacement} est déjà occupé par le véhicule ${occupiedBy.no || occupiedBy.ordre || occupiedBy.chassis}.`);
+        return;
+      }
+
       const previousEmplacement = row.emplacement;
 
       setWriteNotice("");
@@ -981,21 +1134,21 @@ export default function Dashboard() {
       setSelectedVehicleId(row.id);
       setSelectedZone(nextEmplacement);
 
-      if (!canWriteToSheet) {
+      if (!canWriteToDatabase) {
         setSavingVehicleId(null);
         setDraftEmplacements((current) => removeDraft(current, row.id));
         setWriteError(
-          "Emplacement modifié dans l'app seulement. Pour modifier aussi Google Sheets, crée le déploiement Apps Script puis ajoute VITE_SHEET_WRITE_URL dans .env.local."
+          "L'enregistrement de l'emplacement a échoué. Vérifiez que l'API PostgreSQL est disponible puis réessayez."
         );
         return;
       }
 
       try {
-        await updateGoogleSheetEmplacement(row, nextEmplacement);
+        await updateDatabaseEmplacement(row, nextEmplacement);
         setDraftEmplacements((current) => removeDraft(current, row.id));
         setLastRefresh(formatRefreshDate());
-        setSheetStatus("ready");
-        setSheetError("");
+        setDatabaseStatus("ready");
+        setDatabaseError("");
         setWriteNotice(
           `Emplacement ${row.serie || row.no} mis à jour: ${previousEmplacement} -> ${nextEmplacement}.`
         );
@@ -1012,7 +1165,7 @@ export default function Dashboard() {
         setWriteError(
           error instanceof Error
             ? error.message
-            : "Impossible d'enregistrer l'emplacement dans Google Sheets."
+            : "Impossible d'enregistrer l'emplacement dans PostgreSQL."
         );
       } finally {
         setSavingVehicleId((current) =>
@@ -1020,7 +1173,7 @@ export default function Dashboard() {
         );
       }
     },
-    [canWriteToSheet, permissions.canEditEmplacement]
+    [canWriteToDatabase, permissions.canEditEmplacement, vehicles]
   );
 
   const saveVehicleEtat = useCallback(
@@ -1036,13 +1189,21 @@ export default function Dashboard() {
       const previousEmplacement = row.emplacement;
       const previousEquipe = row.equipe;
       const isDelivered = formatStatusLabel(nextEtat) === "Livré";
-      const nextEmplacement = isDelivered
-        ? DELIVERED_EMPLACEMENT
-        : row.emplacement;
 
       // Si passage à "En cours", on affecte automatiquement l'équipe du Chef d'Équipe actif
       const isGoingToEnCours = nextEtat === "En cours";
       const assignedTeam = isGoingToEnCours ? activeChefEquipeTeam : row.equipe;
+
+      // Calcul automatique de l'emplacement selon l'état et l'équipe active
+      const computedVehicle: Partial<Flux> = {
+        ...row,
+        etatIntervention: nextEtat,
+        statut: nextEtat,
+        equipe: (isGoingToEnCours && assignedTeam ? assignedTeam : row.equipe) || "Daily",
+      };
+      const nextEmplacement = isDelivered
+        ? DELIVERED_EMPLACEMENT
+        : calculerEmplacementAutomatique(computedVehicle, vehicles, row.id);
 
       setWriteNotice("");
       setWriteError("");
@@ -1063,29 +1224,34 @@ export default function Dashboard() {
       setSelectedVehicleId(row.id);
       setSelectedZone(isDelivered ? null : nextEmplacement);
 
-      if (!canWriteToSheet) {
+      if (!canWriteToDatabase) {
         setSavingVehicleId(null);
         setWriteError(
-          "Etat et équipe modifiés dans l'application. Déployez le script Apps Script pour enregistrer directement dans Google Sheets."
+          "La mise à jour n'a pas été enregistrée dans PostgreSQL. Vérifiez la connexion à la base puis réessayez."
         );
         return;
       }
 
       try {
-        await updateGoogleSheetEtat(
+        await updateDatabaseEtat(
           row,
           nextEtat,
-          isGoingToEnCours ? assignedTeam : undefined
+          isGoingToEnCours ? assignedTeam : undefined,
+          undefined,
+          undefined,
+          undefined,
+          undefined,
+          nextEmplacement
         );
         setLastRefresh(formatRefreshDate());
-        setSheetStatus("ready");
-        setSheetError("");
+        setDatabaseStatus("ready");
+        setDatabaseError("");
         setWriteNotice(
           isDelivered
             ? `Etat ${row.serie || row.no} mis à jour: ${formatStatusLabel(previousEtat)} -> Livré. Emplacement: ${DELIVERED_EMPLACEMENT}.`
             : isGoingToEnCours
-              ? `Véhicule ${row.serie || row.no} passé en cours. Équipe affectée automatiquement : ${assignedTeam}.`
-              : `Etat ${row.serie || row.no} mis à jour: ${formatStatusLabel(previousEtat)} -> ${formatStatusLabel(nextEtat)}.`
+              ? `Véhicule ${row.serie || row.no} passé en cours (${nextEmplacement}). Équipe affectée : ${assignedTeam}.`
+              : `Etat ${row.serie || row.no} mis à jour: ${formatStatusLabel(previousEtat)} -> ${formatStatusLabel(nextEtat)} (${nextEmplacement}).`
         );
       } catch (error) {
         setVehicles((current) =>
@@ -1105,7 +1271,7 @@ export default function Dashboard() {
         setWriteError(
           error instanceof Error
             ? error.message
-            : "Impossible d'enregistrer l'état dans Google Sheets."
+            : "Impossible d'enregistrer l'état dans PostgreSQL."
         );
       } finally {
         setSavingVehicleId((current) =>
@@ -1113,7 +1279,7 @@ export default function Dashboard() {
         );
       }
     },
-    [canWriteToSheet, permissions.canEditEtat, activeChefEquipeTeam]
+    [canWriteToDatabase, permissions.canEditEtat, activeChefEquipeTeam, vehicles]
   );
 
   const saveVehicleEtatWithTech = useCallback(
@@ -1132,50 +1298,133 @@ export default function Dashboard() {
       const previousTech = row.technicien;
       const previousNomTech = row.nomTechnicien;
 
+      // Avancement initialisé à "En cours - 10%" dès le début de prise en charge
+      const nextAvancement =
+        (!row.avancement || row.avancement === "-" || row.avancement === "NA" || row.avancement.toLowerCase().includes("attente"))
+          ? "En cours - 10%"
+          : row.avancement;
+
+      const now = new Date();
+      const dd = String(now.getDate()).padStart(2, "0");
+      const mm = String(now.getMonth() + 1).padStart(2, "0");
+      const yyyy = now.getFullYear();
+      const hh = String(now.getHours()).padStart(2, "0");
+      const min = String(now.getMinutes()).padStart(2, "0");
+      const ss = String(now.getSeconds()).padStart(2, "0");
+      const currentDateTime = `${dd}/${mm}/${yyyy} ${hh}:${min}:${ss}`;
+      const currentTime = `${hh}:${min}:${ss}`;
+      const dateDebut = row.dateDebutRep || row.dateDebutTravail || currentDateTime;
+      const heureDebut = row.heureDebutTravail || currentTime;
+
+      // Calcul automatique de l'emplacement atelier selon l'équipe responsable
+      const computedVehicle: Partial<Flux> = {
+        ...row,
+        etatIntervention: nextEtat,
+        statut: nextEtat,
+        avancement: nextAvancement,
+        equipe: assignedTeam || row.equipe,
+        technicien: technicien !== "-" ? technicien : row.technicien,
+        nomTechnicien: nomTechnicien !== "-" ? nomTechnicien : row.nomTechnicien,
+        dateDebutRep: dateDebut,
+        dateDebutTravail: dateDebut,
+        heureDebutTravail: heureDebut,
+        statutAcceptation: "accepte",
+        dateAcceptation: row.dateAcceptation || currentDateTime,
+      };
+      const nextEmplacement = calculerEmplacementAutomatique(computedVehicle, vehicles, row.id);
+
       setWriteNotice("");
       setWriteError("");
       setSavingVehicleId(row.id);
 
-      setVehicles((current) =>
-        current.map((item) =>
-          item.id === row.id
-            ? {
-              ...item,
-              etatIntervention: nextEtat,
-              statut: nextEtat,
-              equipe: assignedTeam,
-              technicien: technicien !== "-" ? technicien : item.technicien,
-              nomTechnicien: nomTechnicien !== "-" ? nomTechnicien : item.nomTechnicien,
-            }
-            : item
-        )
-      );
-      setSelectedVehicleId(row.id);
+      setVehicles((current) => {
+        let matched = false;
+        const updated = current.map((item) => {
+          const isTarget =
+            (row.id && item.id === row.id) ||
+            (row.id && String(item.id) === String(row.id)) ||
+            (row.no && (item.no === row.no || item.ordre === row.no)) ||
+            (row.ordre && (item.no === row.ordre || item.ordre === row.ordre)) ||
+            (row.chassis && item.chassis && item.chassis.trim().toUpperCase() === row.chassis.trim().toUpperCase());
 
-      if (!canWriteToSheet) {
+          if (!isTarget) return item;
+          matched = true;
+
+          return {
+            ...item,
+            etatIntervention: nextEtat,
+            statut: nextEtat,
+            avancement: nextAvancement,
+            equipe: assignedTeam,
+            emplacement: nextEmplacement,
+            technicien: technicien && technicien !== "-" ? technicien : item.technicien,
+            nomTechnicien: nomTechnicien && nomTechnicien !== "-" ? nomTechnicien : item.nomTechnicien,
+            dateDebutRep: item.dateDebutRep || dateDebut,
+            dateDebutTravail: item.dateDebutTravail || dateDebut,
+            heureDebutTravail: item.heureDebutTravail || heureDebut,
+            statutAcceptation: "accepte" as const,
+            dateAcceptation: item.dateAcceptation || currentDateTime,
+          };
+        });
+
+        if (matched) return updated;
+        return [
+          {
+            ...row,
+            etatIntervention: nextEtat,
+            statut: nextEtat,
+            avancement: nextAvancement,
+            equipe: assignedTeam,
+            emplacement: nextEmplacement,
+            technicien: technicien && technicien !== "-" ? technicien : row.technicien,
+            nomTechnicien: nomTechnicien && nomTechnicien !== "-" ? nomTechnicien : row.nomTechnicien,
+            dateDebutRep: row.dateDebutRep || dateDebut,
+            dateDebutTravail: row.dateDebutTravail || dateDebut,
+            heureDebutTravail: row.heureDebutTravail || heureDebut,
+            statutAcceptation: "accepte" as const,
+            dateAcceptation: row.dateAcceptation || currentDateTime,
+          },
+          ...current,
+        ];
+      });
+      setSelectedVehicleId(row.id);
+      setSelectedZone(nextEmplacement);
+
+      // Si une notification d'entrée était active pour ce véhicule, la retirer
+      const matchingNotif = nouvelleEntreeNotifications.find(
+        (n) => (n.noOr && (n.noOr === row.no || n.noOr === row.ordre)) || (n.chassis && n.chassis === row.chassis)
+      );
+      if (matchingNotif) {
+        removeNouvelleEntreeNotification(matchingNotif.id);
+      }
+
+      if (!canWriteToDatabase) {
         setSavingVehicleId(null);
         setWriteNotice(
-          `Véhicule ${row.serie || row.no} passé en cours. Équipe : ${assignedTeam}${technicien && technicien !== "-" ? ` • Technicien : [${technicien}] ${nomTechnicien}` : ""
+          `Véhicule ${row.serie || row.no} passé en cours (${nextEmplacement} - ${nextAvancement} - Début : ${dateDebut}). Équipe : ${assignedTeam}${technicien && technicien !== "-" ? ` • Technicien : [${technicien}] ${nomTechnicien}` : ""
           }.`
         );
         return;
       }
 
       try {
-        await updateGoogleSheetEtat(
+        await updateDatabaseEtat(
           row,
           nextEtat,
           assignedTeam,
           technicien !== "-" ? technicien : undefined,
           nomTechnicien !== "-" ? nomTechnicien : undefined,
           poste !== "-" ? poste : undefined,
-          row.bloc
+          row.bloc,
+          nextEmplacement,
+          nextAvancement,
+          dateDebut
         );
         setLastRefresh(formatRefreshDate());
-        setSheetStatus("ready");
-        setSheetError("");
+        setDatabaseStatus("ready");
+        setDatabaseError("");
         setWriteNotice(
-          `Véhicule ${row.serie || row.no} passé en cours. Équipe : ${assignedTeam}${technicien && technicien !== "-" ? ` • Technicien : [${technicien}] ${nomTechnicien}` : ""
+          `Véhicule ${row.serie || row.no} passé en cours (${nextEmplacement} - ${nextAvancement} - Début : ${dateDebut}). Équipe : ${assignedTeam}${technicien && technicien !== "-" ? ` • Technicien : [${technicien}] ${nomTechnicien}` : ""
           }.`
         );
       } catch (error) {
@@ -1188,7 +1437,7 @@ export default function Dashboard() {
         if (isValidationRuleError) {
           setWriteNotice(
             `Véhicule ${row.serie || row.no} pris en charge : Équipe ${assignedTeam}${technicien && technicien !== "-" ? ` • Technicien : [${technicien}] ${nomTechnicien}` : ""
-            }. (Enregistré dans l'application. Déployez le nouveau Code.gs pour débloquer la cellule dans Google Sheets).`
+            }. PostgreSQL a refusé l'enregistrement. Vérifiez les données puis actualisez.`
           );
         } else {
           setVehicles((current) =>
@@ -1209,14 +1458,14 @@ export default function Dashboard() {
           setWriteError(
             error instanceof Error
               ? error.message
-              : "Impossible d'enregistrer l'intervention dans Google Sheets."
+              : "Impossible d'enregistrer l'intervention dans PostgreSQL."
           );
         }
       } finally {
         setSavingVehicleId((current) => (current === row.id ? null : current));
       }
     },
-    [canWriteToSheet]
+    [canWriteToDatabase, vehicles]
   );
 
   const saveVehicleTechnicienOnly = useCallback(
@@ -1249,23 +1498,64 @@ export default function Dashboard() {
           : "En cours - 10%";
       const finalTeam = assignedTeam || row.equipe || (activeChefEquipeTeam || "Daily1");
 
+      const now = new Date();
+      const dd = String(now.getDate()).padStart(2, "0");
+      const mm = String(now.getMonth() + 1).padStart(2, "0");
+      const yyyy = now.getFullYear();
+      const hh = String(now.getHours()).padStart(2, "0");
+      const min = String(now.getMinutes()).padStart(2, "0");
+      const ss = String(now.getSeconds()).padStart(2, "0");
+      const currentDateTime = `${dd}/${mm}/${yyyy} ${hh}:${min}:${ss}`;
+      const currentTime = `${hh}:${min}:${ss}`;
+
+      const computedVehicle: Partial<Flux> = {
+        ...row,
+        equipe: finalTeam,
+        technicien: technicien && technicien !== "-" ? technicien : row.technicien,
+        nomTechnicien: nomTechnicien && nomTechnicien !== "-" ? nomTechnicien : row.nomTechnicien,
+        avancement: nextAvancement,
+        etatIntervention: "En cours",
+        statut: "En cours",
+      };
+      const nextEmplacement = isTransferInit
+        ? calculerEmplacementAutomatique(computedVehicle, vehicles, row.id)
+        : row.emplacement;
+
       setVehicles((current) =>
-        current.map((item) =>
-          item.id === row.id
-            ? {
-              ...item,
-              technicien: technicien !== "-" ? technicien : item.technicien,
-              nomTechnicien: nomTechnicien !== "-" ? nomTechnicien : item.nomTechnicien,
-              equipe: finalTeam,
-              etatIntervention: "En cours",
-              statut: "En cours",
-              avancement: nextAvancement,
-            }
-            : item
-        )
+        current.map((item) => {
+          const isTarget =
+            (row.id && item.id === row.id) ||
+            (row.id && String(item.id) === String(row.id)) ||
+            (row.no && (item.no === row.no || item.ordre === row.no)) ||
+            (row.ordre && (item.no === row.ordre || item.ordre === row.ordre)) ||
+            (row.chassis && item.chassis && item.chassis.trim().toUpperCase() === row.chassis.trim().toUpperCase());
+
+          if (!isTarget) return item;
+
+          return {
+            ...item,
+            technicien: technicien && technicien !== "-" ? technicien : item.technicien,
+            nomTechnicien: nomTechnicien && nomTechnicien !== "-" ? nomTechnicien : item.nomTechnicien,
+            equipe: finalTeam,
+            emplacement: nextEmplacement,
+            etatIntervention: "En cours",
+            statut: "En cours",
+            avancement: nextAvancement,
+            dateDebutRep: isTransferInit ? currentDateTime : (item.dateDebutRep || currentDateTime),
+            dateDebutTravail: isTransferInit ? currentDateTime : (item.dateDebutTravail || currentDateTime),
+            heureDebutTravail: isTransferInit ? currentTime : (item.heureDebutTravail || currentTime),
+          };
+        })
       );
 
-      if (!canWriteToSheet) {
+      // L'équipe destinataire vient de prendre le travail : mémoriser immédiatement
+      // sa date/heure d'acceptation et la durée exacte restée en attente.
+      if (isTransferInit) {
+        const currentUserName = currentUser?.name || selectedChefEquipeName || "Chef d'équipe";
+        marquerTransfertAccepte(row, currentUserName);
+      }
+
+      if (!canWriteToDatabase) {
         setSavingVehicleId(null);
         setWriteNotice(
           `Technicien mis à jour pour ${row.serie || row.no} : [${technicien}] ${nomTechnicien}.`
@@ -1274,7 +1564,7 @@ export default function Dashboard() {
       }
 
       try {
-        await updateGoogleSheetTechnicien(
+        await updateDatabaseTechnicien(
           row,
           technicien,
           nomTechnicien,
@@ -1282,8 +1572,26 @@ export default function Dashboard() {
           poste,
           row.bloc
         );
+        if (isTransferInit) {
+          if (nextEmplacement && nextEmplacement !== row.emplacement) {
+            updateDatabaseEmplacement(row, nextEmplacement).catch(() => {});
+          }
+          updateDatabaseAvancement(
+            row,
+            nextAvancement,
+            finalTeam,
+            row.bloc,
+            undefined,
+            {
+              dateModification: currentDateTime,
+              dateDebutRep: currentDateTime,
+              heureDebutTravail: currentTime,
+              emplacement: nextEmplacement,
+            }
+          ).catch(() => {});
+        }
         setLastRefresh(formatRefreshDate());
-        setSheetStatus("ready");
+        setDatabaseStatus("ready");
         setWriteNotice(
           `Technicien mis à jour pour ${row.serie || row.no} : [${technicien}] ${nomTechnicien}.`
         );
@@ -1296,7 +1604,7 @@ export default function Dashboard() {
 
         if (isValidationRuleError) {
           setWriteNotice(
-            `Technicien affecté pour ${row.serie || row.no} : [${technicien}] ${nomTechnicien}. (Enregistré dans l'application. Déployez le nouveau Code.gs pour débloquer la cellule dans Google Sheets).`
+            `Technicien affecté pour ${row.serie || row.no} : [${technicien}] ${nomTechnicien}. PostgreSQL a refusé l'enregistrement. Vérifiez les données puis actualisez.`
           );
         } else {
           setVehicles((current) =>
@@ -1317,14 +1625,14 @@ export default function Dashboard() {
           setWriteError(
             error instanceof Error
               ? error.message
-              : "Impossible d'enregistrer le technicien dans Google Sheets."
+              : "Impossible d'enregistrer le technicien dans PostgreSQL."
           );
         }
       } finally {
         setSavingVehicleId((current) => (current === row.id ? null : current));
       }
     },
-    [canWriteToSheet, activeChefEquipeTeam]
+    [canWriteToDatabase, activeChefEquipeTeam]
   );
 
   const saveVehicleAvancement = useCallback(
@@ -1397,6 +1705,7 @@ export default function Dashboard() {
       const previousEmplacement = row.emplacement;
 
       let effectiveAvancement = nextAvancement;
+      let shouldMarkReprise = false;
       if (nextAvancement === "Technicien réaffecté") {
         const record = marquerVehiculeReaffecte(row, currentUserName);
         effectiveAvancement = "Attente réparation";
@@ -1408,12 +1717,7 @@ export default function Dashboard() {
         nextAvancement.includes("%")
       ) {
         const existingReaff = getReaffectationForVehicle(row);
-        if (existingReaff && !existingReaff.isRepris) {
-          const rec = marquerVehiculeReprise(row, currentUserName);
-          setWriteNotice(
-            `✅ Travail repris sur ${row.serie || row.no} le ${rec.dateReprise} !`
-          );
-        }
+        shouldMarkReprise = Boolean(existingReaff && !existingReaff.isRepris);
       }
 
       // Essai routier : démarrer le contrôle horodaté à maintenant
@@ -1444,37 +1748,59 @@ export default function Dashboard() {
             ? "attends acheter"
             : effectiveAvancement === "Attente client"
               ? "Attente Client"
-              : effectiveAvancement.startsWith("vr")
-                ? "En cours"
-                : nextAvancement === "Technicien réaffecté"
+                : effectiveAvancement.startsWith("vr")
                   ? "En cours"
+                  : nextAvancement === "Technicien réaffecté"
+                  ? "Attente Réparation"
                   : effectiveAvancement === "Attente réparation" || effectiveAvancement === "Attente Réparation"
                     ? ((extraParams?.etat as WorkshopStatus) || "Attente Réparation")
                     : effectiveAvancement.startsWith("En cours") || effectiveAvancement.toLowerCase().includes("devis")
                       ? "En cours"
                       : row.etatIntervention;
 
-      // Emplacement automatique : quand l'équipe met ATENDE DEVIS, l'emplacement bascule automatiquement en "P" (Parking)
+      // Emplacement automatique : calculé selon l'avancement, l'état et l'équipe active
       const isDevis = nextAvancement === "ATENDE DEVIS" || nextAvancement.toLowerCase().includes("devis");
-      const nextEmplacement = isDevis ? "P" : row.emplacement;
-      const targetEquipe = (extraParams?.equipe || demandeDevis?.equipeOrigine || row.equipe || "").trim() || row.equipe;
-      const targetTech = extraParams?.technicien !== undefined ? extraParams.technicien : (demandeDevis?.technicien || row.technicien);
-      const targetNomTech = extraParams?.nomTechnicien !== undefined ? extraParams.nomTechnicien : (demandeDevis?.nomTechnicien || row.nomTechnicien);
+      const isVrTransfer = nextAvancement.startsWith("vr");
+      const vrTargetTeam = isVrTransfer ? getTeamFromVr(nextAvancement) : "";
+      const currentBloc = row.bloc || 1;
+      const rawNextBloc = isVrTransfer ? currentBloc + 1 : currentBloc;
+      const nextBloc = (Math.min(rawNextBloc, 3) as 1 | 2 | 3);
+      const targetEquipe = (extraParams?.equipe || demandeDevis?.equipeOrigine || vrTargetTeam || row.equipe || "").trim() || row.equipe || "";
+      const targetTech = isVrTransfer
+        ? "-"
+        : (extraParams?.technicien !== undefined ? extraParams.technicien : (demandeDevis?.technicien || row.technicien));
+      const targetNomTech = isVrTransfer
+        ? "-"
+        : (extraParams?.nomTechnicien !== undefined ? extraParams.nomTechnicien : (demandeDevis?.nomTechnicien || row.nomTechnicien));
+
+      const computedVehicle: Partial<Flux> = {
+        ...row,
+        avancement: effectiveAvancement,
+        etatIntervention: nextEtat,
+        statut: nextEtat,
+        equipe: targetEquipe,
+        bloc: nextBloc,
+        technicien: targetTech,
+        nomTechnicien: targetNomTech,
+      };
+      const nextEmplacement = isDevis
+        ? "P"
+        : isVrTransfer
+          ? (row.emplacement || "-")
+          : calculerEmplacementAutomatique(computedVehicle, vehicles, row.id);
 
       // Transferts VR : enregistrer le début du transfert vers l'équipe cible horodaté à maintenant
-      if (nextAvancement.startsWith("vr")) {
+      if (isVrTransfer) {
         marquerDebutTransfertVR(row, nextAvancement, targetEquipe, currentUserName);
       }
 
-      // Enregistrer chaque modification dans la chronométrie pour affichage et calcul précis des temps
-      recordAvancementStatusChange(row, nextAvancement, nowFormatted, currentUserName);
-
       // Si l'avancement cible est En cours, vérifier que le technicien n'est pas déjà occupé sur un autre véhicule
       const isTryingEnCours =
-        effectiveAvancement.startsWith("En cours") ||
-        effectiveAvancement.includes("%") ||
-        effectiveAvancement.startsWith("vr") ||
-        nextEtat === "En cours";
+        !isVrTransfer && nextAvancement !== "Technicien réaffecté" && (
+          effectiveAvancement.startsWith("En cours") ||
+          effectiveAvancement.includes("%") ||
+          nextEtat === "En cours"
+        );
 
       if (isTryingEnCours && ((targetTech && targetTech !== "-") || (targetNomTech && targetNomTech !== "-"))) {
         const busyCar = getActiveVehicleForTech(
@@ -1495,6 +1821,14 @@ export default function Dashboard() {
 
       setWriteNotice("");
       setWriteError("");
+
+      // La reprise et la chronométrie ne sont enregistrées qu'après la validation :
+      // un clic refusé car le technicien est occupé ne peut plus libérer le véhicule réaffecté.
+      if (shouldMarkReprise) {
+        const rec = marquerVehiculeReprise(row, currentUserName);
+        setWriteNotice(`✅ Travail repris sur ${row.serie || row.no} le ${rec.dateReprise} !`);
+      }
+      recordAvancementStatusChange(row, nextAvancement, nowFormatted, currentUserName);
       setSavingVehicleId(row.id);
       setVehicles((current) =>
         current.map((item) =>
@@ -1506,10 +1840,29 @@ export default function Dashboard() {
               statut: nextEtat,
               emplacement: nextEmplacement,
               equipe: targetEquipe,
-              technicien: targetTech !== undefined ? targetTech : item.technicien,
-              nomTechnicien: targetNomTech !== undefined ? targetNomTech : item.nomTechnicien,
+              bloc: nextBloc,
+              technicien: isVrTransfer ? "-" : (targetTech !== undefined ? targetTech : item.technicien),
+              nomTechnicien: isVrTransfer ? "-" : (targetNomTech !== undefined ? targetNomTech : item.nomTechnicien),
               dateModification: nowFormatted,
-              dateFinRep: effectiveAvancement === "Terminer" ? nowFormatted : item.dateFinRep,
+              dateFinRep: (effectiveAvancement === "Terminer" || isVrTransfer) ? nowFormatted : item.dateFinRep,
+              ...(isVrTransfer && currentBloc === 1
+                ? {
+                    equipe1: row.equipe || "Atelier",
+                    avancement1: nextAvancement,
+                    dateFin1: nowFormatted,
+                    technicien1: row.technicien,
+                    nomTechnicien1: row.nomTechnicien,
+                  }
+                : {}),
+              ...(isVrTransfer && currentBloc === 2
+                ? {
+                    equipe2: row.equipe || "Atelier",
+                    avancement2: nextAvancement,
+                    dateFin2: nowFormatted,
+                    technicien2: row.technicien,
+                    nomTechnicien2: row.nomTechnicien,
+                  }
+                : {}),
             }
             : item
         )
@@ -1528,10 +1881,10 @@ export default function Dashboard() {
         setActiveTab("devis");
       }
 
-      if (!canWriteToSheet) {
+      if (!canWriteToDatabase) {
         setSavingVehicleId(null);
         setWriteError(
-          "Avancement modifié dans l'application. Déployez le script Apps Script pour enregistrer directement dans Google Sheets."
+          "La modification de l'avancement n'a pas été enregistrée dans PostgreSQL. Vérifiez l'API puis réessayez."
         );
         return;
       }
@@ -1541,8 +1894,10 @@ export default function Dashboard() {
         etat: nextEtat,
         dateModification: nowFormatted,
       };
+      if (nextEmplacement) {
+        extraPayload.emplacement = nextEmplacement;
+      }
       if (isDevis) {
-        extraPayload.emplacement = "P";
         extraPayload.dateDevis = nowFormatted;
       }
       if (nextAvancement === "Attente PDR" || nextAvancement === "attends acheter") {
@@ -1557,57 +1912,87 @@ export default function Dashboard() {
       }
       if (nextAvancement === "Terminer") {
         extraPayload.dateFin = nowFormatted;
+        extraPayload.dateFinRep = nowFormatted;
       }
-      if (nextAvancement.startsWith("vr")) {
+      if (isVrTransfer) {
         extraPayload.dateTransfert = nowFormatted;
+        extraPayload.bloc = String(nextBloc);
+        extraPayload.equipe = targetEquipe;
+        extraPayload.technicien = "-";
+        extraPayload.nomTechnicien = "-";
+        extraPayload.dateFinRep = nowFormatted;
+        extraPayload.dateFin = nowFormatted;
+        if (currentBloc === 1) {
+          extraPayload.equipe1 = row.equipe || "Atelier";
+          extraPayload.avancement1 = nextAvancement;
+          extraPayload.dateFin1 = nowFormatted;
+          if (row.technicien && row.technicien !== "-") {
+            extraPayload.technicien1 = row.technicien;
+          }
+          if (row.nomTechnicien && row.nomTechnicien !== "-") {
+            extraPayload.nomTechnicien1 = row.nomTechnicien;
+          }
+        } else if (currentBloc === 2) {
+          extraPayload.equipe2 = row.equipe || "Atelier";
+          extraPayload.avancement2 = nextAvancement;
+          extraPayload.dateFin2 = nowFormatted;
+          if (row.technicien && row.technicien !== "-") {
+            extraPayload.technicien2 = row.technicien;
+          }
+          if (row.nomTechnicien && row.nomTechnicien !== "-") {
+            extraPayload.nomTechnicien2 = row.nomTechnicien;
+          }
+        }
       }
-      if (targetTech) {
+      if (!isVrTransfer && targetTech) {
         extraPayload.technicien = targetTech;
       }
-      if (targetNomTech) {
+      if (!isVrTransfer && targetNomTech) {
         extraPayload.nomTechnicien = targetNomTech;
       }
 
       try {
-        await updateGoogleSheetAvancement(
+        await updateDatabaseAvancement(
           row,
           effectiveAvancement,
           targetEquipe,
-          row.bloc,
+          nextBloc,
           activeDemandeAchat,
           extraPayload,
           demandeDevis
         );
-        // Garantir la mise à jour immédiate de l'emplacement en P dans Google Sheets
+        // Garantir la mise à jour immédiate de l'emplacement en P dans PostgreSQL
         if (isDevis && row.emplacement !== "P") {
-          updateGoogleSheetEmplacement(row, "P").catch(() => { });
+          updateDatabaseEmplacement(row, "P").catch(() => { });
         }
         // Si un technicien est réaffecté ou spécifié, synchroniser aussi la colonne technicien
-        if (extraParams?.technicien || extraParams?.nomTechnicien) {
-          updateGoogleSheetTechnicien(
+        if (!isVrTransfer && (extraParams?.technicien || extraParams?.nomTechnicien)) {
+          updateDatabaseTechnicien(
             row,
             targetTech || "",
             targetNomTech || ""
           ).catch(() => {});
+        } else if (isVrTransfer) {
+          updateDatabaseTechnicien(row, "-", "-").catch(() => {});
         }
         setLastRefresh(formatRefreshDate());
-        setSheetStatus("ready");
-        setSheetError("");
+        setDatabaseStatus("ready");
+        setDatabaseError("");
         const noticeMsg =
-          nextAvancement === "Essai"
-            ? `Véhicule ${row.serie || row.no} mis à jour : Essai (transféré vers la Page Essai).`
-            : nextAvancement === "attends acheter"
-              ? `Véhicule ${row.serie || row.no} mis à jour : attends acheter (transféré vers la Page Acheter).`
-              : nextAvancement === "ATENDE DEVIS"
-                ? `Véhicule ${row.serie || row.no} mis à jour : ATENDE DEVIS (Emplacement basculé automatiquement en P).`
-                : nextAvancement === "Technicien réaffecté"
-                  ? `🔄 Technicien réaffecté pour ${row.serie || row.no} : avancement passé en "Attente réparation" (reste dans Interventions En cours).`
-                  : nextAvancement === "Terminer"
-                    ? `Essai CONFORME validé pour ${row.serie || row.no} : intervention Terminer (transféré en Attente Client).`
-                    : nextAvancement === "Attente client"
-                      ? `Essai NON-CONFORME pour ${row.serie || row.no} : placé en Attente Client (accord requis pour la nouvelle panne).`
-                      : nextAvancement.startsWith("vr")
-                        ? `Essai NON-CONFORME pour ${row.serie || row.no} : retourné à l'équipe ${nextAvancement}.`
+          isVrTransfer
+            ? `🔄 Transfert ${nextAvancement} : véhicule ${row.serie || row.no} transmis à l'équipe ${targetEquipe}. Technicien ${row.nomTechnicien || row.technicien || ""} libéré (🟢 Disponible).`
+            : nextAvancement === "Essai"
+              ? `Véhicule ${row.serie || row.no} mis à jour : Essai (transféré vers la Page Essai).`
+              : nextAvancement === "attends acheter"
+                ? `Véhicule ${row.serie || row.no} mis à jour : attends acheter (transféré vers la Page Acheter).`
+                : nextAvancement === "ATENDE DEVIS"
+                  ? `Véhicule ${row.serie || row.no} mis à jour : ATENDE DEVIS (Emplacement basculé automatiquement en P).`
+                  : nextAvancement === "Technicien réaffecté"
+                    ? `🔄 Technicien réaffecté pour ${row.serie || row.no} : avancement passé en "Attente réparation" (reste dans Interventions En cours).`
+                    : nextAvancement === "Terminer"
+                      ? `Essai CONFORME validé pour ${row.serie || row.no} : intervention Terminer (transféré en Attente Client).`
+                      : nextAvancement === "Attente client"
+                        ? `Essai NON-CONFORME pour ${row.serie || row.no} : placé en Attente Client (accord requis pour la nouvelle panne).`
                         : `Avancement ${row.serie || row.no} mis à jour : ${nextAvancement}.`;
         setWriteNotice(noticeMsg);
       } catch (error) {
@@ -1632,8 +2017,8 @@ export default function Dashboard() {
           );
           setWriteError(
             error instanceof Error
-              ? `Avertissement Google Sheets : ${error.message}. Pensez à déployer le script Code.gs à jour pour synchroniser.`
-              : "Synchronisation Google Sheets en attente. Déployez le script Apps Script pour enregistrer directement dans Google Sheets."
+              ? `Échec de l'enregistrement PostgreSQL : ${error.message}.`
+              : "La modification n'a pas été enregistrée dans PostgreSQL. Vérifiez l'API puis actualisez."
           );
         } else {
           const errorMsg = error instanceof Error ? error.message : String(error);
@@ -1644,7 +2029,7 @@ export default function Dashboard() {
 
           if (isValidationRuleError) {
             setWriteNotice(
-              `Avancement pour ${row.serie || row.no} mis à jour : ${nextAvancement}. (Enregistré dans l'application. Déployez le nouveau Code.gs pour débloquer la cellule dans Google Sheets).`
+              `Avancement pour ${row.serie || row.no} mis à jour : ${nextAvancement}. PostgreSQL a refusé l'enregistrement. Vérifiez les données puis actualisez.`
             );
           } else {
             setVehicles((current) =>
@@ -1663,7 +2048,7 @@ export default function Dashboard() {
             setWriteError(
               error instanceof Error
                 ? error.message
-                : "Impossible d'enregistrer l'avancement dans Google Sheets."
+                : "Impossible d'enregistrer l'avancement dans PostgreSQL."
             );
           }
         }
@@ -1671,7 +2056,7 @@ export default function Dashboard() {
         setSavingVehicleId((current) => (current === row.id ? null : current));
       }
     },
-    [canWriteToSheet, permissions.canEditEtat, permissions.canEditAvancement, setActiveTab, role]
+    [canWriteToDatabase, permissions.canEditEtat, permissions.canEditAvancement, setActiveTab, role]
   );
 
   const handleReprendreTravail = useCallback(
@@ -1705,6 +2090,30 @@ export default function Dashboard() {
     [currentUser?.name, saveVehicleAvancement, vehicles, reaffectationsMap]
   );
 
+  // Tous les travaux encore ouverts du technicien sélectionné. Cette liste permet
+  // au chef d'équipe de choisir explicitement quel OR réaffecté doit reprendre.
+  const repriseChooserWorks = useMemo(() => {
+    if (!repriseChooserVehicle) return [];
+    const matricule = (repriseChooserVehicle.technicien || "").trim().toLowerCase();
+    const nom = (repriseChooserVehicle.nomTechnicien || "").trim().toLowerCase();
+
+    return vehicles.filter((vehicle) => {
+      if (isVehicleFinished(vehicle)) return false;
+      const vehicleMatricule = (vehicle.technicien || "").trim().toLowerCase();
+      const vehicleNom = (vehicle.nomTechnicien || "").trim().toLowerCase();
+      const isSameTechnician =
+        (matricule && matricule !== "-" && vehicleMatricule === matricule) ||
+        (nom && nom !== "-" && (vehicleNom === nom || vehicleNom.includes(nom) || nom.includes(vehicleNom)));
+      if (!isSameTechnician) return false;
+
+      const record = getReaffectationForVehicle(vehicle);
+      return Boolean(
+        isVehicleActivelyOccupyingTech(vehicle, reaffectationsMap) ||
+        (record && !record.isRepris)
+      );
+    });
+  }, [repriseChooserVehicle, vehicles, reaffectationsMap, getReaffectationForVehicle]);
+
   // Validation du contrôle d'essai depuis la Page Essai (modal essayeur)
   const handleValidateEssai = useCallback(
     async (payload: EssaiValidationPayload) => {
@@ -1723,10 +2132,13 @@ export default function Dashboard() {
         extraParams.dateFin = payload.dateControle || nowFormatted;
       } else {
         if (payload.actionNonConforme === "transfert_vr" && payload.targetVr) {
-          nextAvancement = payload.targetVr;
-          extraParams.actionNonConforme = "transfert_vr";
+          // Retour après essai non conforme : l'équipe doit accepter explicitement
+          // avant que le véhicule ne redémarre en intervention.
+          nextAvancement = "Attente réparation";
+          extraParams.actionNonConforme = "retour_equipe_apres_essai";
           extraParams.targetVr = payload.targetVr;
-          extraParams.dateTransfert = payload.dateControle || nowFormatted;
+          extraParams.equipe = getTeamFromVr(payload.targetVr);
+          extraParams.dateRetourEssai = payload.dateControle || nowFormatted;
         } else {
           nextAvancement = "Attente client";
           extraParams.actionNonConforme = "attente_client";
@@ -1736,6 +2148,7 @@ export default function Dashboard() {
 
       // 1. Sauvegarde locale de la fiche de contrôle essai
       saveEssaiControleLocal({
+        id: `essai-controle-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
         vehicleId: vehicle.id,
         or: payload.or,
         chassis: vehicle.chassis || "",
@@ -1746,12 +2159,38 @@ export default function Dashboard() {
         actionNonConforme: payload.actionNonConforme,
         targetVr: payload.targetVr,
         descriptionPanne: payload.descriptionPanne,
+        remarque: payload.remarque,
         dateControle: payload.dateControle,
         timestamp: Date.now(),
       });
 
-      // 2. Mettre à jour l'avancement et synchroniser vers Google Sheets
+      // Un contrôle clôture toujours l'essai ouvert, même s'il est non conforme.
+      marquerFinEssai(vehicle, {
+        essayeur: payload.essayeur,
+        resultat: payload.resultat,
+        dateControle: payload.dateControle || nowFormatted,
+      });
+
+      // 2. Mettre à jour l'avancement et synchroniser vers PostgreSQL
       await saveVehicleAvancement(vehicle, nextAvancement, undefined, extraParams);
+
+      if (payload.resultat === "NON-CONFORME" && payload.actionNonConforme === "transfert_vr" && payload.targetVr) {
+        const equipeRetour = getTeamFromVr(payload.targetVr);
+        setReturnedEssaiNotifications((previous) => [
+          ...previous.filter((item) => item.vehicle.id !== vehicle.id),
+          {
+            vehicle: {
+              ...vehicle,
+              equipe: equipeRetour,
+              avancement: "Attente réparation",
+              etatIntervention: "Attente Réparation",
+              statut: "Attente Réparation",
+            },
+            equipe: equipeRetour,
+            timestamp: payload.dateControle || nowFormatted,
+          },
+        ]);
+      }
     },
     [saveVehicleAvancement]
   );
@@ -1766,13 +2205,14 @@ export default function Dashboard() {
       // 1. Marquer localement la demande comme Livrée
       marquerDemandeAchatLivree(orKey, userName);
 
-      // 2. Mettre à jour l'avancement à "En cours - 10%" et l'état à "En cours"
-      // (pour que le véhicule réintègre immédiatement Interventions En cours)
-      const nextAvancement = "En cours - 10%";
+      // 2. La pièce arrivée ne démarre jamais le travail automatiquement.
+      // Le véhicule retourne dans les Tableaux de chargement, en Attente réparation,
+      // jusqu'à l'acceptation explicite de l'équipe qui l'a demandée.
+      const nextAvancement = "Attente réparation";
       await saveVehicleAvancement(vehicle, nextAvancement);
 
-      // 3. Déclencher la synchronisation Google Sheets du statut d'achat
-      void updateGoogleSheetStatutAchat(vehicle, demande, "Livré");
+      // 3. Déclencher la synchronisation PostgreSQL du statut d'achat
+      void updateDatabaseStatutAchat(vehicle, demande, "Livré");
 
       // 4. Ajouter la notification d'acceptation pour le chef d'équipe
       const updatedDemande: DemandeAchat = {
@@ -1790,8 +2230,8 @@ export default function Dashboard() {
           vehicle: {
             ...vehicle,
             avancement: nextAvancement,
-            etatIntervention: "En cours",
-            statut: "En cours",
+            etatIntervention: "Attente Réparation",
+            statut: "Attente Réparation",
           },
           demande: updatedDemande,
           timestamp: new Date().toLocaleTimeString("fr-FR", { hour: "2-digit", minute: "2-digit" }),
@@ -1804,27 +2244,77 @@ export default function Dashboard() {
   const handleMarquerAchatAttente = useCallback(async (vehicle: Flux, demande: DemandeAchat) => {
     const orKey = (vehicle.no || vehicle.ordre || vehicle.chassis || String(vehicle.id)).trim();
     marquerDemandeAchatAttente(orKey);
-    void updateGoogleSheetStatutAchat(vehicle, demande, "Attente");
+    void updateDatabaseStatutAchat(vehicle, demande, "Attente");
     setDeliveredAchatNotifications((prev) =>
       prev.filter((n) => (n.vehicle.no || n.vehicle.id) !== (vehicle.no || vehicle.id))
     );
   }, []);
 
-  const handleAcceptDeliveredAchat = useCallback((item: { vehicle: Flux; demande: DemandeAchat }) => {
+  const handleAcceptDeliveredAchat = useCallback(async (item: { vehicle: Flux; demande: DemandeAchat }) => {
+    const busyCar = getActiveVehicleForTech(
+      item.vehicle.technicien || "",
+      item.vehicle.nomTechnicien || "",
+      vehicles,
+      item.vehicle.id,
+      item.vehicle.no,
+      reaffectationsMap
+    );
+    if (busyCar) {
+      setWriteError(
+        `⏳ OR ${item.vehicle.no || item.vehicle.ordre || item.vehicle.id} reste en Attente Réparation : ${item.vehicle.nomTechnicien || item.vehicle.technicien} est encore occupé sur OR ${busyCar.no || busyCar.ordre || busyCar.id}.`
+      );
+      setActiveTab("chargement");
+      setActiveFilter("Attente Réparation");
+      setSelectedVehicleId(item.vehicle.id);
+      return;
+    }
+
+    // L'équipe accepte : le technicien est libre, l'intervention peut redémarrer.
+    await saveVehicleAvancement(item.vehicle, "En cours - 10%");
+    marquerDemandeAchatAccepteeParEquipe(
+      (item.vehicle.no || item.vehicle.ordre || item.vehicle.chassis || String(item.vehicle.id)).trim(),
+      currentUser?.name || selectedChefEquipeName
+    );
     setDeliveredAchatNotifications((prev) =>
       prev.filter((n) => (n.vehicle.no || n.vehicle.id) !== (item.vehicle.no || item.vehicle.id))
     );
-    setActiveTab("plan_atelier");
+    setActiveTab("en_cours");
     setActiveFilter("En cours");
     setSelectedVehicleId(item.vehicle.id);
     setVehiculeModalData(item.vehicle);
-  }, [setActiveTab]);
+  }, [vehicles, reaffectationsMap, saveVehicleAvancement, currentUser?.name, selectedChefEquipeName]);
 
   const handleDismissDeliveredAchat = useCallback((vehicleId: number | string) => {
     setDeliveredAchatNotifications((prev) =>
       prev.filter((n) => n.vehicle.id !== vehicleId && n.vehicle.no !== vehicleId)
     );
   }, []);
+
+  const handleAcceptReturnedEssai = useCallback(async (item: { vehicle: Flux; equipe: string }) => {
+    const busyCar = getActiveVehicleForTech(
+      item.vehicle.technicien || "",
+      item.vehicle.nomTechnicien || "",
+      vehicles,
+      item.vehicle.id,
+      item.vehicle.no,
+      reaffectationsMap
+    );
+    if (busyCar) {
+      setWriteError(
+        `⏳ Retour d'essai maintenu en Attente Réparation : ${item.vehicle.nomTechnicien || item.vehicle.technicien} est occupé sur OR ${busyCar.no || busyCar.ordre || busyCar.id}.`
+      );
+      setActiveTab("chargement");
+      setActiveFilter("Attente Réparation");
+      setSelectedVehicleId(item.vehicle.id);
+      return;
+    }
+
+    await saveVehicleAvancement(item.vehicle, "En cours - 10%");
+    setReturnedEssaiNotifications((previous) => previous.filter((entry) => entry.vehicle.id !== item.vehicle.id));
+    setActiveTab("en_cours");
+    setActiveFilter("En cours");
+    setSelectedVehicleId(item.vehicle.id);
+  }, [vehicles, reaffectationsMap, saveVehicleAvancement]);
 
   const rowsByZone = useMemo(() => {
     const zones = new Map<string, Flux[]>();
@@ -1929,7 +2419,9 @@ export default function Dashboard() {
   const [dismissedDevisNotifIds, setDismissedDevisNotifIds] = useState<Set<string>>(new Set());
 
   const activeDevisAppelerNotifications = useMemo(() => {
-    if (role !== "reception" && role !== "administration" && role !== "chef_atelier") {
+    // Les notifications opérationnelles sont destinées à la Réception ;
+    // elles ne doivent pas interrompre l'Administration ni le Chef d'Atelier.
+    if (role !== "reception") {
       return [];
     }
     return vehicles
@@ -1952,7 +2444,7 @@ export default function Dashboard() {
   }, [vehicles, demandesDevisMap, role, dismissedDevisNotifIds]);
 
   const activeDevisRelanceNotifications = useMemo(() => {
-    if (role !== "reception" && role !== "administration" && role !== "chef_atelier") {
+    if (role !== "reception") {
       return [];
     }
     return vehicles
@@ -1978,7 +2470,7 @@ export default function Dashboard() {
     const key = (item.vehicle.no || item.vehicle.ordre || item.vehicle.chassis || String(item.vehicle.id)).trim();
     const updated = marquerDevisAppele(key, currentUser?.name || "Réception", undefined, item.vehicle);
     if (updated) {
-      void updateGoogleSheetStatutDevis(item.vehicle, updated, "Client appelé");
+      void updateDatabaseStatutDevis(item.vehicle, updated, "Client appelé");
     }
     const dateHeureAppel = updated?.dateAppel || "";
     setWriteNotice(`📞 Client appelé le ${dateHeureAppel} pour le devis N° DV ${item.devis.numeroDevis} (${item.vehicle.no || item.vehicle.ordre}).`);
@@ -1988,7 +2480,7 @@ export default function Dashboard() {
     const key = (item.vehicle.no || item.vehicle.ordre || item.vehicle.chassis || String(item.vehicle.id)).trim();
     const updated = marquerDevisAccepte(key);
     if (updated) {
-      void updateGoogleSheetStatutDevis(item.vehicle, updated, "Accepté");
+      void updateDatabaseStatutDevis(item.vehicle, updated, "Accepté");
     }
     const targetEquipe = item.devis.equipeOrigine || item.devis.equipe || item.vehicle.equipe || "Daily1";
     const targetTech =
@@ -2054,7 +2546,7 @@ export default function Dashboard() {
     const key = (item.vehicle.no || item.vehicle.ordre || item.vehicle.chassis || String(item.vehicle.id)).trim();
     const updated = marquerDevisRefuse(key);
     if (updated) {
-      void updateGoogleSheetStatutDevis(item.vehicle, updated, "Refusé");
+      void updateDatabaseStatutDevis(item.vehicle, updated, "Refusé");
     }
     await saveVehicleAvancement(
       item.vehicle,
@@ -2070,7 +2562,7 @@ export default function Dashboard() {
     const key = (item.vehicle.no || item.vehicle.ordre || item.vehicle.chassis || String(item.vehicle.id)).trim();
     const updated = marquerDevisRelance(key, currentUser?.name || "Réception");
     if (updated) {
-      void updateGoogleSheetStatutDevis(item.vehicle, updated, "Client appelé");
+      void updateDatabaseStatutDevis(item.vehicle, updated, "Client appelé");
     }
     setWriteNotice(`⚠️ Relance client effectuée pour le devis N° DV ${item.devis.numeroDevis} (${item.vehicle.no || item.vehicle.ordre}).`);
   }, [currentUser?.name]);
@@ -2080,27 +2572,44 @@ export default function Dashboard() {
   }, []);
 
   const activeDevisAccordNotificationsForUser = useMemo(() => {
+    if (role !== "chef_equipe") return [];
     return devisAccordNotifications.filter((notif) => {
       if (role === "chef_equipe") {
         if (!activeChefEquipeTeam) return false;
         return isVehicleMatchingTeam(notif.equipeCible, activeChefEquipeTeam);
       }
-      return role === "chef_atelier" || role === "administration";
+      return false;
     });
   }, [devisAccordNotifications, role, activeChefEquipeTeam]);
 
   const handlePrendreEnChargeDevisAccord = useCallback(
     (notif: DevisAccordNotification, vehicle: Flux) => {
+      const busyCar = getActiveVehicleForTech(
+        vehicle.technicien || notif.technicien || "",
+        vehicle.nomTechnicien || notif.nomTechnicien || "",
+        vehicles,
+        vehicle.id,
+        vehicle.no,
+        reaffectationsMap
+      );
+      if (busyCar) {
+        setWriteError(
+          `⏳ Le retour de devis reste en Attente Réparation : ${vehicle.nomTechnicien || vehicle.technicien || notif.nomTechnicien || notif.technicien} est occupé sur OR ${busyCar.no || busyCar.ordre || busyCar.id}.`
+        );
+        setActiveTab("chargement");
+        setActiveFilter("Attente Réparation");
+        setSelectedVehicleId(vehicle.id);
+        return;
+      }
       removeDevisAccordNotification(notif.id);
       setPendingEnCoursVehicle(vehicle);
       setIsTechModalOpen(true);
     },
-    []
+    [vehicles, reaffectationsMap]
   );
 
   const handleVoirDansChargement = useCallback(
-    (notif: DevisAccordNotification, vehicle?: Flux) => {
-      removeDevisAccordNotification(notif.id);
+    (_notif: DevisAccordNotification, vehicle?: Flux) => {
       setActiveTab("chargement");
       setActiveFilter("Attente Réparation");
       if (vehicle) {
@@ -2110,9 +2619,225 @@ export default function Dashboard() {
     []
   );
 
-  const handleDismissDevisAccord = useCallback((notifId: string) => {
-    removeDevisAccordNotification(notifId);
-  }, []);
+  const activeReceptionReadyVehicles = useMemo(() => {
+    if (role !== "reception") return [];
+    return vehicles.filter((v) => {
+      const isReady =
+        v.avancement === "Terminer" ||
+        v.etatIntervention === "Attente Client" ||
+        v.statut === "Attente Client";
+      const isDelivered =
+        v.etatIntervention === "Livré" ||
+        v.statut === "Livré" ||
+        v.avancement === "Livré" ||
+        v.avancement === "Sorti";
+      return isReady && !isDelivered && !dismissedReadyNotifIds.has(v.id);
+    });
+  }, [vehicles, role, dismissedReadyNotifIds]);
+
+  const activeNouvelleEntreeNotificationsForUser = useMemo(() => {
+    // Seuls les Chefs d'équipe reçoivent les entrées à accepter/mettre en attente.
+    if (role !== "chef_equipe") return [];
+    return nouvelleEntreeNotifications.filter((notif) => {
+      if (dismissedEntreeNotifIds.has(notif.id)) return false;
+      if (notif.statutAcceptation && notif.statutAcceptation !== "en_attente") return false;
+      if (!notif.equipe || notif.equipe === "-" || notif.equipe === "NA") return false;
+
+      // Seul le chef d'équipe de l'équipe qui prend le travail peut voir et accepter la notification
+      // (ex: si l'entrée est pour Daily, seuls Daily1 et Daily2 la voient)
+      if (role === "chef_equipe") {
+        if (!activeChefEquipeTeam) return false;
+        return isVehicleMatchingTeam(notif.equipe, activeChefEquipeTeam);
+      }
+
+      // Si l'utilisateur a une équipe explicitement affectée
+      if (activeChefEquipeTeam && (role === "chef_atelier" || role === "administration")) {
+        return isVehicleMatchingTeam(notif.equipe, activeChefEquipeTeam);
+      }
+      return false;
+    });
+  }, [nouvelleEntreeNotifications, dismissedEntreeNotifIds, role, activeChefEquipeTeam]);
+
+  const handleAccepterNouvelleEntree = useCallback(
+    async (item: NouvelleEntreeNotification, matchingVehicle?: Flux) => {
+      const chefName = (currentUser?.name || selectedChefEquipeName || "Chef d'équipe").trim();
+
+      // Basculer immédiatement vers le tableau Interventions En cours
+      setActiveTab("en_cours");
+      setActiveFilter("En cours");
+
+      const assignedTeam = activeChefEquipeTeam || item.equipe || "Daily1";
+
+      const normOr = (item.noOr || "").trim();
+      const normChassis = (item.chassis || "").trim().toUpperCase();
+      const resolvedVehicle = matchingVehicle || vehicles.find((v) => {
+        const vOr = (v.no || v.ordre || "").trim();
+        const vChassis = (v.chassis || "").trim().toUpperCase();
+        return (normOr && vOr === normOr) || (normChassis && vChassis === normChassis);
+      });
+
+      // Préparer le véhicule pour passage direct en "En cours - 10%"
+      const baseVehicle: Partial<Flux> = resolvedVehicle
+        ? {
+            ...resolvedVehicle,
+            equipe: assignedTeam,
+            equipe1: resolvedVehicle.equipe1 && resolvedVehicle.equipe1 !== "-" ? resolvedVehicle.equipe1 : assignedTeam,
+            statut: "En cours",
+            etatIntervention: "En cours",
+            avancement: "En cours - 10%",
+            statutAcceptation: "accepte" as const,
+            dateAcceptation: "",
+            acceptePar: chefName,
+          }
+        : {
+            id: typeof item.id === "number" ? item.id : Number(item.id) || Date.now(),
+            no: item.noOr,
+            ordre: item.noOr,
+            chassis: item.chassis,
+            immatriculation: item.immatriculation || "-",
+            marque: item.marque,
+            modele: item.modele,
+            modelePowerBI: item.modele,
+            client: item.nomClient,
+            equipe: assignedTeam,
+            equipe1: assignedTeam,
+            statut: "En cours",
+            etatIntervention: "En cours",
+            avancement: "En cours - 10%",
+            emplacement: "-",
+            technicien: "-",
+            nomTechnicien: "-",
+            serie: item.noOr,
+            dateEntree: item.dateEntreeHeure,
+            date: item.dateEntreeHeure.split(" ")[0] || "",
+            atelier: item.modele,
+            categorie: item.modele,
+            operation: "Entrée atelier",
+            montant: 0,
+            temps: 0,
+            nbIntervention: 1,
+            statutAcceptation: "accepte" as const,
+            dateAcceptation: "",
+            acceptePar: chefName,
+          };
+
+      // Calcul automatique de l'emplacement selon l'équipe responsable (Daily->D, Électrique->E, Service Rapide->S, Carrosserie->C, Lourd->T/M)
+      const autoEmp = calculerEmplacementAutomatique(baseVehicle, vehicles, baseVehicle.id);
+      baseVehicle.emplacement = autoEmp;
+
+      const now = new Date();
+      const dd = String(now.getDate()).padStart(2, "0");
+      const mm = String(now.getMonth() + 1).padStart(2, "0");
+      const yyyy = now.getFullYear();
+      const hh = String(now.getHours()).padStart(2, "0");
+      const min = String(now.getMinutes()).padStart(2, "0");
+      const ss = String(now.getSeconds()).padStart(2, "0");
+      const currentDateTime = `${dd}/${mm}/${yyyy} ${hh}:${min}:${ss}`;
+      const currentTime = `${hh}:${min}:${ss}`;
+
+      baseVehicle.dateDebutRep = currentDateTime;
+      baseVehicle.dateDebutTravail = currentDateTime;
+      baseVehicle.heureDebutTravail = currentTime;
+
+      const res = await accepterEntreeParChefEquipe({
+        noOr: item.noOr,
+        chassis: item.chassis,
+        decision: "accepte",
+        equipe: assignedTeam,
+        decisionPar: chefName,
+        statut: "En cours",
+        etat: "En cours",
+        avancement: "En cours - 10%",
+        emplacement: autoEmp,
+        dateDebutRep: currentDateTime,
+        dateDebutTravail: currentDateTime,
+        heureDebutTravail: currentTime,
+      });
+
+      const targetVehicle: Flux = {
+        ...(baseVehicle as Flux),
+        id: typeof baseVehicle.id === "number" ? baseVehicle.id : (typeof item.id === "number" ? item.id : Number(item.id) || Date.now()),
+        dateAcceptation: res.dateDecision,
+        dateDebutRep: res.dateDecision || currentDateTime,
+        dateDebutTravail: res.dateDecision || currentDateTime,
+        heureDebutTravail: (res.dateDecision || currentDateTime).split(" ")[1] || currentTime,
+      };
+
+      // Nettoyer la notification
+      removeNouvelleEntreeNotification(item.id);
+
+      // Mettre à jour l'état local des véhicules
+      setVehicles((prev) => {
+        const exists = prev.some((v) =>
+          (normOr && (v.no === normOr || v.ordre === normOr)) ||
+          (normChassis && v.chassis && v.chassis.trim().toUpperCase() === normChassis)
+        );
+        if (exists) {
+          return prev.map((v) =>
+            ((normOr && (v.no === normOr || v.ordre === normOr)) ||
+             (normChassis && v.chassis && v.chassis.trim().toUpperCase() === normChassis))
+              ? {
+                  ...v,
+                  equipe: assignedTeam,
+                  statut: "En cours",
+                  etatIntervention: "En cours",
+                  avancement: "En cours - 10%",
+                  statutAcceptation: "accepte",
+                  dateAcceptation: res.dateDecision,
+                  dateDebutRep: res.dateDecision || currentDateTime,
+                  dateDebutTravail: res.dateDecision || currentDateTime,
+                  heureDebutTravail: (res.dateDecision || currentDateTime).split(" ")[1] || currentTime,
+                  acceptePar: chefName,
+                  emplacement: autoEmp,
+                }
+              : v
+          );
+        }
+        return [targetVehicle, ...prev];
+      });
+
+      // Ouvrir immédiatement la modal d'affectation technicien
+      setPendingEnCoursVehicle(targetVehicle);
+      setIsOnlyTechChange(false);
+      setIsTechModalOpen(true);
+
+      setWriteNotice(
+        `✅ Entrée N° OR ${item.noOr} acceptée et placée dans Interventions En cours (${autoEmp} • Avancement 10%). Choisissez un technicien libre.`
+      );
+    },
+    [currentUser?.name, selectedChefEquipeName, setActiveTab, vehicles]
+  );
+
+  const handleMettreEnAttenteEntree = useCallback(
+    async (item: NouvelleEntreeNotification) => {
+      const chefName = (currentUser?.name || selectedChefEquipeName || "Chef d'équipe").trim();
+      const res = await accepterEntreeParChefEquipe({
+        noOr: item.noOr,
+        chassis: item.chassis,
+        decision: "mis_en_attente",
+        equipe: item.equipe,
+        decisionPar: chefName,
+      });
+
+      removeNouvelleEntreeNotification(item.id);
+      setDismissedEntreeNotifIds((prev) => new Set([...prev, item.id]));
+
+      // Mettre à jour l'état local des véhicules
+      setVehicles((prev) =>
+        prev.map((v) =>
+          ((item.noOr && (v.no === item.noOr || v.ordre === item.noOr)) ||
+           (item.chassis && v.chassis === item.chassis))
+            ? { ...v, statutAcceptation: "mis_en_attente", dateMiseEnAttente: res.dateDecision, misEnAttentePar: chefName }
+            : v
+        )
+      );
+
+      setWriteNotice(
+        `⏸️ Entrée N° OR ${item.noOr} mise en attente le ${res.dateDecision} dans Tableaux de chargement (Attente Réparation).`
+      );
+    },
+    [currentUser?.name, selectedChefEquipeName]
+  );
 
 
   const filteredRows = useMemo(() => {
@@ -2208,29 +2933,15 @@ export default function Dashboard() {
           return (b.creationTimestamp ?? b.id) - (a.creationTimestamp ?? a.id);
         }
 
-        // 2. Pour les lignes de la feuille Google Sheets :
-        // Chaque nouvelle entrée est insérée directement en ligne 2 de la feuille Google Sheets
-        // (sheet.insertRowBefore(2)), ce qui pousse les anciens véhicules vers les lignes 3, 4, etc.
-        // La ligne 2 est donc le véhicule le plus récent et doit impérativement figurer EN TÊTE de tableau.
-        // Un tri par sheetRowNumber croissant garantit que la ligne 2 est en première position pour tous les accès.
-        const rowA =
-          typeof a.sheetRowNumber === "number" && a.sheetRowNumber > 0
-            ? a.sheetRowNumber
-            : typeof a.id === "number"
-              ? a.id
-              : Infinity;
-        const rowB =
-          typeof b.sheetRowNumber === "number" && b.sheetRowNumber > 0
-            ? b.sheetRowNumber
-            : typeof b.id === "number"
-              ? b.id
-              : Infinity;
-
-        if (rowA !== rowB) {
-          return rowA - rowB;
-        }
-
-        return (b.id ?? 0) - (a.id ?? 0);
+        // 2. Règle commune des tableaux : la dernière entrée est toujours en tête.
+        // La date/heure d'entrée est prioritaire ; l'identifiant sert de secours
+        // pour les anciennes lignes qui ne possèdent pas encore d'horodatage.
+        const dateA = parseStoredDate(`${a.dateEntree || ""} ${a.heureEntree || ""}`) ||
+          parseStoredDate(a.dateModification) || a.creationTimestamp || (typeof a.id === "number" ? a.id : 0);
+        const dateB = parseStoredDate(`${b.dateEntree || ""} ${b.heureEntree || ""}`) ||
+          parseStoredDate(b.dateModification) || b.creationTimestamp || (typeof b.id === "number" ? b.id : 0);
+        if (dateA !== dateB) return dateB - dateA;
+        return String(b.id ?? "").localeCompare(String(a.id ?? ""), undefined, { numeric: true });
       });
   }, [activeFilter, dateFilter, search, vehicles, role, activeTab, activeChefEquipeTeam, enCoursTransferOnly]);
 
@@ -2242,18 +2953,8 @@ export default function Dashboard() {
             .map((row) => normalizeDateLabel(row.dateEntree))
             .filter(Boolean)
         )
-      ).sort((a, b) => parseSheetDate(b) - parseSheetDate(a)),
+      ).sort((a, b) => parseStoredDate(b) - parseStoredDate(a)),
     [vehicles]
-  );
-
-  const visibleZones = useMemo(
-    () =>
-      new Set(
-        filteredRows
-          .map((row) => (row.emplacement || "").toUpperCase().trim())
-          .filter((z) => z && !z.startsWith("#") && z !== "NA")
-      ),
-    [filteredRows]
   );
 
   const statusRows = useMemo(
@@ -2288,10 +2989,6 @@ export default function Dashboard() {
         .sort((a, b) => a.localeCompare(b)),
     [rowsByZone]
   );
-
-  const hasActiveSearch = search.trim().length > 0;
-  const hasVisualFilter =
-    activeFilter !== "Tous" || dateFilter !== ALL_DATES || hasActiveSearch;
 
   const kpis = [
     {
@@ -2356,8 +3053,7 @@ export default function Dashboard() {
       .querySelectorAll<SVGGraphicsElement>(".atelier-zone-label")
       .forEach((label) => label.remove());
 
-    rowsByZone.forEach((_, zone) => {
-      if (!zone || !mapZoneIds.has(zone)) return;
+    mapZoneIds.forEach((zone) => {
       let element: SVGGraphicsElement | null = null;
       try {
         element = svg.querySelector<SVGGraphicsElement>(`#${CSS.escape(zone)}`);
@@ -2367,11 +3063,25 @@ export default function Dashboard() {
 
       if (!element) return;
 
-      element.style.setProperty("fill", "transparent");
-      element.style.setProperty("fill-opacity", "0");
-      element.style.setProperty("stroke", "transparent");
-      element.style.setProperty("stroke-width", "1");
-      element.style.setProperty("stroke-opacity", "0");
+      const isOccupied = rowsByZone.has(zone);
+      const isSelected = selectedZone === zone;
+
+      if (!isOccupied) {
+        const freeStyle = getFreeEmplacementStyle(zone);
+        element.style.setProperty("fill", isSelected ? "#3b82f6" : freeStyle.fill);
+        element.style.setProperty("fill-opacity", isSelected ? "0.55" : "0.95");
+        element.style.setProperty("stroke", isSelected ? "#1d4ed8" : freeStyle.stroke);
+        element.style.setProperty("stroke-width", isSelected ? "3.5" : "2");
+        element.style.setProperty("stroke-opacity", "1");
+      }
+      const previousTitle = element.querySelector("title[data-atelier-zone-tooltip]");
+      previousTitle?.remove();
+      const title = document.createElementNS("http://www.w3.org/2000/svg", "title");
+      title.setAttribute("data-atelier-zone-tooltip", "true");
+      title.textContent = isOccupied
+        ? `${zone} — ${rowsByZone.get(zone)?.length || 1} véhicule(s) affecté(s)`
+        : `${zone} — Emplacement libre`;
+      element.prepend(title);
       element.style.setProperty("cursor", "pointer");
       element.style.setProperty("pointer-events", "visiblePainted");
       element.style.setProperty("transition", "all 160ms ease");
@@ -2399,7 +3109,9 @@ export default function Dashboard() {
       const row = rows[0];
       const color = getStatusColor(row.etatIntervention);
       const isSelected = selectedZone === zone;
-      const isVisible = !hasVisualFilter || visibleZones.has(zone);
+      // Un poste occupé reste toujours éclairé : les filtres ne doivent pas
+      // masquer visuellement un véhicule présent dans l'atelier.
+      const isVisible = true;
 
       element.style.setProperty("fill", color);
       element.style.setProperty("opacity", "1");
@@ -2416,6 +3128,17 @@ export default function Dashboard() {
         "stroke-opacity",
         isVisible ? "0.95" : "0.25"
       );
+
+      const tooltip = element.querySelector("title[data-atelier-zone-tooltip]");
+      if (tooltip) {
+        tooltip.textContent = [
+          `Emplacement ${zone}`,
+          `Véhicule : ${row.serie || row.chassis || row.no || "-"}`,
+          `OR : ${row.l2n2500 || row.no || "-"}`,
+          `État : ${formatStatusLabel(row.etatIntervention)}`,
+          `Équipe : ${row.equipe || "-"}`,
+        ].join("\n");
+      }
 
       if (isSelected) {
         element.style.setProperty(
@@ -2472,29 +3195,9 @@ export default function Dashboard() {
       }
     });
   }, [
-    hasVisualFilter,
     rowsByZone,
     selectedZone,
-    visibleZones,
   ]);
-
-  const handleMapHover = (event: MouseEvent<HTMLDivElement>) => {
-    if (isDetailPinned) return;
-
-    let element = event.target as Element | null;
-
-    while (element && element !== event.currentTarget) {
-      const zone = element.id?.toUpperCase();
-
-      if (zone && rowsByZone.has(zone)) {
-        setSelectedZone(zone);
-        setSelectedVehicleId(null);
-        return;
-      }
-
-      element = element.parentElement;
-    }
-  };
 
   const handleMapClick = (event: MouseEvent<HTMLDivElement>) => {
     let element = event.target as Element | null;
@@ -2502,7 +3205,7 @@ export default function Dashboard() {
     while (element && element !== event.currentTarget) {
       const zone = element.id?.toUpperCase();
 
-      if (zone && rowsByZone.has(zone)) {
+      if (zone && (rowsByZone.has(zone) || mapZoneIds.has(zone))) {
         setSelectedZone(zone);
         setSelectedVehicleId(null);
         setIsDetailPinned(true);
@@ -2612,7 +3315,7 @@ export default function Dashboard() {
                     ? "!bg-amber-600 hover:!bg-amber-700 !text-white !font-bold shadow-xs"
                     : ""
                   }`}
-                disabled={sheetStatus === "loading" || isInstantSyncing}
+                disabled={databaseStatus === "loading" || isInstantSyncing}
                 onClick={() => {
                   if ((role === "administration" || role === "chef_atelier") && activeTab === "chargement") {
                     void handleInstantSync();
@@ -2623,7 +3326,7 @@ export default function Dashboard() {
                 type="button"
                 title="Actualiser à l'instant tout le tableau de chargement"
               >
-                <RefreshCw size={14} className={isInstantSyncing || sheetStatus === "loading" ? "animate-spin" : ""} />
+                <RefreshCw size={14} className={isInstantSyncing || databaseStatus === "loading" ? "animate-spin" : ""} />
                 {(role === "administration" || role === "chef_atelier") && activeTab === "chargement"
                   ? (isInstantSyncing ? "Actualisation..." : "Actualiser à l'instant")
                   : "Actualiser"}
@@ -2939,9 +3642,9 @@ export default function Dashboard() {
                 <div className="flex items-center gap-2.5">
                   <Timer size={16} className={activeTab === "suivi_temps" ? "text-white" : "text-indigo-600"} />
                   <div>
-                    <div className="leading-tight">Calcul des Temps</div>
+                    <div className="leading-tight">Chronométrie & Calcul des Temps</div>
                     <div className={`text-[10px] font-medium ${activeTab === "suivi_temps" ? "text-indigo-100" : "text-slate-400"}`}>
-                      Attentes & Travail net
+                      Administration & Chef d'Atelier
                     </div>
                   </div>
                 </div>
@@ -3034,6 +3737,33 @@ export default function Dashboard() {
                 </span>
               </button>
             )}
+
+            {(role === "administration" || role === "chef_atelier") && (
+              <button
+                type="button"
+                onClick={() => setActiveTab("vehicle_inventory")}
+                className={`w-full flex items-center justify-between px-3.5 py-2.5 rounded-xl text-xs font-bold transition-all cursor-pointer text-left ${activeTab === "vehicle_inventory"
+                    ? "bg-cyan-700 text-white shadow-sm"
+                    : "text-slate-600 hover:text-cyan-800 hover:bg-slate-100/90"
+                  }`}
+              >
+                <div className="flex items-center gap-2.5">
+                  <Database size={16} className={activeTab === "vehicle_inventory" ? "text-white" : "text-cyan-700"} />
+                  <div>
+                    <div className="leading-tight">Parc véhicules & engins</div>
+                    <div className={`text-[10px] font-medium ${activeTab === "vehicle_inventory" ? "text-cyan-100" : "text-slate-400"}`}>
+                      Inventaire Excel enregistré
+                    </div>
+                  </div>
+                </div>
+                <span className={`px-2 py-0.5 rounded-full text-[10px] font-bold shrink-0 ${activeTab === "vehicle_inventory"
+                    ? "bg-white/25 text-white"
+                    : "bg-cyan-50 text-cyan-800 border border-cyan-200"
+                  }`}>
+                  SQL
+                </span>
+              </button>
+            )}
           </nav>
 
           {/* Sidebar Footer */}
@@ -3057,11 +3787,95 @@ export default function Dashboard() {
 
         {/* Main Content Area */}
         <div className="dashboard-content-area">
-          {/* Notifications Devis : Réception, Relances & Devis Accepté par le client */}
-          {(activeDevisAppelerNotifications.length > 0 ||
+          {/* Notifications : Nouvelles Entrées, Devis Réception, Relances & Devis Accepté par le client */}
+          {(activeNouvelleEntreeNotificationsForUser.length > 0 ||
+            activeDevisAppelerNotifications.length > 0 ||
             activeDevisRelanceNotifications.length > 0 ||
-            activeDevisAccordNotificationsForUser.length > 0) && (
-            <div className="p-3 sm:p-4 space-y-2.5 bg-gradient-to-r from-emerald-50/95 via-amber-50/90 to-rose-50/90 border-b border-emerald-200 shadow-2xs animate-in slide-in-from-top-1 duration-200">
+            activeDevisAccordNotificationsForUser.length > 0 ||
+            activeReceptionReadyVehicles.length > 0) && (
+            <div className="p-3 sm:p-4 space-y-2.5 bg-gradient-to-r from-blue-50/95 via-emerald-50/90 to-amber-50/90 border-b border-blue-200 shadow-2xs animate-in slide-in-from-top-1 duration-200">
+              {/* Notification 0 : Nouvelle Entrée Réception assignée à l'équipe => Accepter ou Mettre en attente */}
+              {activeNouvelleEntreeNotificationsForUser.map((item) => {
+                const matchingVehicle = vehicles.find(
+                  (v) =>
+                    (item.noOr && (v.no === item.noOr || v.ordre === item.noOr)) ||
+                    (item.chassis && v.chassis === item.chassis)
+                );
+                return (
+                  <div
+                    key={`entree-banner-${item.id}`}
+                    className="p-3.5 bg-white/95 rounded-2xl border-2 border-blue-500 shadow-sm flex flex-col lg:flex-row lg:items-center justify-between gap-3 animate-in fade-in duration-200"
+                  >
+                    <div className="flex items-start gap-3 min-w-0">
+                      <div className="w-10 h-10 rounded-xl bg-gradient-to-br from-blue-600 to-indigo-700 text-white flex items-center justify-center shrink-0 shadow-xs">
+                        <Car size={20} className="animate-pulse" />
+                      </div>
+                      <div className="min-w-0 space-y-1">
+                        <div className="flex items-center gap-2 flex-wrap">
+                          <span className="px-2.5 py-0.5 rounded-md text-[10px] font-black uppercase tracking-wider bg-blue-600 text-white shadow-2xs">
+                            Nouvelle Entrée Atelier
+                          </span>
+                          <span className="px-2 py-0.5 rounded-md text-[11px] font-extrabold bg-blue-100 text-blue-900 border border-blue-300">
+                            Équipe : {item.equipe}
+                          </span>
+                          <span className="px-2 py-0.5 rounded-full text-[10px] font-bold bg-amber-100 text-amber-900 border border-amber-300">
+                            Tableaux de chargement (Attente Réparation)
+                          </span>
+                          <span className="text-[11px] text-slate-500 font-medium">
+                            Enregistré le {item.dateEntreeHeure}
+                          </span>
+                        </div>
+
+                        <div className="text-xs text-slate-800 font-semibold flex items-center gap-2 flex-wrap">
+                          <span>N° OR : <strong className="font-mono text-slate-950 font-black">{item.noOr}</strong></span>
+                          <span>•</span>
+                          <span>Châssis (VIN) : <strong className="font-mono text-slate-700">{item.chassis}</strong></span>
+                          <span>•</span>
+                          <span>Immat : <strong className="font-mono text-blue-900">{item.immatriculation || "-"}</strong></span>
+                          <span>•</span>
+                          <span>Véhicule : <strong className="text-slate-900">{item.marque} {item.modele}</strong></span>
+                          <span>•</span>
+                          <span>Client : <strong className="text-slate-900">{item.nomClient}</strong></span>
+                        </div>
+
+                        <p className="text-[11px] text-slate-600">
+                          Véhicule transmis à l'équipe <strong>{item.equipe}</strong>. Acceptez pour affecter immédiatement un technicien libre, ou mettez-le en attente.
+                        </p>
+                      </div>
+                    </div>
+
+                    <div className="flex items-center gap-2 shrink-0 self-end lg:self-center flex-wrap">
+                      <button
+                        type="button"
+                        onClick={() => void handleAccepterNouvelleEntree(item, matchingVehicle)}
+                        className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-bold text-white bg-emerald-600 hover:bg-emerald-700 active:scale-95 rounded-xl shadow-2xs transition-all cursor-pointer"
+                        title="Accepter l'entrée et affecter un technicien"
+                      >
+                        <CheckCircle2 size={14} />
+                        <span>Accepter</span>
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => void handleMettreEnAttenteEntree(item)}
+                        className="inline-flex items-center gap-1.5 px-3 py-2 text-xs font-bold text-amber-900 bg-amber-100 hover:bg-amber-200 border border-amber-300 active:scale-95 rounded-xl shadow-2xs transition-all cursor-pointer"
+                        title="Mettre en attente dans Tableaux de chargement (Attente Réparation)"
+                      >
+                        <Clock size={14} />
+                        <span>Mettre en attente</span>
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setDismissedEntreeNotifIds((prev) => new Set([...prev, item.id]))}
+                        className="p-1.5 rounded-lg text-slate-400 hover:text-slate-600 hover:bg-slate-100 transition-colors cursor-pointer"
+                        title="Masquer cette alerte"
+                      >
+                        <X size={15} />
+                      </button>
+                    </div>
+                  </div>
+                );
+              })}
+
               {/* Notification 1 : Nouveau devis créé => Appeler le client */}
               {activeDevisAppelerNotifications.map((item) => {
                 const notifId = `appeler-${item.vehicle.id}`;
@@ -3295,16 +4109,90 @@ export default function Dashboard() {
                       )}
                       <button
                         type="button"
-                        onClick={() => handleDismissDevisAccord(item.id)}
+                        onClick={() => handleVoirDansChargement(item, matchingVehicle)}
                         className="p-1 rounded-lg text-slate-400 hover:text-slate-600 hover:bg-slate-100 transition-colors cursor-pointer"
-                        title="Masquer cette notification"
+                        title="Voir dans Tableaux de chargement sans supprimer la notification"
                       >
-                        <X size={15} />
+                        <ClipboardList size={15} />
                       </button>
                     </div>
                   </div>
                 );
               })}
+
+              {/* Notification 4 : Réception - Véhicules Terminer -> Attente client (clients à contacter pour livraison) */}
+              {activeReceptionReadyVehicles.map((v) => (
+                <div
+                  key={`ready-banner-${v.id}`}
+                  className="p-3.5 bg-white/95 rounded-xl border-2 border-emerald-500 shadow-xs flex flex-col md:flex-row md:items-center justify-between gap-3 animate-in fade-in duration-200"
+                >
+                  <div className="flex items-start gap-3 min-w-0">
+                    <div className="w-9 h-9 rounded-xl bg-gradient-to-br from-emerald-600 to-teal-700 text-white flex items-center justify-center shrink-0 shadow-xs">
+                      <PhoneCall size={18} className="animate-pulse" />
+                    </div>
+                    <div className="min-w-0 space-y-0.5">
+                      <div className="flex items-center gap-2 flex-wrap">
+                        <span className="px-2 py-0.5 rounded text-[10px] font-extrabold uppercase bg-emerald-600 text-white tracking-wide">
+                          Prêt pour Livraison / Contacter Client
+                        </span>
+                        <span className="px-2 py-0.5 rounded-full text-[10px] font-bold bg-emerald-100 text-emerald-900 border border-emerald-300">
+                          {v.etatIntervention || "Attente Client"}
+                        </span>
+                        {v.emplacement && (
+                          <span className="px-2 py-0.5 rounded text-[10px] font-bold bg-slate-100 text-slate-800 border border-slate-300">
+                            Emplacement : {v.emplacement}
+                          </span>
+                        )}
+                        {v.dateFinRep && (
+                          <span className="text-[11px] text-slate-500 font-medium">
+                            Terminé le : {v.dateFinRep}
+                          </span>
+                        )}
+                      </div>
+                      <div className="text-xs text-slate-800 font-semibold flex items-center gap-2 flex-wrap">
+                        <span>OR : <strong className="font-mono text-slate-900">{v.no || v.ordre}</strong></span>
+                        <span>•</span>
+                        <span>Client : <strong className="text-slate-900">{v.client || "-"}</strong></span>
+                        <span>•</span>
+                        <span>Véhicule : <strong>{v.marque} {v.modele}</strong> ({v.serie || v.immatriculation || "-"})</span>
+                        {v.nomTechnicien && v.nomTechnicien !== "-" && (
+                          <>
+                            <span>•</span>
+                            <span>Réparé par : <strong className="text-slate-700">{v.nomTechnicien}</strong></span>
+                          </>
+                        )}
+                      </div>
+                      <p className="text-[11px] text-slate-600">
+                        Intervention terminée par l'atelier. Informer le client <strong>{v.client || ""}</strong> que son véhicule est prêt pour restitution.
+                      </p>
+                    </div>
+                  </div>
+
+                  <div className="flex items-center gap-2 shrink-0 self-end md:self-center flex-wrap">
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setSelectedVehicleId(v.id);
+                        setActiveTab("chargement");
+                        setActiveFilter("Attente Client");
+                      }}
+                      className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-bold text-white bg-emerald-600 hover:bg-emerald-700 active:scale-95 rounded-lg shadow-2xs transition-all cursor-pointer"
+                      title="Consulter le véhicule en Attente Client"
+                    >
+                      <CheckCircle2 size={13} />
+                      <span>Voir Attente Client</span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setDismissedReadyNotifIds((prev) => new Set([...prev, v.id]))}
+                      className="p-1 rounded-lg text-slate-400 hover:text-slate-600 hover:bg-slate-100 transition-colors cursor-pointer"
+                      title="Masquer cette notification"
+                    >
+                      <X size={15} />
+                    </button>
+                  </div>
+                </div>
+              ))}
             </div>
           )}
 
@@ -3323,13 +4211,34 @@ export default function Dashboard() {
               </div>
             )
           ) : activeTab === "suivi_entrees" ? (
-            <SuiviEntreesTable />
+            <SuiviEntreesTable
+              onNavigateToMap={(emp) => {
+                const targetZone = normalizeEmplacementCode(emp);
+                setActiveTab("plan_atelier");
+                setSelectedZone(targetZone);
+                setIsDetailPinned(true);
+              }}
+            />
+          ) : activeTab === "vehicle_inventory" ? (
+            role === "administration" || role === "chef_atelier" ? (
+              <VehicleInventoryView />
+            ) : (
+              <div className="p-8 text-center bg-white rounded-2xl m-4 sm:m-6 border border-slate-200 shadow-sm">
+                <div className="w-12 h-12 rounded-xl bg-amber-100 text-amber-700 flex items-center justify-center mx-auto mb-3">
+                  <ShieldAlert className="w-6 h-6" />
+                </div>
+                <h2 className="text-base font-bold text-slate-800">Accès Restreint</h2>
+                <p className="text-xs text-slate-500 mt-1 max-w-md mx-auto">
+                  La consultation du Parc véhicules & engins est réservée à l'Administration et au Chef d'Atelier.
+                </p>
+              </div>
+            )
           ) : activeTab === "gestion_acces" ? (
             <GestionAccesView />
           ) : activeTab === "gestion_equipes" ? (
             <GestionEquipesView />
           ) : activeTab === "moyennes" ? (
-            <MoyennesView />
+            <MoyennesView vehicles={vehicles} />
           ) : activeTab === "essai" ? (
             permissions.canViewEssai ? (
               <EssaiView
@@ -3342,10 +4251,11 @@ export default function Dashboard() {
                 }}
                 savingVehicleId={savingVehicleId}
                 canEdit={permissions.canEditEtat || permissions.canEditAvancement}
+                role={role}
                 userTeam={role === "chef_equipe" ? activeChefEquipeTeam : undefined}
                 isChefEquipe={role === "chef_equipe"}
                 onRefresh={() => void loadVehicles()}
-                isRefreshing={sheetStatus === "loading" || isInstantSyncing}
+                isRefreshing={databaseStatus === "loading" || isInstantSyncing}
               />
             ) : (
               <div className="p-8 text-center bg-white rounded-2xl m-4 sm:m-6 border border-slate-200 shadow-sm">
@@ -3374,7 +4284,7 @@ export default function Dashboard() {
                 onMarquerLivrer={handleMarquerAchatLivrer}
                 onMarquerAttente={handleMarquerAchatAttente}
                 onRefresh={() => void loadVehicles()}
-                isRefreshing={sheetStatus === "loading" || isInstantSyncing}
+                isRefreshing={databaseStatus === "loading" || isInstantSyncing}
               />
             ) : (
               <div className="p-8 text-center bg-white rounded-2xl m-4 sm:m-6 border border-slate-200 shadow-sm">
@@ -3403,7 +4313,7 @@ export default function Dashboard() {
                 role={role}
                 currentUser={currentUser}
                 onRefresh={() => void loadVehicles()}
-                isRefreshing={sheetStatus === "loading" || isInstantSyncing}
+                isRefreshing={databaseStatus === "loading" || isInstantSyncing}
                 onNavigateToTab={(tab, filter, vehicleId) => {
                   setActiveTab(tab as any);
                   if (filter) setActiveFilter(filter as any);
@@ -3432,8 +4342,8 @@ export default function Dashboard() {
 
                   <div className="map-toolbar-divider" />
 
-                  {/* Statuts Horizontaux */}
-                  <div className="map-statuses-bar">
+                  {/* Légende des statuts, affichable ou masquable */}
+                  {showMapLegend && <div className="map-statuses-bar">
                     {statusMeta.map((status) => {
                       const isActive = activeFilter === status.label;
                       return (
@@ -3466,7 +4376,7 @@ export default function Dashboard() {
                       <span className="status-dot" style={{ backgroundColor: "#94a3b8" }} />
                       <span>Libre</span>
                     </button>
-                  </div>
+                  </div>}
 
                   {(activeFilter !== "Tous" || selectedZone) && (
                     <div className="map-chips">
@@ -3505,6 +4415,15 @@ export default function Dashboard() {
                 <div className="map-controls">
                   <button
                     className="map-ctrl-btn"
+                    onClick={() => setShowMapLegend((shown) => !shown)}
+                    title={showMapLegend ? "Masquer la légende des états" : "Afficher la légende des états"}
+                    type="button"
+                  >
+                    <Eye size={14} />
+                    <span className="hidden sm:inline">{showMapLegend ? "Masquer légende" : "Afficher légende"}</span>
+                  </button>
+                  <button
+                    className="map-ctrl-btn"
                     onClick={() => void toggleFullscreen()}
                     title={isFullscreen ? "Quitter le plein écran" : "Afficher en plein écran"}
                     type="button"
@@ -3518,18 +4437,16 @@ export default function Dashboard() {
                   className="atelier-map"
                   dangerouslySetInnerHTML={{ __html: atelierMapDisplaySvg }}
                   onClick={handleMapClick}
-                  onMouseLeave={hideVehicleDetails}
-                  onMouseMove={handleMapHover}
                   ref={mapRef}
                 />
               </section>
 
               <aside
-                className={`panel detail-panel ${selectedVehicle ? "detail-open" : ""
+                className={`panel detail-panel ${(selectedVehicle || selectedZone) ? "detail-open" : ""
                   } ${isDetailPinned ? "detail-pinned" : ""}`}
                 aria-label="Fiche synoptique du véhicule"
               >
-                {selectedVehicle && (
+                {selectedVehicle ? (
                   <>
                     <div className="panel-head">
                       <div>
@@ -3616,11 +4533,11 @@ export default function Dashboard() {
                         <strong>{displayText(selectedVehicle.categorie)}</strong>
                       </div>
                       <div>
-                        <span>Technicien</span>
+                        <span>N° Matricule</span>
                         <strong>{displayText(selectedVehicle.technicien)}</strong>
                       </div>
                       <div>
-                        <span>NOM DE Technicien</span>
+                        <span>NOM DE TECHNICIEN</span>
                         <strong>{displayText(selectedVehicle.nomTechnicien)}</strong>
                       </div>
                       <div>
@@ -3651,7 +4568,49 @@ export default function Dashboard() {
                       </p>
                     )}
                   </>
-                )}
+                ) : selectedZone ? (
+                  <div className="flex flex-col gap-4 p-1">
+                    <div className="panel-head">
+                      <div>
+                        <p className="panel-kicker text-emerald-600 font-bold">Poste Disponible</p>
+                        <h2 className="text-xl font-black text-slate-900">Emplacement {selectedZone}</h2>
+                      </div>
+                      <div className="flex items-center gap-2">
+                        <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-bold bg-emerald-100 text-emerald-800 border border-emerald-300">
+                          <span className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse" />
+                          Libre
+                        </span>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setSelectedZone(null);
+                            setSelectedVehicleId(null);
+                            setIsDetailPinned(false);
+                          }}
+                          className="p-1 rounded-lg text-slate-400 hover:text-slate-700 hover:bg-slate-100 transition-colors cursor-pointer"
+                          title="Fermer la fiche"
+                        >
+                          <X size={16} />
+                        </button>
+                      </div>
+                    </div>
+
+                    <div className="p-3.5 rounded-xl bg-slate-50 border border-slate-200 flex flex-col gap-2.5 text-xs">
+                      <div className="flex justify-between items-center">
+                        <span className="text-slate-500 font-semibold">Zone d'atelier :</span>
+                        <strong className="text-slate-800">{getZoneForEmplacement(selectedZone)}</strong>
+                      </div>
+                      <div className="flex justify-between items-center">
+                        <span className="text-slate-500 font-semibold">Statut actuel :</span>
+                        <span className="font-bold text-emerald-700">Aucun véhicule affecté</span>
+                      </div>
+                    </div>
+
+                    <p className="text-xs text-slate-500 leading-relaxed">
+                      Ce poste de travail est actuellement vacant et prêt à accueillir une intervention pour l'équipe responsable.
+                    </p>
+                  </div>
+                ) : null}
               </aside>
             </main>
           ) : (
@@ -3782,7 +4741,7 @@ export default function Dashboard() {
                           <button
                             type="button"
                             onClick={() => void handleInstantSync()}
-                            disabled={isInstantSyncing || sheetStatus === "loading"}
+                            disabled={isInstantSyncing || databaseStatus === "loading"}
                             className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-bold text-amber-900 bg-amber-100 hover:bg-amber-200 border border-amber-300 rounded-lg shadow-2xs transition-all cursor-pointer active:scale-95 disabled:opacity-50"
                             title="Synchroniser et actualiser à l'instant tout le tableau de chargement"
                           >
@@ -3790,21 +4749,14 @@ export default function Dashboard() {
                             {isInstantSyncing ? "Actualisation..." : "Actualiser à l'instant"}
                           </button>
                         )}
-                        <a
-                          className="sheet-link"
-                          href={VEHICLE_SHEET_URL}
-                          rel="noreferrer"
-                          target="_blank"
-                        >
-                          Google Sheets
-                        </a>
+                        <span className="sheet-link">PostgreSQL</span>
                         <span
-                          className={`sheet-state sheet-state-${sheetStatus}`}
-                          title={sheetError}
+                          className={`sheet-state sheet-state-${databaseStatus}`}
+                          title={databaseError}
                         >
-                          {sheetStatus === "loading"
+                          {databaseStatus === "loading"
                             ? "Chargement"
-                            : sheetStatus === "ready"
+                            : databaseStatus === "ready"
                               ? "Connecté"
                               : "Secours"}
                         </span>
@@ -3980,14 +4932,13 @@ export default function Dashboard() {
                       )}
                     </div>
 
-                    {sheetStatus === "fallback" && (
+                    {databaseStatus === "fallback" && (
                       <div className="table-alert">
-                        Google Sheets n'est pas accessible. Partage la feuille en lecture
-                        avec toute personne ayant le lien.
+                        PostgreSQL n'est pas accessible. Vérifiez la configuration de la base et l'état du serveur API.
                       </div>
                     )}
 
-                    {sheetStatus === "ready" && missingMapZones.length > 0 && (
+                    {databaseStatus === "ready" && missingMapZones.length > 0 && (
                       <div className="table-alert table-alert-info">
                         Emplacements absents du plan:{" "}
                         {missingMapZones.slice(0, 8).join(", ")}
@@ -3995,10 +4946,9 @@ export default function Dashboard() {
                       </div>
                     )}
 
-                    {!canWriteToSheet && !writeError && (
+                    {!canWriteToDatabase && !writeError && (
                       <div className="table-alert table-alert-info">
-                        Écriture Sheets à configurer: déploie le script Apps Script puis
-                        ajoute VITE_SHEET_WRITE_URL dans .env.local.
+                        Le serveur PostgreSQL n'est pas configuré. Vérifiez DATABASE_URL dans le fichier .env du serveur.
                       </div>
                     )}
 
@@ -4013,6 +4963,8 @@ export default function Dashboard() {
                     )}
 
                     <datalist id="atelier-zone-options">
+                      <option value="Place complet" />
+                      <option value="Livraison au client" />
                       {editableMapZoneIds.map((zone) => (
                         <option key={zone} value={zone} />
                       ))}
@@ -4041,7 +4993,7 @@ export default function Dashboard() {
                                 <col className="col-chassis" />
                                 <col className="col-state" />
                                 <col className="col-emplacement" />
-                                <col className="col-action" />
+                                {role !== "chef_equipe" && <col className="col-action" />}
                               </colgroup>
                             ) : isEnCoursTab ? (
                               <colgroup>
@@ -4056,7 +5008,7 @@ export default function Dashboard() {
                                 {role !== "chef_equipe" && <col className="col-team" />}
                                 <col className="col-avancement" />
                                 <col className="col-emplacement" />
-                                <col className="col-action" />
+                                {role !== "chef_equipe" && <col className="col-action" />}
                               </colgroup>
                             ) : (
                               <colgroup>
@@ -4075,7 +5027,7 @@ export default function Dashboard() {
                                 <col className="col-avancement" />
                                 <col className="col-state" />
                                 <col className="col-emplacement" />
-                                <col className="col-action" />
+                                {role !== "chef_equipe" && <col className="col-action" />}
                               </colgroup>
                             )}
 
@@ -4089,7 +5041,7 @@ export default function Dashboard() {
                                   <th>N° Chassis</th>
                                   <th>Etat</th>
                                   <th>Emplacement</th>
-                                  <th>Fiche</th>
+                                  {role !== "chef_equipe" && <th>Actions</th>}
                                 </tr>
                               ) : isEnCoursTab ? (
                                 <tr>
@@ -4103,12 +5055,12 @@ export default function Dashboard() {
                                   ) : (
                                     <th>Etat</th>
                                   )}
-                                  <th>Technicien</th>
-                                  <th>NOM DE Technicien</th>
+                                  <th>N° Matricule</th>
+                                  <th>NOM DE TECHNICIEN</th>
                                   {role !== "chef_equipe" && <th>Équipe</th>}
                                   <th>Avancement</th>
                                   <th>Emplacement</th>
-                                  <th>Fiche</th>
+                                  {role !== "chef_equipe" && <th>Actions</th>}
                                 </tr>
                               ) : (
                                 <tr>
@@ -4121,13 +5073,13 @@ export default function Dashboard() {
                                   <th>Modèle</th>
                                   <th>N° Chassis</th>
                                   <th>Catégorie</th>
-                                  <th>Technicien</th>
-                                  <th>NOM DE Technicien</th>
+                                  <th>N° Matricule</th>
+                                  <th>NOM DE TECHNICIEN</th>
                                   <th>Équipe</th>
                                   <th>Avancement</th>
                                   <th>Etat</th>
                                   <th>Emplacement</th>
-                                  <th>Fiche</th>
+                                  {role !== "chef_equipe" && <th>Actions</th>}
                                 </tr>
                               )}
                             </thead>
@@ -4215,6 +5167,33 @@ export default function Dashboard() {
                                         </button>
                                       )}
                                     </div>
+                                    {row.dateAcceptation && (
+                                      <div
+                                        className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-semibold bg-emerald-50 text-emerald-800 border border-emerald-200 mt-1 w-fit"
+                                        title={`Accepté le ${row.dateAcceptation}${row.acceptePar ? ` par ${row.acceptePar}` : ""}`}
+                                      >
+                                        <CheckCircle2 size={10} className="text-emerald-600 shrink-0" />
+                                        <span>Accepté : {row.dateAcceptation}</span>
+                                      </div>
+                                    )}
+                                    {(row.dateDebutRep || row.dateDebutTravail) && (
+                                      <div
+                                        className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-semibold bg-blue-50 text-blue-800 border border-blue-200 mt-1 w-fit"
+                                        title={`Début des travaux : ${row.dateDebutRep || row.dateDebutTravail}`}
+                                      >
+                                        <Clock size={10} className="text-blue-600 shrink-0" />
+                                        <span>Début : {row.dateDebutRep || row.dateDebutTravail}</span>
+                                      </div>
+                                    )}
+                                    {row.dateMiseEnAttente && !row.dateAcceptation && (
+                                      <div
+                                        className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-semibold bg-amber-50 text-amber-800 border border-amber-200 mt-1 w-fit"
+                                        title={`Mis en attente le ${row.dateMiseEnAttente}${row.misEnAttentePar ? ` par ${row.misEnAttentePar}` : ""}`}
+                                      >
+                                        <Clock size={10} className="text-amber-600 shrink-0" />
+                                        <span>En attente : {row.dateMiseEnAttente}</span>
+                                      </div>
+                                    )}
                                   </td>
                                 );
 
@@ -4261,6 +5240,12 @@ export default function Dashboard() {
                                     );
                                   }
 
+                                  const hasTech = Boolean(
+                                    (row.technicien && row.technicien !== "-") ||
+                                    (row.nomTechnicien && row.nomTechnicien !== "-")
+                                  );
+                                  const isTechOccupied = hasTech && isVehicleActivelyOccupyingTech(row, reaffectationsMap);
+
                                   return (
                                     <td
                                       title={row.nomTechnicien || (permissions.canEditEtat ? "Cliquer pour affecter ou modifier le technicien" : undefined)}
@@ -4279,6 +5264,27 @@ export default function Dashboard() {
                                             <Wrench size={11} className="text-slate-300 hover:text-blue-600 shrink-0" />
                                           )}
                                         </div>
+                                        {hasTech && (
+                                          <div className="flex items-center gap-1 flex-wrap mt-0.5">
+                                            {isTechOccupied ? (
+                                              <span
+                                                className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[9px] font-extrabold bg-rose-50 text-rose-700 border border-rose-200 shadow-2xs"
+                                                title="Mécanicien affecté et intervention active en cours : 🔴 Occupé"
+                                              >
+                                                <span className="w-1.5 h-1.5 rounded-full bg-rose-600 animate-pulse" />
+                                                <span>🔴 Occupé</span>
+                                              </span>
+                                            ) : (
+                                              <span
+                                                className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[9px] font-bold bg-emerald-50 text-emerald-700 border border-emerald-200 shadow-2xs"
+                                                title="Intervention terminée, en attente ou réaffectée : 🟢 Disponible"
+                                              >
+                                                <span className="w-1.5 h-1.5 rounded-full bg-emerald-500" />
+                                                <span>🟢 Disponible</span>
+                                              </span>
+                                            )}
+                                          </div>
+                                        )}
                                         {isReaffActive && (
                                           <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-bold bg-fuchsia-100 text-fuchsia-800 border border-fuchsia-300 w-fit">
                                             <Clock size={10} className="text-fuchsia-700 shrink-0" />
@@ -4403,12 +5409,12 @@ export default function Dashboard() {
                                                   </div>
                                                   <button
                                                     type="button"
-                                                    disabled={true}
-                                                    className="inline-flex items-center justify-center gap-1 px-2 py-1 font-bold text-slate-400 bg-slate-200 rounded text-[10px] cursor-not-allowed opacity-80"
-                                                    title={`Le technicien ${row.nomTechnicien || row.technicien} est actuellement occupé sur l'OR ${techBusyCar.no || techBusyCar.serie || techBusyCar.id}. Il doit terminer ce véhicule avant de pouvoir reprendre ce travail.`}
+                                                    onClick={() => setRepriseChooserVehicle(row)}
+                                                    className="inline-flex items-center justify-center gap-1 px-2 py-1 font-bold text-amber-900 bg-amber-100 hover:bg-amber-200 border border-amber-300 rounded text-[10px] transition-colors cursor-pointer"
+                                                    title={`Voir tous les travaux de ${row.nomTechnicien || row.technicien} et choisir l'OR à reprendre`}
                                                   >
-                                                    <Play size={9} className="fill-slate-400 text-slate-400" />
-                                                    <span>Reprendre (Technicien occupé)</span>
+                                                    <Play size={9} className="fill-amber-800 text-amber-800" />
+                                                    <span>Choisir le travail à reprendre</span>
                                                   </button>
                                                 </div>
                                               ) : (
@@ -4428,6 +5434,15 @@ export default function Dashboard() {
                                             <div className="mt-0.5 text-[9px] text-slate-500 font-medium flex items-center gap-1">
                                               <CheckCircle2 size={10} className="text-emerald-600 shrink-0" />
                                               <span>Repris le : {reaff.dateReprise}</span>
+                                            </div>
+                                          )}
+                                          {(row.dateDebutRep || row.dateDebutTravail) && (
+                                            <div
+                                              className="mt-0.5 text-[9px] font-semibold text-blue-800 bg-blue-50/90 px-1.5 py-0.5 rounded border border-blue-200/80 flex items-center gap-1 w-fit"
+                                              title={`Début des travaux : ${row.dateDebutRep || row.dateDebutTravail}`}
+                                            >
+                                              <Clock size={9} className="text-blue-600 shrink-0" />
+                                              <span>Début : {row.dateDebutRep || row.dateDebutTravail}</span>
                                             </div>
                                           )}
                                         </div>
@@ -4502,6 +5517,15 @@ export default function Dashboard() {
                                               <span>Repris : {reaff.dateReprise}</span>
                                             </div>
                                           )}
+                                          {(row.dateDebutRep || row.dateDebutTravail) && (
+                                            <div
+                                              className="mt-0.5 text-[9px] font-semibold text-blue-800 bg-blue-50/90 px-1.5 py-0.5 rounded border border-blue-200/80 flex items-center gap-1 w-fit"
+                                              title={`Début des travaux : ${row.dateDebutRep || row.dateDebutTravail}`}
+                                            >
+                                              <Clock size={9} className="text-blue-600 shrink-0" />
+                                              <span>Début : {row.dateDebutRep || row.dateDebutTravail}</span>
+                                            </div>
+                                          )}
                                         </div>
                                       ) : (
                                         <div className="flex flex-col gap-0.5">
@@ -4517,9 +5541,12 @@ export default function Dashboard() {
                                   );
                                 };
 
-                                const renderCellEmplacement = () => (
-                                  <td>
-                                    <div className="emplacement-editor">
+                                const renderCellEmplacement = () => {
+                                  const isComplet = draftValue === FULL_PARKING_EMPLACEMENT || row.emplacement === FULL_PARKING_EMPLACEMENT;
+                                  return (
+                                    <td>
+                                      <div className="flex items-center gap-1.5">
+                                        <div className={`emplacement-editor ${isComplet ? "border-red-400 bg-red-50/50" : ""}`}>
                                       <input
                                         aria-label={`Modifier emplacement ${row.no}`}
                                         disabled={isSaving || !permissions.canEditEmplacement}
@@ -4582,8 +5609,36 @@ export default function Dashboard() {
                                         <Save size={12} />
                                       </button>
                                     </div>
-                                  </td>
-                                );
+
+                                    {row.emplacement && row.emplacement !== "-" && row.emplacement !== "NA" && (
+                                      <button
+                                        type="button"
+                                        onClick={(event) => {
+                                          event.stopPropagation();
+                                          const targetZone = normalizeEmplacementCode(row.emplacement);
+                                          setActiveTab("plan_atelier");
+                                          setSelectedZone(targetZone);
+                                          setSelectedVehicleId(row.id);
+                                          setIsDetailPinned(true);
+                                        }}
+                                        className={`p-1.5 rounded-lg border transition-all cursor-pointer shrink-0 ${
+                                          isComplet
+                                            ? "bg-red-50 text-red-700 border-red-200 hover:bg-red-100"
+                                            : "bg-amber-50 text-amber-700 border-amber-200 hover:bg-amber-100"
+                                        }`}
+                                        title={
+                                          isComplet
+                                            ? "Atelier complet (aucune place libre disponible)"
+                                            : `Voir le poste ${row.emplacement} sur le Plan d'Atelier`
+                                        }
+                                      >
+                                        <MapPin size={12} />
+                                      </button>
+                                    )}
+                                  </div>
+                                </td>
+                              );
+                            };
 
                                 const renderCellFiche = () => (
                                   <td className="text-center">
@@ -4629,7 +5684,7 @@ export default function Dashboard() {
                                         <td title={row.chassis}>{displayText(row.chassis)}</td>
                                         {renderCellEtat()}
                                         {renderCellEmplacement()}
-                                        {renderCellFiche()}
+                                        {role !== "chef_equipe" && renderCellFiche()}
                                       </>
                                     ) : isEnCoursTab ? (
                                       /* CAS 2 : Interventions En cours (OR, Client, Marque, Modèle, N° Chassis, Etat/Matricule, Tech, Nom Tech, Avancement, Emplacement, Fiche) */
@@ -4666,7 +5721,7 @@ export default function Dashboard() {
                                         {role !== "chef_equipe" && renderCellEquipe()}
                                         {renderCellAvancement()}
                                         {renderCellEmplacement()}
-                                        {renderCellFiche()}
+                                        {role !== "chef_equipe" && renderCellFiche()}
                                       </>
                                     ) : (
                                       /* CAS 3 : Tableaux de chargement complet (Tous les véhicules) - 16 colonnes */
@@ -4686,7 +5741,7 @@ export default function Dashboard() {
                                         {renderCellAvancement()}
                                         {renderCellEtat()}
                                         {renderCellEmplacement()}
-                                        {renderCellFiche()}
+                                        {role !== "chef_equipe" && renderCellFiche()}
                                       </>
                                     )}
                                   </tr>
@@ -4698,12 +5753,12 @@ export default function Dashboard() {
                                   <td
                                     colSpan={
                                       isChefEquipeChargement
-                                        ? 8
+                                        ? role === "chef_equipe" ? 7 : 8
                                         : isEnCoursTab
                                           ? role === "chef_equipe"
                                             ? 11
                                             : 12
-                                          : 16
+                                          : role === "chef_equipe" ? 15 : 16
                                     }
                                   >
                                     <div className="table-empty">
@@ -4859,10 +5914,57 @@ export default function Dashboard() {
         </div>
       )}
 
+      {/* Notification équipe : retour après essai non conforme, à accepter avant reprise */}
+      {role === "chef_equipe" && returnedEssaiNotifications.filter((item) =>
+        isVehicleMatchingTeam(item.equipe, activeChefEquipeTeam || "")
+      ).length > 0 && (
+        <div className="fixed top-24 right-6 z-50 max-w-sm w-full pointer-events-auto flex flex-col gap-3">
+          {returnedEssaiNotifications
+            .filter((item) => isVehicleMatchingTeam(item.equipe, activeChefEquipeTeam || ""))
+            .slice(0, 2)
+            .map((item) => (
+              <div key={`notif-retour-essai-${item.vehicle.id}`} className="bg-white rounded-2xl shadow-2xl border-2 border-violet-500 p-5">
+                <div className="flex items-start justify-between gap-3">
+                  <div>
+                    <p className="text-[10px] font-extrabold uppercase tracking-wider text-violet-700">Retour après essai</p>
+                    <h3 className="mt-1 text-sm font-black text-slate-900">OR {item.vehicle.no || item.vehicle.ordre || item.vehicle.id}</h3>
+                    <p className="mt-1 text-xs text-slate-600">Essai non conforme · retour le {item.timestamp}</p>
+                  </div>
+                  <Gauge size={22} className="text-violet-600 shrink-0" />
+                </div>
+                <p className="mt-3 rounded-lg bg-amber-50 border border-amber-200 px-3 py-2 text-[11px] text-amber-900">
+                  Le véhicule est dans <strong>Tableaux de chargement · Attente Réparation</strong>. Acceptez-le pour redémarrer le travail.
+                </p>
+                <div className="mt-3 flex gap-2">
+                  <button
+                    type="button"
+                    onClick={() => void handleAcceptReturnedEssai(item)}
+                    className="flex-1 py-2.5 px-3 bg-violet-600 hover:bg-violet-700 text-white rounded-xl text-xs font-bold transition-colors cursor-pointer"
+                  >
+                    Accepter & démarrer
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setReturnedEssaiNotifications((previous) => previous.filter((entry) => entry.vehicle.id !== item.vehicle.id))}
+                    className="py-2.5 px-3 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-xl text-xs font-bold border border-slate-300 transition-colors cursor-pointer"
+                  >
+                    Plus tard
+                  </button>
+                </div>
+              </div>
+            ))}
+        </div>
+      )}
+
       {/* Notification Flottante - Pièces Achat Retirées avec Bouton Accepter et Reprendre */}
-      {deliveredAchatNotifications.length > 0 && (
+      {role === "chef_equipe" && deliveredAchatNotifications.filter((item) =>
+        isVehicleMatchingTeam(item.demande.equipe || item.vehicle.equipe || "", activeChefEquipeTeam || "")
+      ).length > 0 && (
         <div className="fixed top-24 right-6 z-50 max-w-sm w-full animate-in fade-in slide-from-top-4 duration-300 pointer-events-auto flex flex-col gap-3">
-          {deliveredAchatNotifications.slice(0, 2).map((item) => (
+          {deliveredAchatNotifications
+            .filter((item) => isVehicleMatchingTeam(item.demande.equipe || item.vehicle.equipe || "", activeChefEquipeTeam || ""))
+            .slice(0, 2)
+            .map((item) => (
             <div
               key={`notif-achat-${item.vehicle.id}`}
               className="bg-white/95 backdrop-blur-md rounded-2xl shadow-2xl border-2 border-emerald-500 p-5 relative overflow-hidden"
@@ -4877,10 +5979,10 @@ export default function Dashboard() {
                   </div>
                   <div>
                     <h3 className="text-sm font-black text-slate-900 leading-tight">
-                      📦 Pièce Retirée !
+                      📦 Pièce arrivée pour votre équipe
                     </h3>
                     <p className="text-[11px] text-emerald-800 font-semibold mt-0.5">
-                      Prêt pour reprise en atelier • {item.timestamp}
+                      En attente de votre acceptation • {item.timestamp}
                     </p>
                   </div>
                 </div>
@@ -4931,12 +6033,12 @@ export default function Dashboard() {
               <div className="flex items-center gap-2">
                 <button
                   type="button"
-                  onClick={() => handleAcceptDeliveredAchat(item)}
+                  onClick={() => void handleAcceptDeliveredAchat(item)}
                   className="flex-1 py-2.5 px-3 bg-emerald-600 hover:bg-emerald-700 active:scale-95 text-white rounded-xl text-xs font-bold flex items-center justify-center gap-1.5 shadow-md shadow-emerald-600/20 transition-all cursor-pointer"
-                  title="Accepter et reprendre l'intervention en cours"
+                  title="Accepter et démarrer uniquement si le technicien est disponible"
                 >
                   <CheckCircle2 size={16} />
-                  <span>Accepter & Reprendre</span>
+                  <span>Accepter & Démarrer</span>
                 </button>
 
                 <button
@@ -5168,14 +6270,9 @@ export default function Dashboard() {
                       </p>
                     </div>
                   </div>
-                  <button
-                    type="button"
-                    onClick={() => handleDismissDevisAccord(item.id)}
-                    className="text-slate-400 hover:text-slate-700 p-1 rounded-lg hover:bg-slate-100 transition-colors cursor-pointer"
-                    title="Fermer la notification"
-                  >
-                    <X size={16} />
-                  </button>
+                  <span className="px-2 py-1 rounded-lg bg-amber-50 border border-amber-200 text-[10px] font-bold text-amber-800 text-center">
+                    En attente d'acceptation
+                  </span>
                 </div>
 
                 <div className="p-3 bg-slate-50 rounded-xl border border-slate-200/80 mb-4 space-y-1.5 text-xs">
@@ -5247,17 +6344,113 @@ export default function Dashboard() {
                     )}
                     <button
                       type="button"
-                      onClick={() => handleDismissDevisAccord(item.id)}
+                      onClick={() => handleVoirDansChargement(item, matchingVehicle)}
                       className="p-2 text-slate-500 hover:text-slate-800 hover:bg-slate-100 rounded-xl transition-colors cursor-pointer border border-slate-200"
-                      title="Fermer"
+                      title="Voir dans Tableaux de chargement sans supprimer la notification"
                     >
-                      <X size={15} />
+                      <ClipboardList size={15} />
                     </button>
                   </div>
                 </div>
               </div>
             );
           })}
+        </div>
+      )}
+
+      {/* Choix du travail à reprendre après réaffectation */}
+      {repriseChooserVehicle && (
+        <div className="fixed inset-0 z-[80] bg-slate-950/45 backdrop-blur-[1px] flex items-center justify-center p-4">
+          <div className="w-full max-w-2xl bg-white rounded-2xl shadow-2xl border border-slate-200 overflow-hidden">
+            <div className="px-5 py-4 bg-gradient-to-r from-fuchsia-700 to-violet-700 text-white flex items-start justify-between gap-4">
+              <div>
+                <p className="text-[10px] uppercase tracking-[0.16em] font-extrabold text-fuchsia-100">Technicien réaffecté</p>
+                <h2 className="mt-1 text-base font-black">Choisir le travail à reprendre</h2>
+                <p className="mt-1 text-xs text-fuchsia-100">
+                  {repriseChooserVehicle.nomTechnicien || repriseChooserVehicle.technicien} — tous les OR ouverts sont affichés ci-dessous.
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => setRepriseChooserVehicle(null)}
+                className="p-1.5 rounded-lg hover:bg-white/15 text-white transition-colors cursor-pointer"
+                title="Fermer"
+                aria-label="Fermer"
+              >
+                <X size={18} />
+              </button>
+            </div>
+
+            <div className="p-5 space-y-3 max-h-[70vh] overflow-y-auto">
+              <p className="text-xs text-slate-600 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2">
+                Un OR déjà <strong>En cours</strong> doit être terminé avant de reprendre un autre OR. Si tous les OR sont réaffectés, choisissez celui qui doit redémarrer.
+              </p>
+
+              {repriseChooserWorks.length === 0 ? (
+                <p className="py-8 text-center text-sm text-slate-500">Aucun travail ouvert trouvé pour ce technicien.</p>
+              ) : (
+                repriseChooserWorks.map((work) => {
+                  const record = getReaffectationForVehicle(work);
+                  const isActive = isVehicleActivelyOccupyingTech(work, reaffectationsMap);
+                  const isReaffecte = Boolean(record && !record.isRepris && !isActive);
+                  const busyWork = isReaffecte
+                    ? getActiveVehicleForTech(
+                        work.technicien || "",
+                        work.nomTechnicien || "",
+                        vehicles,
+                        work.id,
+                        work.no,
+                        reaffectationsMap
+                      )
+                    : undefined;
+
+                  return (
+                    <div key={`reprise-choice-${work.id}`} className="rounded-xl border border-slate-200 p-3 flex flex-col sm:flex-row sm:items-center gap-3">
+                      <div className="min-w-0 flex-1">
+                        <div className="flex items-center gap-2 flex-wrap">
+                          <span className="font-black text-slate-900">OR {work.no || work.ordre || work.id}</span>
+                          <span className={`px-2 py-0.5 rounded-full text-[10px] font-extrabold border ${
+                            isActive
+                              ? "bg-rose-50 text-rose-700 border-rose-200"
+                              : "bg-fuchsia-50 text-fuchsia-800 border-fuchsia-200"
+                          }`}>
+                            {isActive ? "En cours — travail actif" : "Réaffecté — attente réparation"}
+                          </span>
+                        </div>
+                        <p className="mt-1 text-xs text-slate-600 truncate">
+                          {work.marque || "-"} {work.modele || ""} · {work.client || "Client non renseigné"} · Emplacement {work.emplacement || "-"}
+                        </p>
+                        {busyWork && (
+                          <p className="mt-1 text-[11px] font-semibold text-amber-800">
+                            À reprendre après la fin de OR {busyWork.no || busyWork.ordre || busyWork.id}.
+                          </p>
+                        )}
+                      </div>
+
+                      {isReaffecte ? (
+                        <button
+                          type="button"
+                          disabled={Boolean(busyWork) || savingVehicleId === work.id}
+                          onClick={() => {
+                            setRepriseChooserVehicle(null);
+                            void handleReprendreTravail(work);
+                          }}
+                          className="shrink-0 inline-flex items-center justify-center gap-1.5 px-3 py-2 rounded-lg bg-fuchsia-600 hover:bg-fuchsia-700 disabled:bg-slate-200 disabled:text-slate-500 text-white text-xs font-extrabold transition-colors cursor-pointer disabled:cursor-not-allowed"
+                        >
+                          <Play size={12} className="fill-current" />
+                          Reprendre cet OR
+                        </button>
+                      ) : (
+                        <span className="shrink-0 px-3 py-2 rounded-lg bg-rose-50 border border-rose-200 text-rose-700 text-xs font-bold">
+                          Travail en cours
+                        </span>
+                      )}
+                    </div>
+                  );
+                })
+              )}
+            </div>
+          </div>
         </div>
       )}
 
@@ -5290,6 +6483,11 @@ export default function Dashboard() {
             await saveVehicleTechnicienOnly(payload);
           } else {
             await saveVehicleEtatWithTech(payload);
+            setActiveTab("en_cours");
+            setActiveFilter("En cours");
+            setDateFilter(ALL_DATES);
+            setSearch("");
+            setSelectedVehicleId(payload.vehicle.id);
           }
           if (wasTransfer) {
             setActiveTab("en_cours");

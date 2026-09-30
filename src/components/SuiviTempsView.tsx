@@ -1,4 +1,4 @@
-import { useState, useEffect, useMemo } from "react";
+import { useState, useEffect, useMemo, useRef } from "react";
 import {
   Timer,
   Clock,
@@ -17,14 +17,16 @@ import {
   Gauge,
 } from "lucide-react";
 import {
-  fetchGoogleSheetFluxData,
+  fetchDatabaseFluxData,
   fetchSuiviEntreesData,
   type SuiviEntree,
-} from "../services/googleSheets";
+} from "../services/database";
 import type { Flux } from "../data/mockData";
 import {
   calculateVehicleTimes,
   formatMinutes,
+  getWorkshopWorkingMillisecondsBetween,
+  parseDateTimestamp,
   type VehicleTimeCalculation,
 } from "../services/timeTracking";
 import ChronoTimelineModal from "./ChronoTimelineModal";
@@ -52,13 +54,36 @@ export default function SuiviTempsView({ userTeam }: SuiviTempsViewProps = {}) {
   const [selectedVehicleForChrono, setSelectedVehicleForChrono] = useState<any | null>(null);
   const [isChronoModalOpen, setIsChronoModalOpen] = useState(false);
 
+  // Horloge temps réel (tick chaque seconde) pour les chronos d'attente achat
+  const [now, setNow] = useState(() => Date.now());
+  const nowRef = useRef(now);
+  useEffect(() => {
+    const id = setInterval(() => {
+      nowRef.current = Date.now();
+      setNow(Date.now());
+    }, 1000);
+    return () => clearInterval(id);
+  }, []);
+  void now; // used via nowRef below
+
+  /** Formate une durée en ms en "Xh Ym Zs" ou "Ym Zs" */
+  const formatElapsed = (ms: number): string => {
+    if (ms <= 0) return "0s";
+    const totalSec = Math.floor(ms / 1000);
+    const h = Math.floor(totalSec / 3600);
+    const m = Math.floor((totalSec % 3600) / 60);
+    const s = totalSec % 60;
+    if (h > 0) return `${h}h ${String(m).padStart(2, "0")}m ${String(s).padStart(2, "0")}s`;
+    return `${m}m ${String(s).padStart(2, "0")}s`;
+  };
+
   // Synchronisation des données
   const loadData = async (silent = false) => {
     if (!silent) setLoading(true);
     setError(null);
     try {
       const [fluxRows, suiviRows] = await Promise.all([
-        fetchGoogleSheetFluxData().catch(() => [] as Flux[]),
+        fetchDatabaseFluxData().catch(() => [] as Flux[]),
         fetchSuiviEntreesData().catch(() => [] as SuiviEntree[]),
       ]);
       setVehicles(fluxRows);
@@ -216,6 +241,12 @@ export default function SuiviTempsView({ userTeam }: SuiviTempsViewProps = {}) {
       }
 
       return true;
+    }).sort((a, b) => {
+      // Les dernières entrées restent en haut, y compris après un filtre ou une actualisation.
+      const dateA = parseDateTimestamp(a.dateEntreeReception);
+      const dateB = parseDateTimestamp(b.dateEntreeReception);
+      if (dateA !== dateB) return dateB - dateA;
+      return b.vehicleKey.localeCompare(a.vehicleKey, undefined, { numeric: true });
     });
   }, [
     timeCalculations,
@@ -307,10 +338,10 @@ export default function SuiviTempsView({ userTeam }: SuiviTempsViewProps = {}) {
             <div>
               <div className="flex items-center flex-wrap gap-2">
                 <h1 className="text-xl font-bold text-slate-900 tracking-tight">
-                  Suivi des Voitures & Calcul des Temps Atelier
+                  Chronométrie & Calcul des Temps Atelier
                 </h1>
                 <span className="px-2.5 py-0.5 rounded-full text-xs font-bold bg-indigo-100 text-indigo-800 border border-indigo-200">
-                  Vue Chef d'Équipe & Atelier
+                  Administration & Chef d'Atelier
                 </span>
                 {userTeam && (
                   <span className="px-2.5 py-0.5 rounded-full text-xs font-extrabold bg-blue-100 text-blue-800 border border-blue-200">
@@ -319,7 +350,7 @@ export default function SuiviTempsView({ userTeam }: SuiviTempsViewProps = {}) {
                 )}
               </div>
               <p className="text-xs text-slate-500 mt-0.5">
-                Calcul précis pour chaque véhicule : Attente réparation, Travail effectif net, Attente pièces & Attente accord devis.
+                Vue automatique des données provenant du suivi des entrées, des achats, devis, réaffectations et essais.
               </p>
             </div>
           </div>
@@ -529,7 +560,7 @@ export default function SuiviTempsView({ userTeam }: SuiviTempsViewProps = {}) {
       {/* Main Table */}
       <div className="bg-white/95 backdrop-blur-md rounded-2xl border border-white/60 shadow-lg flex-1 flex flex-col min-h-[460px] overflow-hidden">
         <div className="overflow-x-auto flex-1">
-          <table className="w-full min-w-[1450px] text-left border-collapse text-xs">
+          <table className="w-full min-w-[1550px] text-left border-collapse text-xs">
             <thead>
               <tr className="bg-slate-100/90 border-b border-slate-200 text-slate-600 font-bold uppercase tracking-wider text-[11px] select-none sticky top-0 z-10 backdrop-blur-md">
                 <th className="py-3 px-3.5 whitespace-nowrap">N° OR</th>
@@ -537,7 +568,10 @@ export default function SuiviTempsView({ userTeam }: SuiviTempsViewProps = {}) {
                 <th className="py-3 px-3.5 whitespace-nowrap">N° Immatriculation</th>
                 <th className="py-3 px-4 min-w-[160px]">Client</th>
                 <th className="py-3 px-3.5 whitespace-nowrap">Équipe</th>
-                <th className="py-3 px-3.5 whitespace-nowrap">Date Entrée</th>
+                <th className="py-3 px-3.5 whitespace-nowrap">Date Entrée & Heure</th>
+                <th className="py-3 px-3.5 whitespace-nowrap text-emerald-800 font-extrabold bg-emerald-50/60">
+                  Date Fin Prév.
+                </th>
                 <th className="py-3 px-3.5 whitespace-nowrap">Prise en Charge</th>
                 <th className="py-3 px-3.5 whitespace-nowrap font-extrabold bg-slate-200/50">
                   ⏳ Tout le temps (Séjour)
@@ -577,7 +611,7 @@ export default function SuiviTempsView({ userTeam }: SuiviTempsViewProps = {}) {
             <tbody className="divide-y divide-slate-100">
               {loading && timeCalculations.length === 0 ? (
                 <tr>
-                  <td colSpan={17} className="py-16 text-center text-slate-400">
+                  <td colSpan={18} className="py-16 text-center text-slate-400">
                     <div className="flex flex-col items-center justify-center gap-2">
                       <RefreshCcw className="w-7 h-7 animate-spin text-indigo-600" />
                       <p className="font-semibold text-slate-700 text-sm">
@@ -588,7 +622,7 @@ export default function SuiviTempsView({ userTeam }: SuiviTempsViewProps = {}) {
                 </tr>
               ) : filteredCalculations.length === 0 ? (
                 <tr>
-                  <td colSpan={17} className="py-16 text-center text-slate-400">
+                  <td colSpan={18} className="py-16 text-center text-slate-400">
                     <div className="flex flex-col items-center justify-center gap-2">
                       <Car className="w-8 h-8 text-slate-300" />
                       <p className="font-bold text-slate-700 text-sm">
@@ -599,6 +633,17 @@ export default function SuiviTempsView({ userTeam }: SuiviTempsViewProps = {}) {
                 </tr>
               ) : (
                 filteredCalculations.map((item, index) => {
+                  const currentAvancement = item.avancement.toLowerCase();
+                  const isActiveWork =
+                    (currentAvancement.includes("en cours") || item.avancementPct > 0) &&
+                    !currentAvancement.includes("attente") &&
+                    !currentAvancement.includes("devis") &&
+                    !currentAvancement.includes("essai") &&
+                    !currentAvancement.includes("réaffect");
+                  const workStartedAt = parseDateTimestamp(item.datePriseEnChargeEquipe);
+                  const liveWorkElapsed = isActiveWork && workStartedAt > 0
+                    ? getWorkshopWorkingMillisecondsBetween(workStartedAt, nowRef.current)
+                    : 0;
                   return (
                     <tr
                       key={`${item.vehicleKey}-${index}`}
@@ -645,6 +690,18 @@ export default function SuiviTempsView({ userTeam }: SuiviTempsViewProps = {}) {
                         {item.dateEntreeReception}
                       </td>
 
+                      {/* Date Fin Prévue de réparation */}
+                      <td className="py-3 px-3.5 font-mono text-[11px] text-emerald-800 whitespace-nowrap bg-emerald-50/40">
+                        {item.dateFinReparation && item.dateFinReparation !== "En cours" ? (
+                          <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md bg-emerald-100 border border-emerald-200 font-bold">
+                            <Calendar className="w-3 h-3 text-emerald-600" />
+                            {item.dateFinReparation}
+                          </span>
+                        ) : (
+                          <span className="text-slate-400 italic">À définir</span>
+                        )}
+                      </td>
+
                       {/* Prise en Charge Atelier */}
                       <td className="py-3 px-3.5 font-mono text-[11px] text-slate-700 whitespace-nowrap">
                         {item.datePriseEnChargeEquipe}
@@ -665,10 +722,46 @@ export default function SuiviTempsView({ userTeam }: SuiviTempsViewProps = {}) {
 
                       {/* Attente Pièces */}
                       <td className="py-3 px-3.5 whitespace-nowrap bg-orange-50/40">
-                        {item.tempsAttentePiecesMin > 0 ? (
+                        {item.achatsEnCours.length > 0 ? (
+                          <div className="flex flex-col gap-1.5">
+                            {item.achatsEnCours.map((achat) => {
+                              const elapsed = achat.dateDemandeTs > 0
+                                ? getWorkshopWorkingMillisecondsBetween(achat.dateDemandeTs, nowRef.current)
+                                : 0;
+                              return (
+                                <div key={achat.id} className="flex flex-col gap-0.5">
+                                  <span className="inline-flex items-center gap-1 font-mono font-bold text-[10px] text-orange-800 bg-orange-100 px-2 py-0.5 rounded-md border border-orange-300 whitespace-nowrap">
+                                    <Package className="w-3 h-3 text-orange-600 shrink-0" />
+                                    {achat.designation.length > 18
+                                      ? achat.designation.slice(0, 18) + "…"
+                                      : achat.designation}
+                                  </span>
+                                  <span className="text-[10px] text-orange-600 font-mono pl-1">
+                                    📅 {achat.dateDemandeStr || "Date inconnue"}
+                                  </span>
+                                  {elapsed > 0 && (
+                                    <span className="text-[10px] font-bold font-mono text-red-600 pl-1 animate-pulse">
+                                      ⏱️ {formatElapsed(elapsed)} en attente
+                                    </span>
+                                  )}
+                                </div>
+                              );
+                            })}
+                            {item.tempsAttentePiecesMin > 0 && (
+                              <span className="text-[10px] text-orange-500 font-mono pl-1">
+                                Total calculé : {item.tempsAttentePiecesFormat}
+                              </span>
+                            )}
+                          </div>
+                        ) : item.tempsAttentePiecesMin > 0 ? (
                           <span className="inline-flex items-center gap-1 font-mono font-bold text-[11px] text-orange-800 bg-orange-100 px-2 py-0.5 rounded-md border border-orange-200">
                             <Package className="w-3 h-3 text-orange-600" />
                             {item.tempsAttentePiecesFormat}
+                          </span>
+                        ) : item.isAttentePiecesActive ? (
+                          <span className="inline-flex items-center gap-1 font-bold text-[11px] text-orange-800 bg-orange-100 px-2 py-0.5 rounded-md border border-orange-300">
+                            <Package className="w-3 h-3 text-orange-600" />
+                            Attente PDR en cours
                           </span>
                         ) : (
                           <span className="text-slate-300 text-[11px] font-mono">0 min</span>
@@ -745,10 +838,17 @@ export default function SuiviTempsView({ userTeam }: SuiviTempsViewProps = {}) {
                             À démarrer
                           </span>
                         ) : (
-                          <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-md text-xs font-black bg-indigo-100 text-indigo-900 border border-indigo-300 shadow-2xs">
-                            <Hourglass className="w-3 h-3 text-indigo-600 shrink-0" />
-                            {item.tempsRestantEstimeFormat}
-                          </span>
+                          <div className="flex flex-col items-start gap-1">
+                            <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-md text-xs font-black bg-indigo-100 text-indigo-900 border border-indigo-300 shadow-2xs">
+                              <Hourglass className="w-3 h-3 text-indigo-600 shrink-0" />
+                              {item.tempsRestantEstimeFormat}
+                            </span>
+                            {liveWorkElapsed > 0 && (
+                              <span className="text-[10px] font-mono font-bold text-emerald-700 whitespace-nowrap">
+                                {item.datePriseEnChargeEquipe} • {formatElapsed(liveWorkElapsed)} en travail
+                              </span>
+                            )}
+                          </div>
                         )}
                       </td>
 

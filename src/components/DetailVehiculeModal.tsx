@@ -24,10 +24,12 @@ import {
   searchVehicleByVin,
   getDemandesDevisLocal,
   getReaffectationsLocal,
+  getTransfersForVehicle,
   type VinVehicleInfo,
   type DemandeDevis,
   type ReaffectationRecord,
-} from "../services/googleSheets";
+  type VehicleTransferRecord,
+} from "../services/database";
 import { calculateVehicleTimes } from "../services/timeTracking";
 import ChronoTimelineModal from "./ChronoTimelineModal";
 
@@ -88,6 +90,13 @@ function parseAvancementPct(val?: string): number {
   if (clean.includes("cours")) return 40;
   if (clean.includes("attente")) return 10;
   return 0;
+}
+
+function formatTransferWait(record: VehicleTransferRecord): string {
+  const minutes = Math.max(0, Math.floor(((record.timestampAcceptation || Date.now()) - record.timestampTransfert) / 60000));
+  const days = Math.floor(minutes / 1440);
+  const hours = Math.floor((minutes % 1440) / 60);
+  return `${days ? `${days} j ` : ""}${hours ? `${hours} h ` : ""}${minutes % 60} min`;
 }
 
 // Analyse de la condition générale du véhicule
@@ -215,6 +224,7 @@ export default function DetailVehiculeModal({
     window.addEventListener("demandes_devis_updated", handleUpdate);
     window.addEventListener("demandes_achat_updated", handleUpdate);
     window.addEventListener("vehicle_essais_updated", handleUpdate);
+    window.addEventListener("transfers_timeline_updated", handleUpdate);
     window.addEventListener("storage", handleUpdate);
 
     const timer = setInterval(() => {
@@ -227,6 +237,7 @@ export default function DetailVehiculeModal({
       window.removeEventListener("demandes_devis_updated", handleUpdate);
       window.removeEventListener("demandes_achat_updated", handleUpdate);
       window.removeEventListener("vehicle_essais_updated", handleUpdate);
+      window.removeEventListener("transfers_timeline_updated", handleUpdate);
       window.removeEventListener("storage", handleUpdate);
       clearInterval(timer);
     };
@@ -234,6 +245,12 @@ export default function DetailVehiculeModal({
 
   const chronoCalc = useMemo(() => {
     return vehicule ? calculateVehicleTimes(vehicule as any) : null;
+  }, [vehicule, timeTick]);
+
+  const transferHistory = useMemo(() => {
+    if (!vehicule) return [];
+    return getTransfersForVehicle({ id: vehicule.id, no: vehicule.noOr, chassis: vehicule.chassis } as any)
+      .sort((a, b) => b.timestampTransfert - a.timestampTransfert);
   }, [vehicule, timeTick]);
 
   const devisRecord = useMemo<DemandeDevis | null>(() => {
@@ -278,7 +295,7 @@ export default function DetailVehiculeModal({
     return found || null;
   }, [isOpen, vehicule, timeTick]);
 
-  // Recherche automatique des caractéristiques complètes dans la base VIN Google Sheets
+  // Recherche automatique des caractéristiques complètes dans la base VIN PostgreSQL
   useEffect(() => {
     let isCancelled = false;
     if (isOpen && vehicule?.chassis) {
@@ -337,7 +354,7 @@ export default function DetailVehiculeModal({
     window.print();
   };
 
-  // Valeurs consolidées (entre le dossier et la fiche VIN de Google Sheets)
+  // Valeurs consolidées (entre le dossier et la fiche VIN de PostgreSQL)
   const marqueAffichee =
     vehicule.marque || vinDetails?.marque || "IVECO";
   const modeleAffiche =
@@ -677,6 +694,30 @@ export default function DetailVehiculeModal({
                   </div>
                 </div>
               </div>
+
+              {transferHistory.length > 0 && (
+                <div className="bg-amber-50/70 border border-amber-200 rounded-xl p-4 space-y-3">
+                  <div className="flex items-center gap-1.5 pb-2 border-b border-amber-200">
+                    <Truck className="w-4 h-4 text-amber-700" />
+                    <h3 className="text-xs font-bold uppercase tracking-wider text-amber-900">Historique des transferts d'équipes</h3>
+                  </div>
+                  <div className="space-y-2">
+                    {transferHistory.map((transfer) => (
+                      <div key={transfer.id} className="bg-white rounded-lg border border-amber-200 p-2.5 text-xs">
+                        <div className="font-bold text-slate-900">
+                          {transfer.equipeDepart} <span className="text-amber-600">→</span> {transfer.equipeCible}
+                        </div>
+                        <p className="mt-1 text-slate-600"><strong>{transfer.equipeDepart}</strong> : étape terminée / transférée le <strong className="font-mono text-slate-800">{transfer.dateTransfert}</strong>.</p>
+                        {transfer.isAccepte ? (
+                          <p className="mt-1 text-emerald-800">Accepté le <strong className="font-mono">{transfer.dateAcceptation}</strong>{transfer.acceptePar ? ` par ${transfer.acceptePar}` : ""} <span className="text-slate-500">(attente : {formatTransferWait(transfer)})</span></p>
+                        ) : (
+                          <p className="mt-1 text-amber-800 font-semibold">En attente d'acceptation depuis {formatTransferWait(transfer)}.</p>
+                        )}
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
 
               {/* Suivi des Délais & Chronométrie Atelier */}
               <div className="bg-slate-50/80 border border-slate-200 rounded-xl p-4 space-y-3">
@@ -1034,7 +1075,7 @@ export default function DetailVehiculeModal({
         <div className="px-6 py-3.5 bg-slate-50 border-t border-slate-200 flex flex-wrap items-center justify-between gap-3 shrink-0 print:hidden">
           <div className="text-[11px] text-slate-500 flex items-center gap-1.5">
             <ShieldCheck className="w-4 h-4 text-slate-400" />
-            <span>Fiche technique atelier synchronisée avec Google Sheets</span>
+            <span>Fiche technique atelier synchronisée avec PostgreSQL</span>
           </div>
 
           <div className="flex items-center gap-2">

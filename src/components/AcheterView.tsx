@@ -16,7 +16,7 @@ import {
   getAvancementOptionsForTeam,
   getDemandesAchatLocal,
   type DemandeAchat,
-} from "../services/googleSheets";
+} from "../services/database";
 
 interface AcheterViewProps {
   vehicles: Flux[];
@@ -136,7 +136,7 @@ export default function AcheterView({
         etat.includes("attente pdr") ||
         etat.includes("attente pièce")
       );
-    });
+    }).sort((a, b) => Number(b.creationTimestamp || b.id || 0) - Number(a.creationTimestamp || a.id || 0));
   }, [vehicles, demandesMap]);
 
   // Comptes par statut pour les badges filtres
@@ -480,6 +480,11 @@ export default function AcheterView({
                             <div className="font-semibold text-slate-800 text-[11px] truncate" title={demande.designation}>
                               {demande.designation}
                             </div>
+                            {demande.modeCommande === "Téléphone" && (
+                              <div className="text-[10px] font-semibold text-sky-700 truncate" title={demande.telephoneFournisseur || demande.fournisseur}>
+                                ☎ Commande téléphone{demande.fournisseur ? ` · ${demande.fournisseur}` : ""}{demande.telephoneFournisseur ? ` · ${demande.telephoneFournisseur}` : ""}
+                              </div>
+                            )}
                             {demande.commentaire && (
                               <div className="text-[10px] text-slate-500 italic truncate" title={demande.commentaire}>
                                 💬 {demande.commentaire}
@@ -577,10 +582,10 @@ export default function AcheterView({
                             <div className="flex flex-col gap-0.5">
                               <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md text-[10px] font-bold bg-emerald-100 text-emerald-800 border border-emerald-300 w-fit">
                                 <CheckCircle2 size={11} className="text-emerald-600" />
-                                <span>Pièce retirée {demande?.dateLivraison ? `le ${demande.dateLivraison}` : ""}</span>
+                                <span>Pièce arrivée {demande?.dateLivraison ? `le ${demande.dateLivraison}` : ""}</span>
                               </span>
                               <span className="text-[9.5px] text-emerald-700 font-semibold italic">
-                                Trace conservée • Renvoyé en cours
+                                Notification envoyée à l'équipe • En attente d'acceptation
                               </span>
                             </div>
                           ) : (
@@ -641,7 +646,7 @@ export default function AcheterView({
                             )}
                           </select>
                           <span className="text-[9.5px] text-amber-700/80 font-medium">
-                            {isLivre ? "Véhicule réintégré en atelier" : "Repassez en 'En cours' après réception"}
+                            {isLivre ? "Retour en Attente Réparation jusqu'à l'acceptation de l'équipe" : "Le chef d'équipe enregistre date et heure de la demande"}
                           </span>
                         </div>
                       </td>
@@ -671,4 +676,3 @@ export default function AcheterView({
     </div>
   );
 }
-

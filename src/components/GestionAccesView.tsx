@@ -10,8 +10,6 @@ import {
   Edit2,
   CheckCircle2,
   AlertCircle,
-  Eye,
-  EyeOff,
   Sparkles,
   Lock,
   Search,
@@ -31,7 +29,6 @@ export default function GestionAccesView() {
 
   const [search, setSearch] = useState("");
   const [roleFilter, setRoleFilter] = useState<string>("all");
-  const [revealedPasswords, setRevealedPasswords] = useState<Record<string, boolean>>({});
 
   // Modal State
   const [isModalOpen, setIsModalOpen] = useState(false);
@@ -49,14 +46,6 @@ export default function GestionAccesView() {
 
   // Delete Confirmation State
   const [deletingAccount, setDeletingAccount] = useState<AuthorizedAccount | null>(null);
-
-  // Toggle password visibility for an account row
-  const togglePasswordVisibility = (id: string) => {
-    setRevealedPasswords((prev) => ({
-      ...prev,
-      [id]: !prev[id],
-    }));
-  };
 
   // Open modal for new account with optional prefill
   const openCreateModal = (prefill?: {
@@ -81,7 +70,7 @@ export default function GestionAccesView() {
     setEditingAccount(acc);
     setFormName(acc.name);
     setFormEmail(acc.email);
-    setFormPassword(acc.password);
+    setFormPassword("");
     setFormRole(acc.role);
     setFormTeam(acc.assignedTeam || "Daily1");
     setFormError(null);
@@ -100,7 +89,7 @@ export default function GestionAccesView() {
   };
 
   // Handle Form Submit (keepOpen=true allows creating 6, 10 or more accounts in sequence)
-  const handleFormSubmit = (e: React.FormEvent, keepOpen = false) => {
+  const handleFormSubmit = async (e: React.FormEvent, keepOpen = false) => {
     e.preventDefault();
     setFormError(null);
 
@@ -116,7 +105,7 @@ export default function GestionAccesView() {
       setFormError("L'identifiant ou l'adresse email est obligatoire.");
       return;
     }
-    if (!cleanPass) {
+    if (!cleanPass && !editingAccount) {
       setFormError("Le mot de passe est obligatoire.");
       return;
     }
@@ -124,10 +113,10 @@ export default function GestionAccesView() {
     const assignedTeamValue = formRole === "chef_equipe" ? formTeam : undefined;
 
     if (editingAccount) {
-      const res = updateAccount(editingAccount.id, {
+      const res = await updateAccount(editingAccount.id, {
         name: cleanName,
         email: cleanEmail,
-        password: cleanPass,
+        ...(cleanPass ? { password: cleanPass } : {}),
         role: formRole,
         assignedTeam: assignedTeamValue,
       });
@@ -142,7 +131,7 @@ export default function GestionAccesView() {
         setFormSuccess(null);
       }, 1400);
     } else {
-      const res = addAccount({
+      const res = await addAccount({
         name: cleanName,
         email: cleanEmail,
         password: cleanPass,
@@ -184,8 +173,8 @@ export default function GestionAccesView() {
   };
 
   // Handle Delete
-  const handleDelete = (acc: AuthorizedAccount) => {
-    const res = deleteAccount(acc.id);
+  const handleDelete = async (acc: AuthorizedAccount) => {
+    const res = await deleteAccount(acc.id);
     if (!res.success) {
       alert(res.error || "Impossible de supprimer ce compte.");
     }
@@ -473,7 +462,6 @@ export default function GestionAccesView() {
                     currentUser?.id === acc.id ||
                     (currentUser?.email &&
                       currentUser.email.toLowerCase().trim() === acc.email.toLowerCase().trim());
-                  const isRevealed = !!revealedPasswords[acc.id];
 
                   return (
                     <tr key={acc.id} className="hover:bg-purple-50/30 transition-colors">
@@ -531,17 +519,9 @@ export default function GestionAccesView() {
                       <td className="py-3.5 px-4">
                         <div className="inline-flex items-center gap-2 bg-slate-50 px-2.5 py-1 rounded-lg border border-slate-200">
                           <KeyRound className="w-3.5 h-3.5 text-slate-400 shrink-0" />
-                          <span className="font-mono font-bold text-slate-700 text-xs tracking-wider">
-                            {isRevealed ? acc.password : "••••••••"}
+                          <span className="font-semibold text-slate-600 text-[11px]">
+                            Empreinte sécurisée
                           </span>
-                          <button
-                            type="button"
-                            onClick={() => togglePasswordVisibility(acc.id)}
-                            className="p-0.5 text-slate-400 hover:text-slate-700 transition-colors cursor-pointer"
-                            title={isRevealed ? "Masquer" : "Afficher"}
-                          >
-                            {isRevealed ? <EyeOff size={13} /> : <Eye size={13} />}
-                          </button>
                         </div>
                       </td>
 
@@ -594,7 +574,7 @@ export default function GestionAccesView() {
                   </h2>
                   <p className="text-xs text-slate-500">
                     {editingAccount
-                      ? "Mettre à jour les droits, l'équipe ou le mot de passe"
+                      ? "Mettre à jour les droits et l'équipe ; laissez le nouveau mot de passe vide pour le conserver"
                       : "Créez autant de comptes que nécessaire pour l'atelier"}
                   </p>
                 </div>
@@ -789,7 +769,7 @@ export default function GestionAccesView() {
               <div>
                 <div className="flex items-center justify-between mb-1.5">
                   <label className="text-xs font-bold text-slate-700">
-                    Mot de passe *
+                    {editingAccount ? "Nouveau mot de passe (facultatif)" : "Mot de passe *"}
                   </label>
                   <button
                     type="button"
@@ -802,9 +782,9 @@ export default function GestionAccesView() {
                 </div>
                 <div className="relative">
                   <input
-                    type="text"
-                    required
-                    placeholder="Saisissez un mot de passe"
+                    type="password"
+                    required={!editingAccount}
+                    placeholder={editingAccount ? "Laisser vide pour conserver le mot de passe actuel" : "Saisissez un mot de passe"}
                     value={formPassword}
                     onChange={(e) => setFormPassword(e.target.value)}
                     className="w-full px-3.5 py-2.5 bg-slate-50 rounded-xl border border-slate-200 text-xs font-mono font-semibold text-slate-900 placeholder:text-slate-400 focus:outline-none focus:border-purple-500 focus:bg-white"
@@ -913,7 +893,7 @@ export default function GestionAccesView() {
                 </button>
                 <button
                   type="button"
-                  onClick={() => handleDelete(deletingAccount)}
+                  onClick={() => void handleDelete(deletingAccount)}
                   className="px-4 py-2.5 rounded-xl bg-red-600 hover:bg-red-700 text-xs font-bold text-white shadow-md shadow-red-600/25 cursor-pointer flex-1"
                 >
                   Oui, supprimer
