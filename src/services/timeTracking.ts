@@ -30,6 +30,7 @@ export type TimeStepType =
   | "essai"
   | "attente_client"
   | "travail"
+  | "modification"
   | "fin";
 
 export interface VehicleTimeStep {
@@ -378,7 +379,9 @@ export function saveVehicleTimeLog(log: VehicleTimeLog): void {
       updatedAt: Date.now(),
     };
     localStorage.setItem(STORAGE_KEY_TIME_LOGS, JSON.stringify(all));
-    if (typeof window !== 'undefined') {
+    const role = typeof window !== 'undefined' ? localStorage.getItem('flux_atelier_active_role') : '';
+    const canSaveTimes = !role || ['administration', 'chef_atelier', 'chef_equipe'].includes(role);
+    if (typeof window !== 'undefined' && canSaveTimes) {
       void fetch('/api/data/vehicle_times', {
         method: 'POST',
         credentials: 'same-origin',
@@ -390,6 +393,58 @@ export function saveVehicleTimeLog(log: VehicleTimeLog): void {
   } catch (e) {
     console.warn("Erreur sauvegarde time log:", e);
   }
+}
+
+/**
+ * Ajoute une trace non calculée dans la chronologie du véhicule. Une trace de
+ * modification n'est jamais déduite du temps de travail : elle sert seulement
+ * à expliquer qui a changé quoi, avec la date et l'heure exactes.
+ */
+export function recordVehicleModification(
+  vehicle: {
+    id?: string | number;
+    no?: string;
+    ordre?: string;
+    noOr?: string;
+    chassis?: string;
+    immatriculation?: string;
+    serie?: string;
+    client?: string;
+    nomClient?: string;
+    equipe?: string;
+  },
+  label: string,
+  commentaire?: string,
+): void {
+  const noOr = String(vehicle.no || vehicle.ordre || vehicle.noOr || "").trim();
+  const chassis = String(vehicle.chassis || "").trim();
+  const key = noOr || chassis || String(vehicle.id || "");
+  if (!key) return;
+
+  const all = getVehicleTimeLogs();
+  const normalizedKey = normalizeVehicleKey(key);
+  const existing = all[normalizedKey] || {
+    vehicleKey: key,
+    noOr,
+    chassis,
+    immatriculation: String(vehicle.immatriculation || vehicle.serie || ""),
+    client: String(vehicle.client || vehicle.nomClient || ""),
+    equipe: String(vehicle.equipe || ""),
+    customSteps: [],
+  };
+  const timestamp = Date.now();
+  const step: VehicleTimeStep = {
+    id: `modification-${timestamp}-${Math.random().toString(36).slice(2, 7)}`,
+    type: "modification",
+    label,
+    dateDebut: formatDateDisplay(timestamp),
+    commentaire,
+    automatique: true,
+  };
+  saveVehicleTimeLog({
+    ...existing,
+    customSteps: [...(existing.customSteps || []), step],
+  });
 }
 
 function normalizeVehicleKey(key?: string): string {
@@ -425,6 +480,11 @@ export function calculateVehicleTimes(
     datePriseEnChargeEquipe?: string;
     dateFinRep?: string;
     dateFinReparation?: string;
+    dateModification?: string;
+    dateDevis?: string;
+    dateDemande?: string;
+    dateReaffectation?: string;
+    dateDebutEssai?: string;
     heureFin?: string;
     avancement?: string;
   }
@@ -469,7 +529,9 @@ export function calculateVehicleTimes(
   // Règle atelier : l'avancement « Attente PDR » représente toujours une attente pièces.
   // Normalisation des espaces pour accepter les valeurs saisies avec des espaces multiples.
   const normalizedAvancement = avancement.toLowerCase().replace(/\s+/g, " ").trim();
-  const isAttentePdr = normalizedAvancement === "attente pdr";
+  const isAttentePdr =
+    normalizedAvancement === "attente pdr" ||
+    normalizedAvancement === "attends acheter";
 
   // 2. Détermination de la date de prise en charge en atelier (entrée équipe)
   let datePriseEnChargeRaw =
@@ -553,14 +615,21 @@ export function calculateVehicleTimes(
   // 4. Analyse des demandes d'achat (Pièces) pour ce véhicule
   const allAchats = getDemandesAchatLocal();
   const vehicleAchats = Object.values(allAchats).filter(matchVehicle);
+  const customSteps = customLog?.customSteps || [];
+  // Les changements d'avancement sont la source la plus précise : ils sont
+  // horodatés au clic, puis fermés automatiquement à la reprise/acceptation.
+  // Les anciennes fiches restent un secours pour les dossiers historiques.
+  const hasCustomPieces = customSteps.some((step) => step.type === "attente_pieces");
+  const hasCustomDevis = customSteps.some((step) => step.type === "attente_devis");
+  const hasCustomReaffectation = customSteps.some((step) => step.type === "reaffectation");
+  const hasCustomEssai = customSteps.some((step) => step.type === "essai");
 
   let totalAttentePiecesMin = 0;
   const piecesSteps: VehicleTimeStep[] = [];
 
-  // Une demande d'achat ne devient un temps d'attente que lorsque le Chef d'équipe
-  // choisit explicitement l'avancement « Attente PDR ». Ainsi, une ancienne demande
-  // de pièce ne pénalise pas le travail net d'un véhicule passé en « Attente devis ».
-  if (isAttentePdr) vehicleAchats.forEach((achat, idx) => {
+  // Une demande historique sert de secours si la transition d'avancement n'a pas
+  // encore été enregistrée par la nouvelle chronométrie.
+  if (!hasCustomPieces) vehicleAchats.forEach((achat, idx) => {
     const tsAchatDemande = parseDateTimestamp(achat.date);
     if (tsAchatDemande > 0) {
       let tsAchatLivre = parseDateTimestamp(achat.dateLivraison);
@@ -590,13 +659,14 @@ export function calculateVehicleTimes(
     }
   });
 
-  // Détection automatique si le véhicule est en Attente PDR ou attends acheter sans fiche achat préalable
+  // Un compteur pièces ne peut démarrer qu'après l'action explicite PDR / achat.
+  // Il ne doit jamais partir de l'entrée atelier ni d'une modification sans lien.
+  const tsDemandePieces = parseDateTimestamp(vehicle.dateDemande);
   if (
     totalAttentePiecesMin === 0 &&
-    isAttentePdr
+    isAttentePdr && !hasCustomPieces && tsDemandePieces > 0
   ) {
-    const tsModif = parseDateTimestamp(vehicle.dateModification);
-    const tsDebutPieces = tsModif > 0 ? tsModif : (tsPriseEnCharge > 0 ? tsPriseEnCharge : (tsEntree > 0 ? tsEntree : Date.now()));
+    const tsDebutPieces = tsDemandePieces;
     const diffMin = workingMinutes(tsDebutPieces, tsFinEffective);
     totalAttentePiecesMin = diffMin;
 
@@ -619,7 +689,7 @@ export function calculateVehicleTimes(
   let totalAttenteDevisMin = 0;
   const devisSteps: VehicleTimeStep[] = [];
 
-  vehicleDevis.forEach((devis, idx) => {
+  if (!hasCustomDevis) vehicleDevis.forEach((devis, idx) => {
     // 1. Détermination précise du début de l'attente devis
     let tsDevisDemande = 0;
     if (devis.createdAtTimestamp && devis.createdAtTimestamp > 0) {
@@ -672,13 +742,15 @@ export function calculateVehicleTimes(
     }
   });
 
-  // Détection automatique si le véhicule est en ATENDE DEVIS sans fiche devis préalable
+  // Un compteur devis ne peut démarrer qu'après la mise explicite en attente devis.
+  const tsDevis = parseDateTimestamp(vehicle.dateDevis);
   if (
     totalAttenteDevisMin === 0 &&
+    !hasCustomDevis &&
+    tsDevis > 0 &&
     (avancement.toUpperCase().includes("DEVIS") || etat.toUpperCase().includes("DEVIS"))
   ) {
-    const tsModif = parseDateTimestamp(vehicle.dateModification);
-    const tsDebutDevis = tsModif > 0 ? tsModif : (tsPriseEnCharge > 0 ? tsPriseEnCharge : (tsEntree > 0 ? tsEntree : Date.now()));
+    const tsDebutDevis = tsDevis;
     const diffMin = workingMinutes(tsDebutDevis, tsFinEffective);
     totalAttenteDevisMin = diffMin;
 
@@ -687,7 +759,7 @@ export function calculateVehicleTimes(
       type: "attente_devis",
       label: "Attente accord devis client",
       dateDebut: formatDateDisplay(tsDebutDevis),
-      dateFin: isTermine ? formatDateDisplay(tsFinEffective) : "En attente accord",
+      dateFin: isTermine ? formatDateDisplay(tsFinEffective) : "Attente validation devis",
       dureeMinutes: diffMin,
       commentaire: `Attente devis active depuis le ${formatDateDisplay(tsDebutDevis)}`,
       automatique: true,
@@ -702,7 +774,7 @@ export function calculateVehicleTimes(
   const reaffectSteps: VehicleTimeStep[] = [];
   const treatedReaffectIds = new Set<string>();
 
-  vehicleReaffectations.forEach((reaff, idx) => {
+  if (!hasCustomReaffectation) vehicleReaffectations.forEach((reaff, idx) => {
     if (treatedReaffectIds.has(reaff.id)) return;
     treatedReaffectIds.add(reaff.id);
 
@@ -735,13 +807,15 @@ export function calculateVehicleTimes(
     }
   });
 
-  // Détection automatique si Technicien réaffecté sans fiche préalable
+  // Un compteur de réaffectation démarre seulement lorsque cette action est enregistrée.
+  const tsReaffectation = parseDateTimestamp(vehicle.dateReaffectation);
   if (
     totalReaffecteMin === 0 &&
+    !hasCustomReaffectation &&
+    tsReaffectation > 0 &&
     (avancement.toLowerCase().includes("reaffect") || etat.toLowerCase().includes("reaffect"))
   ) {
-    const tsModif = parseDateTimestamp(vehicle.dateModification);
-    const tsDebutReaff = tsModif > 0 ? tsModif : (tsPriseEnCharge > 0 ? tsPriseEnCharge : (tsEntree > 0 ? tsEntree : Date.now()));
+    const tsDebutReaff = tsReaffectation;
     const diffMin = workingMinutes(tsDebutReaff, tsFinEffective);
     totalReaffecteMin = diffMin;
 
@@ -769,7 +843,7 @@ export function calculateVehicleTimes(
     .filter((essai) => !essai.isTermine)
     .sort((a, b) => (b.timestampDebut || 0) - (a.timestampDebut || 0))[0]?.id : undefined;
 
-  vehicleEssais.forEach((essai, idx) => {
+  if (!hasCustomEssai) vehicleEssais.forEach((essai, idx) => {
     if (treatedEssaiIds.has(essai.id)) return;
     if (!essai.isTermine && !vehicleIsCurrentlyInEssai) return;
     if (!essai.isTermine && latestOpenEssaiId && essai.id !== latestOpenEssaiId) return;
@@ -804,13 +878,15 @@ export function calculateVehicleTimes(
     }
   });
 
-  // Détection automatique si Essai sans fiche préalable
+  // Un compteur d'essai démarre seulement après le démarrage explicite de l'essai.
+  const tsEssai = parseDateTimestamp(vehicle.dateDebutEssai);
   if (
     totalEssaiMin === 0 &&
+    !hasCustomEssai &&
+    tsEssai > 0 &&
     (avancement.toLowerCase().includes("essai") || etat.toLowerCase() === "essai")
   ) {
-    const tsModif = parseDateTimestamp(vehicle.dateModification);
-    const tsDebutEssai = tsModif > 0 ? tsModif : (tsPriseEnCharge > 0 ? tsPriseEnCharge : (tsEntree > 0 ? tsEntree : Date.now()));
+    const tsDebutEssai = tsEssai;
     const diffMin = workingMinutes(tsDebutEssai, tsFinEffective);
     totalEssaiMin = diffMin;
 
@@ -877,8 +953,9 @@ export function calculateVehicleTimes(
 
   // 6. Prise en compte des étapes manuelles ou personnalisées
   let customAttenteReparationMin = 0;
-  if (customLog?.customSteps && customLog.customSteps.length > 0) {
-    customLog.customSteps.forEach((cs) => {
+  const modificationSteps: VehicleTimeStep[] = [];
+  if (customSteps.length > 0) {
+    customSteps.forEach((cs) => {
       const tsD = parseDateTimestamp(cs.dateDebut);
       const tsF = cs.dateFin ? parseDateTimestamp(cs.dateFin) : (isTermine ? tsFinEffective : Date.now());
       const min = cs.dureeMinutes ?? (tsD > 0 && tsF > tsD ? workingMinutes(tsD, tsF) : 0);
@@ -886,12 +963,8 @@ export function calculateVehicleTimes(
       if (cs.type === "attente_reparation") {
         customAttenteReparationMin += min;
       } else if (cs.type === "attente_pieces") {
-        // Même règle pour l'historique local : il est compté uniquement pendant
-        // l'avancement actif « Attente PDR ».
-        if (isAttentePdr) {
-          totalAttentePiecesMin += min;
-          piecesSteps.push({ ...cs, dureeMinutes: min });
-        }
+        totalAttentePiecesMin += min;
+        piecesSteps.push({ ...cs, dureeMinutes: min });
       } else if (cs.type === "attente_devis") {
         totalAttenteDevisMin += min;
         devisSteps.push({ ...cs, dureeMinutes: min });
@@ -905,6 +978,8 @@ export function calculateVehicleTimes(
       } else if (cs.type === "essai") {
         totalEssaiMin += min;
         essaiSteps.push({ ...cs, dureeMinutes: min });
+      } else if (cs.type === "modification") {
+        modificationSteps.push(cs);
       }
     });
   }
@@ -916,7 +991,7 @@ export function calculateVehicleTimes(
   if (typeof customLog?.tempsEssaiMin === "number") {
     totalEssaiMin = customLog.tempsEssaiMin;
   }
-  if (isAttentePdr && typeof customLog?.tempsAttentePiecesMin === "number") {
+  if (typeof customLog?.tempsAttentePiecesMin === "number") {
     totalAttentePiecesMin = customLog.tempsAttentePiecesMin;
   }
   if (typeof customLog?.tempsAttenteDevisMin === "number") {
@@ -1037,6 +1112,7 @@ export function calculateVehicleTimes(
   steps.push(...reaffectSteps);
   steps.push(...essaiSteps);
   steps.push(...transferSteps);
+  steps.push(...modificationSteps);
 
   if (isTermine) {
     steps.push({
@@ -1116,7 +1192,7 @@ export const calculateVehicleTimeStats = calculateVehicleTimes;
 
 /**
  * Enregistre immédiatement l'horodatage exact (DD/MM/YYYY HH:mm) de chaque modification d'avancement
- * pour le véhicule (ATENDE DEVIS, Attente PDR, Technicien réaffecté, attends acheter, Essai, Terminer, vr...)
+ * pour le véhicule (Lancement devis, Attente PDR, Technicien réaffecté, attends acheter, Essai, Terminer, vr...)
  */
 export function recordAvancementStatusChange(
   vehicle: Partial<Flux>,
@@ -1151,7 +1227,7 @@ export function recordAvancementStatusChange(
   let stepType: TimeStepType = "travail";
   let stepLabel = `Modification Avancement : ${cleanAv}`;
 
-  if (cleanAv === "ATENDE DEVIS" || cleanAv.toLowerCase().includes("devis")) {
+  if (cleanAv === "Lancement devis" || cleanAv === "ATENDE DEVIS" || cleanAv.toLowerCase().includes("devis")) {
     stepType = "attente_devis";
     stepLabel = `Attente accord devis (${nowFormatted})`;
   } else if (cleanAv === "Attente PDR" || cleanAv === "attends acheter" || cleanAv.toLowerCase().includes("pdr")) {

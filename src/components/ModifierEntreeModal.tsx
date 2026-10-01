@@ -20,10 +20,18 @@ import {
   modifierDossierEntree,
   isDatabaseWriteConfigured,
   searchVehicleByVin,
+  fetchDatabaseFluxData,
   type VinVehicleInfo,
 } from "../services/database";
 import { getAllDestinationTeams } from "../config/teams";
-import { ALL_EMPLACEMENTS, DELIVERED_EMPLACEMENT } from "../services/emplacementService";
+import {
+  ALL_EMPLACEMENTS,
+  DELIVERED_EMPLACEMENT,
+  calculerEmplacementAutomatique,
+  normalizeEmplacementCode,
+} from "../services/emplacementService";
+import { recordVehicleModification } from "../services/timeTracking";
+import type { Flux } from "../data/mockData";
 import type { UnifiedReceptionRow } from "./SuiviEntreesTable";
 
 interface ModifierEntreeModalProps {
@@ -36,7 +44,7 @@ interface ModifierEntreeModalProps {
 const CS_OPTIONS = ["R10", "R09", "R18", "R16"];
 
 const ETAT_OPTIONS = [
-  "Attente réparation",
+  "Attente Réparation",
   "En cours",
   "Attente accord",
   "Attente pièces",
@@ -62,7 +70,7 @@ export default function ModifierEntreeModal({
     marque: "IVECO",
     modele: "",
     categorie: "",
-    etat: "Attente réparation",
+    etat: "Attente Réparation",
     equipe: "Daily",
     emplacement: "",
   });
@@ -86,7 +94,7 @@ export default function ModifierEntreeModal({
         marque: row.marque || "IVECO",
         modele: row.modele || "",
         categorie: row.categorie || "",
-        etat: row.etat || "Attente réparation",
+        etat: row.etat || "Attente Réparation",
         equipe: row.equipe && row.equipe !== "-" ? row.equipe : "Daily",
         emplacement: row.emplacement || "",
       });
@@ -140,6 +148,44 @@ export default function ModifierEntreeModal({
     }
   };
 
+  const handleTeamChange = async (newTeam: string) => {
+    const isDifferent = newTeam.trim() !== (row?.equipe || "").trim();
+    if (isDifferent) {
+      try {
+        const allVehicles = await fetchDatabaseFluxData().catch(() => []);
+        const autoPlace = calculerEmplacementAutomatique(
+          {
+            id: Number(row?.id) || 0,
+            no: formData.noOr.trim(),
+            chassis: formData.chassis.trim().toUpperCase(),
+            equipe: newTeam.trim(),
+            etatIntervention: "Attente Réparation",
+            statut: "Attente Réparation",
+          },
+          allVehicles,
+          row?.id,
+        );
+        setFormData((prev) => ({
+          ...prev,
+          equipe: newTeam,
+          etat: "Attente Réparation",
+          emplacement: autoPlace,
+        }));
+      } catch {
+        setFormData((prev) => ({
+          ...prev,
+          equipe: newTeam,
+          etat: "Attente Réparation",
+        }));
+      }
+    } else {
+      setFormData((prev) => ({
+        ...prev,
+        equipe: newTeam,
+      }));
+    }
+  };
+
   const handleSubmit = async (e: FormEvent) => {
     e.preventDefault();
     setError("");
@@ -162,8 +208,50 @@ export default function ModifierEntreeModal({
 
     try {
       setLoading(true);
+      const cleanNoOr = formData.noOr.trim();
+      const teamChanged = formData.equipe.trim().toLowerCase() !== (row.equipe || "").trim().toLowerCase();
+      let effectiveEtat = teamChanged ? "Attente Réparation" : formData.etat.trim();
+      if (!effectiveEtat || effectiveEtat.toLowerCase().includes("attente")) {
+        effectiveEtat = "Attente Réparation";
+      }
+
+      // Vérifier si le N° OR a été modifié et s'il entre en conflit avec un AUTRE véhicule
+      if (cleanNoOr.toLowerCase() !== (row.noOr || "").trim().toLowerCase()) {
+        const allVehicles = await fetchDatabaseFluxData().catch(() => []);
+        const conflict = allVehicles.some((v) => {
+          if (String(v.id) === String(row.id)) return false;
+          const vNo = String(v.no || v.ordre || (v as unknown as { numeroOR?: string }).numeroOR || "").trim();
+          return vNo.toLowerCase() === cleanNoOr.toLowerCase();
+        });
+        if (conflict) {
+          setError(`Le N° OR « ${cleanNoOr} » est déjà utilisé par un autre dossier.`);
+          setLoading(false);
+          return;
+        }
+      }
+
+      const keptOldPlace =
+        normalizeEmplacementCode(formData.emplacement) === normalizeEmplacementCode(row.emplacement || "");
+      const allVehicles = await fetchDatabaseFluxData().catch(() => []);
+      const effectiveEmplacement = (teamChanged && keptOldPlace) || (!formData.emplacement.trim() || formData.emplacement.trim() === "-")
+        ? calculerEmplacementAutomatique(
+            {
+              id: Number(row.id) || 0,
+              no: cleanNoOr,
+              chassis: formData.chassis.trim().toUpperCase(),
+              equipe: formData.equipe.trim(),
+              etatIntervention: effectiveEtat as Flux["etatIntervention"],
+              statut: effectiveEtat as Flux["statut"],
+            },
+            allVehicles,
+            row.id,
+          )
+        : formData.emplacement.trim();
+
       await modifierDossierEntree({
-        noOr: formData.noOr.trim(),
+        id: row.id,
+        recordKey: (row as { recordKey?: string }).recordKey || String(row.id),
+        noOr: cleanNoOr,
         cs: formData.cs.trim(),
         chassis: formData.chassis.trim().toUpperCase(),
         codeClient: formData.codeClient.trim(),
@@ -172,15 +260,21 @@ export default function ModifierEntreeModal({
         marque: formData.marque.trim() || "IVECO",
         modele: formData.modele.trim() || "-",
         categorie: formData.categorie.trim() || "-",
-        etat: formData.etat.trim(),
+        etat: effectiveEtat,
         equipe: formData.equipe.trim(),
-        emplacement: formData.emplacement.trim(),
+        emplacement: effectiveEmplacement,
         origNo: row.noOr,
         origCs: row.cs,
         origChassis: row.chassis,
         rowSuivi: row.suiviRowNumber,
         rowNumber: row.chargementRowNumber,
       });
+
+      recordVehicleModification(
+        row,
+        "Dossier modifié à la réception",
+        `Destination : ${row.equipe || "-"} → ${formData.equipe || "-"}${row.emplacement !== effectiveEmplacement ? ` • Emplacement : ${row.emplacement || "-"} → ${effectiveEmplacement || "-"}` : ""}${row.etat !== formData.etat ? ` • État : ${row.etat || "-"} → ${formData.etat || "-"}` : ""}`,
+      );
 
       setSuccess(true);
       setTimeout(() => {
@@ -559,9 +653,7 @@ export default function ModifierEntreeModal({
                 </label>
                 <select
                   value={formData.equipe}
-                  onChange={(e) =>
-                    setFormData((prev) => ({ ...prev, equipe: e.target.value }))
-                  }
+                  onChange={(e) => void handleTeamChange(e.target.value)}
                   className="w-full px-3 py-2 text-xs border border-slate-300 rounded-xl focus:ring-2 focus:ring-blue-500/20 focus:border-blue-500 outline-none transition-all bg-white font-semibold text-slate-800"
                 >
                   {getAllDestinationTeams().map((team) => (
@@ -573,6 +665,15 @@ export default function ModifierEntreeModal({
                     <option value={formData.equipe}>{formData.equipe}</option>
                   )}
                 </select>
+
+                {formData.equipe.trim() !== (row.equipe || "").trim() && (
+                  <p className="mt-1.5 text-[11px] text-amber-700 bg-amber-50 border border-amber-200 rounded-lg px-2.5 py-1.5 flex items-center gap-1.5 font-medium">
+                    <span>⚡</span>
+                    <span>
+                      Changement d'équipe vers <strong>{formData.equipe}</strong> : le dossier repasse automatiquement en <strong>Attente Réparation</strong> avec réattribution de place libre.
+                    </span>
+                  </p>
+                )}
               </div>
             </div>
           </div>

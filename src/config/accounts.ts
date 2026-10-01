@@ -1,4 +1,4 @@
-import type { RoleType } from '../types/roles';
+import type { RolePermissions, RoleType } from '../types/roles';
 
 export interface AuthorizedAccount {
   id: string;
@@ -8,6 +8,7 @@ export interface AuthorizedAccount {
   password: string;
   role: RoleType;
   assignedTeam?: string;
+  customPermissions?: Partial<RolePermissions>;
 }
 
 /** Les comptes sont désormais chargés depuis PostgreSQL et ne sont pas embarqués dans le bundle client. */

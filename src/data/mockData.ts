@@ -60,11 +60,26 @@ export interface Flux {
   isPendingNewEntry?: boolean;
   creationTimestamp?: number;
   dateModification?: string;
+  /** Horodatages des transitions utilisés par la chronométrie atelier. */
+  dateDevis?: string;
+  dateDemande?: string;
+  dateReaffectation?: string;
+  dateDebutEssai?: string;
   statutAcceptation?: "en_attente" | "accepte" | "mis_en_attente";
   dateAcceptation?: string;
   dateMiseEnAttente?: string;
   acceptePar?: string;
   misEnAttentePar?: string;
+  modePaiement?: string;
+  statutFacturation?: string;
+  statutFacturationFinale?: string;
+  dateValidationFacturation?: string;
+  facturationValideePar?: string;
+  numeroFacture?: string;
+  numeroBC?: string;
+  numeroEdition?: string;
+  dateFacturationFinale?: string;
+  facturePar?: string;
 }
 
 export const statusMeta: Array<{

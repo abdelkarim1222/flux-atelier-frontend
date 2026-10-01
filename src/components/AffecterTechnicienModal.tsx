@@ -226,7 +226,7 @@ export function isVehicleActivelyOccupyingTech(
     return true;
   }
 
-  // 7. Technicien réaffecté, attends acheter, ATENDE DEVIS -> Le mécanicien est DISPONIBLE
+  // 7. Technicien réaffecté, attends acheter, Lancement devis -> Le mécanicien est DISPONIBLE
   if (
     normAv.includes("reaffect") ||
     normAv === "attends acheter" ||

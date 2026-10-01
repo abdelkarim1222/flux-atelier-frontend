@@ -96,7 +96,7 @@ export default function DemandeDevisModal({
         technicien: vehicle.technicien && vehicle.technicien !== "-" ? vehicle.technicien : undefined,
         nomTechnicien: vehicle.nomTechnicien && vehicle.nomTechnicien !== "-" ? vehicle.nomTechnicien : undefined,
         demandeur: currentChefEquipeName || undefined,
-        statutDevis: "En attente accord",
+        statutDevis: "Attente validation devis",
         commentaire: commentaire.trim() || undefined,
         createdAtTimestamp: Date.now(),
       };
@@ -161,7 +161,7 @@ export default function DemandeDevisModal({
             <div className="text-[11px] font-bold uppercase tracking-wider text-slate-500 flex items-center justify-between">
               <span>Informations Véhicule Récupérées Automatiquement</span>
               <span className="text-[10px] px-2 py-0.5 rounded-full bg-orange-100 text-orange-800 font-extrabold border border-orange-200">
-                ATENDE DEVIS
+                Lancement devis
               </span>
             </div>
 
@@ -305,7 +305,7 @@ export default function DemandeDevisModal({
           <div className="p-3 bg-orange-50/80 border border-orange-200/80 rounded-xl text-orange-900 text-[11px] flex items-center gap-2">
             <Check size={14} className="text-orange-600 shrink-0" />
             <span>
-              À la validation, l'avancement sera défini sur <strong>ATENDE DEVIS</strong> et l'emplacement passera automatiquement en <strong>P (Parking)</strong>.
+              À la validation, l'avancement sera défini sur <strong>Lancement devis</strong> et l'emplacement passera automatiquement en <strong>P (Parking)</strong>.
             </span>
           </div>
 

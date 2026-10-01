@@ -18,11 +18,104 @@ import {
   Plus,
   Check,
   Layers,
+  Receipt,
+  Eye,
+  ArrowRightLeft,
+  RotateCcw,
+  SlidersHorizontal,
+  FileText,
+  ShoppingCart,
+  Timer,
+  MapPin,
 } from "lucide-react";
 import { useAuth } from "../context/AuthContext";
-import { type RoleType, ROLES_META } from "../context/RoleContext";
+import { type RoleType, type RolePermissions, ROLES_META } from "../context/RoleContext";
 import { type AuthorizedAccount } from "../config/accounts";
-import { CANONICAL_TEAMS } from "../config/teams";
+import { CANONICAL_TEAMS, parseAssignedTeams } from "../config/teams";
+
+const VIEW_PERMISSIONS: { key: keyof RolePermissions; label: string; desc: string; icon: any }[] = [
+  {
+    key: "canViewDevis",
+    label: "Voir et suivre les Devis",
+    desc: "Onglet Devis & Estimations, relances clients et validations",
+    icon: FileText,
+  },
+  {
+    key: "canViewAttenteAchat",
+    label: "Voir les Achats PDR (Pièces)",
+    desc: "Onglet Pièces de Rechange (PDR) en attente magasin",
+    icon: ShoppingCart,
+  },
+  {
+    key: "canViewSuiviTemps",
+    label: "Chronométrie & Calcul des Temps",
+    desc: "Statistiques et KPIs de durée de réparation atelier",
+    icon: Timer,
+  },
+  {
+    key: "canViewEssai",
+    label: "Page Contrôle & Essai",
+    desc: "Page des véhicules en cours d'essai routier",
+    icon: CheckCircle2,
+  },
+  {
+    key: "canAddEntree",
+    label: "Suivi des Entrées & Réception",
+    desc: "Liste générale des entrées et création de nouveaux dossiers",
+    icon: ClipboardList,
+  },
+  {
+    key: "canViewFacturation",
+    label: "Facturation & Caisse",
+    desc: "Interface Facturation, validation paiement & bons de sortie",
+    icon: Receipt,
+  },
+  {
+    key: "canViewAllFacturation",
+    label: "Tous les dossiers Facturation",
+    desc: "Consulter toutes les lignes « En attente de paiement » et « Att Facture », quelle que soit l'équipe",
+    icon: Receipt,
+  },
+  {
+    key: "canViewMap",
+    label: "Plan d'Atelier",
+    desc: "Carte interactive des emplacements et stationnements",
+    icon: MapPin,
+  },
+];
+
+const ACTION_PERMISSIONS: { key: keyof RolePermissions; label: string; desc: string; icon: any }[] = [
+  {
+    key: "canManageEquipes",
+    label: "Gérer l'équipe (Tableaux ÉQUIPE)",
+    desc: "Accès au tableau des membres d'équipe et affectations d'atelier",
+    icon: Users,
+  },
+  {
+    key: "canEditAvancement",
+    label: "Transférer véhicules & Avancement",
+    desc: "Autorise « ↪ Envoyer équipe… » et le changement d'avancement (%)",
+    icon: ArrowRightLeft,
+  },
+  {
+    key: "canEditEtat",
+    label: "Mettre « En cours » & Affecter Technicien",
+    desc: "Autorise le bouton bleu « En cours » et le choix du mécanicien",
+    icon: Wrench,
+  },
+  {
+    key: "canEditEmplacement",
+    label: "Modifier Emplacement de Parking",
+    desc: "Autorise le changement manuel de place (P1, P2...)",
+    icon: MapPin,
+  },
+  {
+    key: "canEditChargement",
+    label: "Gérer Tableaux de Chargement",
+    desc: "Autorise la modification des listes de chargement atelier",
+    icon: Layers,
+  },
+];
 
 export default function GestionAccesView() {
   const { accounts, addAccount, updateAccount, deleteAccount, currentUser } = useAuth();
@@ -40,6 +133,8 @@ export default function GestionAccesView() {
   const [formPassword, setFormPassword] = useState("");
   const [formRole, setFormRole] = useState<RoleType>("chef_equipe");
   const [formTeam, setFormTeam] = useState<string>("Daily1");
+  const [formAdditionalTeams, setFormAdditionalTeams] = useState<string[]>([]);
+  const [formCustomPermissions, setFormCustomPermissions] = useState<Partial<RolePermissions>>({});
   const [sessionCreatedCount, setSessionCreatedCount] = useState<number>(0);
   const [formError, setFormError] = useState<string | null>(null);
   const [formSuccess, setFormSuccess] = useState<string | null>(null);
@@ -54,12 +149,16 @@ export default function GestionAccesView() {
     name?: string;
     email?: string;
   }) => {
+    const initialRole = prefill?.role || "chef_equipe";
     setEditingAccount(null);
     setFormName(prefill?.name || "");
     setFormEmail(prefill?.email || "");
     setFormPassword("");
-    setFormRole(prefill?.role || "chef_equipe");
+    setFormRole(initialRole);
     setFormTeam(prefill?.team || "Daily1");
+    setFormAdditionalTeams([]);
+    // Par défaut pour Chef d'Équipe : les droits restent strictement conformes et inchangés
+    setFormCustomPermissions({ ...ROLES_META[initialRole].permissions });
     setFormError(null);
     setFormSuccess(null);
     setIsModalOpen(true);
@@ -72,11 +171,61 @@ export default function GestionAccesView() {
     setFormEmail(acc.email);
     setFormPassword("");
     setFormRole(acc.role);
-    setFormTeam(acc.assignedTeam || "Daily1");
+    if (acc.role === "chef_equipe" || acc.role === "chef_atelier" || acc.role === "facturation") {
+      const parsed = parseAssignedTeams(acc.assignedTeam);
+      setFormTeam(parsed.primary);
+      setFormAdditionalTeams(parsed.additional);
+    } else {
+      setFormTeam(acc.assignedTeam || "Daily1");
+      setFormAdditionalTeams([]);
+    }
+    // Charger les droits personnalisés ou les droits standards du rôle
+    setFormCustomPermissions({
+      ...ROLES_META[acc.role].permissions,
+      ...(acc.customPermissions || {}),
+    });
     setFormError(null);
     setFormSuccess(null);
     setIsModalOpen(true);
   };
+
+  const handleRoleChange = (newRole: RoleType) => {
+    setFormRole(newRole);
+    if (newRole !== "chef_equipe" && newRole !== "chef_atelier" && newRole !== "facturation") {
+      setFormAdditionalTeams([]);
+    }
+    if (newRole === "reception") {
+      if (formTeam !== "R18" && formTeam !== "R16") setFormTeam("R18");
+    }
+    // Préréglage automatique des droits standards du nouveau rôle (Chef d'Équipe reste standard)
+    setFormCustomPermissions({ ...ROLES_META[newRole].permissions });
+  };
+
+  const toggleAdditionalTeam = (teamName: string) => {
+    setFormAdditionalTeams((prev) =>
+      prev.includes(teamName) ? prev.filter((t) => t !== teamName) : [...prev, teamName]
+    );
+  };
+
+  const togglePermission = (key: keyof RolePermissions) => {
+    setFormCustomPermissions((prev) => ({
+      ...prev,
+      [key]: !prev[key],
+    }));
+  };
+
+  const resetToRoleDefaults = () => {
+    setFormCustomPermissions({ ...ROLES_META[formRole].permissions });
+  };
+
+  const isCustomized = useMemo(() => {
+    const defaults = ROLES_META[formRole].permissions;
+    return Object.keys(defaults).some((k) => {
+      const key = k as keyof RolePermissions;
+      if (key === "defaultTab") return false;
+      return Boolean(formCustomPermissions[key]) !== Boolean(defaults[key]);
+    });
+  }, [formRole, formCustomPermissions]);
 
   // Generate random password
   const generateRandomPassword = () => {
@@ -109,8 +258,22 @@ export default function GestionAccesView() {
       setFormError("Le mot de passe est obligatoire.");
       return;
     }
+    if (formRole === "reception" && !formTeam.trim()) {
+      setFormError("Veuillez attribuer un centre de réception.");
+      return;
+    }
 
-    const assignedTeamValue = formRole === "chef_equipe" ? formTeam : undefined;
+    let assignedTeamValue: string | undefined = undefined;
+    if (formRole === "reception") {
+      assignedTeamValue = formTeam;
+    } else if (formRole === "chef_equipe" || formRole === "chef_atelier" || formRole === "facturation") {
+      if (formTeam === "Toutes") {
+        assignedTeamValue = "Toutes";
+      } else {
+        const cleanAdditional = formAdditionalTeams.filter((t) => t !== formTeam && t !== "Toutes");
+        assignedTeamValue = cleanAdditional.length > 0 ? [formTeam, ...cleanAdditional].join(", ") : formTeam;
+      }
+    }
 
     if (editingAccount) {
       const res = await updateAccount(editingAccount.id, {
@@ -119,6 +282,7 @@ export default function GestionAccesView() {
         ...(cleanPass ? { password: cleanPass } : {}),
         role: formRole,
         assignedTeam: assignedTeamValue,
+        customPermissions: formCustomPermissions,
       });
 
       if (!res.success) {
@@ -137,6 +301,7 @@ export default function GestionAccesView() {
         password: cleanPass,
         role: formRole,
         assignedTeam: assignedTeamValue,
+        customPermissions: formCustomPermissions,
       });
 
       if (!res.success) {
@@ -155,6 +320,8 @@ export default function GestionAccesView() {
         setFormName("");
         setFormEmail("");
         setFormPassword("");
+        setFormAdditionalTeams([]);
+        setFormCustomPermissions({ ...ROLES_META[formRole].permissions });
         // Suggest next team if current was a canonical team
         const currentIdx = CANONICAL_TEAMS.indexOf(formTeam as any);
         if (currentIdx >= 0 && currentIdx < CANONICAL_TEAMS.length - 1) {
@@ -201,6 +368,7 @@ export default function GestionAccesView() {
       atelier: accounts.filter((a) => a.role === "chef_atelier").length,
       reception: accounts.filter((a) => a.role === "reception").length,
       equipe: accounts.filter((a) => a.role === "chef_equipe").length,
+      facturation: accounts.filter((a) => a.role === "facturation").length,
     };
   }, [accounts]);
 
@@ -281,6 +449,7 @@ export default function GestionAccesView() {
                       (a) =>
                         a.role === "chef_equipe" &&
                         (a.assignedTeam === t ||
+                          (a.assignedTeam && a.assignedTeam.split(",").map((x) => x.trim()).includes(t)) ||
                           a.name.toLowerCase().includes(t.toLowerCase()))
                     )
                   ).length}
@@ -303,6 +472,7 @@ export default function GestionAccesView() {
               (a) =>
                 a.role === "chef_equipe" &&
                 (a.assignedTeam === teamName ||
+                  (a.assignedTeam && a.assignedTeam.split(",").map((x) => x.trim()).includes(teamName)) ||
                   a.name.toLowerCase().includes(teamName.toLowerCase()))
             );
             const isConfigured = !!teamAccount;
@@ -416,6 +586,13 @@ export default function GestionAccesView() {
               activeClass: "bg-blue-600 text-white border-blue-600 shadow-sm shadow-blue-600/30",
               inactiveClass: "bg-white/90 text-blue-700 hover:bg-blue-50/80 border-blue-200",
             },
+            {
+              id: "facturation" as const,
+              label: "Facturation",
+              icon: <Receipt className="w-3.5 h-3.5" />,
+              activeClass: "bg-amber-600 text-white border-amber-600 shadow-sm shadow-amber-600/30",
+              inactiveClass: "bg-white/90 text-amber-700 hover:bg-amber-50/80 border-amber-200",
+            },
           ].map((item) => {
             const isSelected = roleFilter === item.id;
             return (
@@ -486,7 +663,7 @@ export default function GestionAccesView() {
                                 : acc.role === "chef_atelier"
                                 ? "Direction Atelier"
                                 : acc.role === "reception"
-                                ? "Accueil & Réception"
+                                ? `Accueil & Réception (${acc.assignedTeam || "Centre non attribué"})`
                                 : `Chef d'Équipe (${acc.assignedTeam || "Atelier"})`}
                             </div>
                           </div>
@@ -506,10 +683,30 @@ export default function GestionAccesView() {
                           >
                             {roleMeta.badgeText}
                           </span>
-                          {acc.role === "chef_equipe" && (
-                            <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md text-[10px] font-extrabold bg-blue-50 text-blue-700 border border-blue-200">
-                              <Wrench className="w-2.5 h-2.5 text-blue-600" />
-                              Équipe : {acc.assignedTeam || "Non assignée"}
+                          {(acc.role === "chef_equipe" || acc.role === "reception") && (
+                            <div className="flex flex-wrap items-center gap-1">
+                              <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md text-[10px] font-extrabold bg-blue-50 text-blue-700 border border-blue-200">
+                                <Wrench className="w-2.5 h-2.5 text-blue-600" />
+                                {acc.role === "reception" ? "Centre" : "Équipe"} : {parseAssignedTeams(acc.assignedTeam).primary}
+                              </span>
+                              {acc.role === "chef_equipe" && parseAssignedTeams(acc.assignedTeam).additional.map((extra) => (
+                                <span
+                                  key={extra}
+                                  className="inline-flex items-center gap-0.5 px-1.5 py-0.5 rounded-md text-[9px] font-extrabold bg-indigo-50 text-indigo-700 border border-indigo-200"
+                                  title={`Équipe additionnelle gérée : ${extra}`}
+                                >
+                                  +{extra}
+                                </span>
+                              ))}
+                            </div>
+                          )}
+                          {acc.customPermissions && Object.keys(acc.customPermissions).length > 0 && (
+                            <span
+                              className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md text-[10px] font-bold bg-purple-50 text-purple-700 border border-purple-200"
+                              title="Ce compte bénéficie de droits personnalisés"
+                            >
+                              <SlidersHorizontal className="w-2.5 h-2.5 text-purple-600" />
+                              <span>Droits sur mesure</span>
                             </span>
                           )}
                         </div>
@@ -562,8 +759,8 @@ export default function GestionAccesView() {
       {isModalOpen &&
         createPortal(
           <div className="fixed inset-0 z-[9999] flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm animate-in fade-in duration-150 overflow-y-auto">
-            <div className="bg-white rounded-3xl p-6 sm:p-7 max-w-lg w-full shadow-2xl border border-slate-100 relative my-auto">
-            <div className="flex items-center justify-between pb-4 border-b border-slate-100 mb-4">
+            <div className="bg-white rounded-3xl p-6 sm:p-7 max-w-2xl w-full max-h-[92vh] flex flex-col shadow-2xl border border-slate-100 relative my-auto">
+            <div className="flex items-center justify-between pb-4 border-b border-slate-100 mb-4 shrink-0">
               <div className="flex items-center gap-3">
                 <div className="w-10 h-10 rounded-xl bg-purple-100 text-purple-700 flex items-center justify-center">
                   <UserPlus className="w-5 h-5" />
@@ -574,8 +771,8 @@ export default function GestionAccesView() {
                   </h2>
                   <p className="text-xs text-slate-500">
                     {editingAccount
-                      ? "Mettre à jour les droits et l'équipe ; laissez le nouveau mot de passe vide pour le conserver"
-                      : "Créez autant de comptes que nécessaire pour l'atelier"}
+                      ? "Mettre à jour les droits, les pages accessibles et l'équipe affectée"
+                      : "Créez autant de comptes que nécessaire avec les droits souhaités"}
                   </p>
                 </div>
               </div>
@@ -589,20 +786,20 @@ export default function GestionAccesView() {
             </div>
 
             {formError && (
-              <div className="mb-4 p-3 rounded-xl bg-red-50 border border-red-200 text-red-700 text-xs flex items-center gap-2">
+              <div className="mb-4 p-3 rounded-xl bg-red-50 border border-red-200 text-red-700 text-xs flex items-center gap-2 shrink-0">
                 <AlertCircle className="w-4 h-4 shrink-0 text-red-500" />
                 <span>{formError}</span>
               </div>
             )}
 
             {formSuccess && (
-              <div className="mb-4 p-3 rounded-xl bg-emerald-50 border border-emerald-200 text-emerald-700 text-xs flex items-center gap-2">
+              <div className="mb-4 p-3 rounded-xl bg-emerald-50 border border-emerald-200 text-emerald-700 text-xs flex items-center gap-2 shrink-0">
                 <CheckCircle2 className="w-4 h-4 shrink-0 text-emerald-500" />
                 <span>{formSuccess}</span>
               </div>
             )}
 
-            <form onSubmit={(e) => handleFormSubmit(e, false)} className="space-y-4">
+            <form onSubmit={(e) => handleFormSubmit(e, false)} className="space-y-4 overflow-y-auto pr-1 flex-1">
               {/* Name */}
               <div>
                 <label className="block text-xs font-bold text-slate-700 mb-1.5">
@@ -639,12 +836,12 @@ export default function GestionAccesView() {
               {/* Role Selection */}
               <div>
                 <label className="block text-xs font-bold text-slate-700 mb-1.5">
-                  Rôle & Droits attribués *
+                  Rôle de base & Profil standard *
                 </label>
                 <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
                   <button
                     type="button"
-                    onClick={() => setFormRole("administration")}
+                    onClick={() => handleRoleChange("administration")}
                     className={`p-2.5 rounded-xl border text-left transition-all cursor-pointer ${
                       formRole === "administration"
                         ? "bg-rose-50 border-rose-400 ring-2 ring-rose-400/20"
@@ -662,7 +859,7 @@ export default function GestionAccesView() {
 
                   <button
                     type="button"
-                    onClick={() => setFormRole("chef_atelier")}
+                    onClick={() => handleRoleChange("chef_atelier")}
                     className={`p-2.5 rounded-xl border text-left transition-all cursor-pointer ${
                       formRole === "chef_atelier"
                         ? "bg-purple-50 border-purple-400 ring-2 ring-purple-400/20"
@@ -680,7 +877,7 @@ export default function GestionAccesView() {
 
                   <button
                     type="button"
-                    onClick={() => setFormRole("reception")}
+                    onClick={() => handleRoleChange("reception")}
                     className={`p-2.5 rounded-xl border text-left transition-all cursor-pointer ${
                       formRole === "reception"
                         ? "bg-emerald-50 border-emerald-400 ring-2 ring-emerald-400/20"
@@ -698,7 +895,7 @@ export default function GestionAccesView() {
 
                   <button
                     type="button"
-                    onClick={() => setFormRole("chef_equipe")}
+                    onClick={() => handleRoleChange("chef_equipe")}
                     className={`p-2.5 rounded-xl border text-left transition-all cursor-pointer ${
                       formRole === "chef_equipe"
                         ? "bg-blue-50 border-blue-400 ring-2 ring-blue-400/20"
@@ -713,30 +910,51 @@ export default function GestionAccesView() {
                       Tableaux chargement & affectation
                     </p>
                   </button>
+
+                  <button
+                    type="button"
+                    onClick={() => handleRoleChange("facturation")}
+                    className={`p-2.5 rounded-xl border text-left transition-all cursor-pointer ${
+                      formRole === "facturation"
+                        ? "bg-amber-50 border-amber-400 ring-2 ring-amber-400/20"
+                        : "bg-slate-50 border-slate-200 hover:bg-slate-100"
+                    }`}
+                  >
+                    <div className="flex items-center gap-1.5 mb-0.5">
+                      <Receipt className="w-4 h-4 text-amber-600" />
+                      <span className="text-xs font-bold text-slate-900">Facturation</span>
+                    </div>
+                    <p className="text-[10px] text-slate-500 leading-tight">
+                      Validation paiement, facturation & sortie
+                    </p>
+                  </button>
                 </div>
               </div>
 
-              {/* Team Selector when Role is Chef d'Équipe */}
-              {formRole === "chef_equipe" && (
-                <div className="p-3 bg-blue-50/80 rounded-2xl border border-blue-200/80 space-y-2 animate-in fade-in duration-150">
+              {/* Équipe atelier ou centre Réception attribué */}
+              {(formRole === "chef_equipe" || formRole === "chef_atelier" || formRole === "facturation" || formRole === "reception") && (
+                <div className="p-3 bg-blue-50/80 rounded-2xl border border-blue-200/80 space-y-3 animate-in fade-in duration-150">
                   <div className="flex items-center justify-between">
                     <label className="text-xs font-bold text-blue-950 flex items-center gap-1.5">
                       <Wrench className="w-3.5 h-3.5 text-blue-600" />
-                      <span>Équipe d'Atelier attribuée *</span>
+                      <span>{formRole === "reception" ? "Centre de réception attribué *" : "Équipe d'Atelier Principale *"}</span>
                     </label>
                     <span className="text-[10px] font-extrabold px-2 py-0.5 rounded-full bg-blue-200/70 text-blue-800">
-                      Tableau dédié
+                      {formRole === "reception" ? "Accès réception" : "Équipe principale"}
                     </span>
                   </div>
 
                   <div className="grid grid-cols-2 sm:grid-cols-4 gap-1.5">
-                    {CANONICAL_TEAMS.map((teamName) => {
+                    {(formRole === "reception" ? ["R18", "R16"] : CANONICAL_TEAMS).map((teamName) => {
                       const isSelected = formTeam === teamName;
                       return (
                         <button
                           key={teamName}
                           type="button"
-                          onClick={() => setFormTeam(teamName)}
+                          onClick={() => {
+                            setFormTeam(teamName);
+                            setFormAdditionalTeams((prev) => prev.filter((t) => t !== teamName));
+                          }}
                           className={`px-2 py-1.5 rounded-xl text-xs font-bold transition-all text-center border cursor-pointer ${
                             isSelected
                               ? "bg-blue-600 text-white border-blue-600 shadow-xs"
@@ -747,23 +965,233 @@ export default function GestionAccesView() {
                         </button>
                       );
                     })}
-                    <button
-                      type="button"
-                      onClick={() => setFormTeam("Toutes")}
-                      className={`px-2 py-1.5 rounded-xl text-xs font-bold transition-all text-center border cursor-pointer ${
-                        formTeam === "Toutes"
-                          ? "bg-indigo-600 text-white border-indigo-600 shadow-xs"
-                          : "bg-white text-slate-700 hover:bg-indigo-100/50 border-indigo-200/60"
-                      }`}
-                    >
-                      Toutes
-                    </button>
+                    {formRole === "reception" && (
+                      <button
+                        type="button"
+                        onClick={() => setFormTeam("")}
+                        className={`px-2 py-1.5 rounded-xl text-xs font-bold transition-all text-center border cursor-pointer ${
+                          formTeam !== "R18" && formTeam !== "R16"
+                            ? "bg-indigo-600 text-white border-indigo-600 shadow-xs"
+                            : "bg-white text-slate-700 hover:bg-indigo-100/50 border-indigo-200/60"
+                        }`}
+                      >
+                        Autre centre
+                      </button>
+                    )}
+                    {formRole === "chef_equipe" && (
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setFormTeam("Toutes");
+                          setFormAdditionalTeams([]);
+                        }}
+                        className={`px-2 py-1.5 rounded-xl text-xs font-bold transition-all text-center border cursor-pointer ${
+                          formTeam === "Toutes"
+                            ? "bg-indigo-600 text-white border-indigo-600 shadow-xs"
+                            : "bg-white text-slate-700 hover:bg-indigo-100/50 border-indigo-200/60"
+                        }`}
+                      >
+                        Toutes
+                      </button>
+                    )}
                   </div>
-                  <p className="text-[10px] text-blue-700 leading-tight">
-                    Ce Chef d'Équipe pilotera directement les ordres et techniciens de l'équipe <strong>{formTeam}</strong>.
-                  </p>
+
+                  {formRole === "reception" && formTeam !== "R18" && formTeam !== "R16" && (
+                    <input
+                      type="text"
+                      autoFocus
+                      placeholder="Code du centre, ex. R10"
+                      value={formTeam}
+                      onChange={(e) => setFormTeam(e.target.value.toUpperCase())}
+                      className="w-full px-3 py-2 rounded-xl border border-blue-200 bg-white text-xs font-bold text-slate-800 uppercase focus:outline-none focus:ring-2 focus:ring-blue-500/20 focus:border-blue-500"
+                    />
+                  )}
+
+                  {/* Équipes supplémentaires gérées (ex: Service Rapide) */}
+                  {(formRole === "chef_equipe" || formRole === "chef_atelier" || formRole === "facturation") && formTeam !== "Toutes" && (
+                    <div className="pt-2 border-t border-blue-200/70 space-y-1.5">
+                      <div className="flex items-center justify-between">
+                        <span className="text-[11px] font-bold text-blue-950 flex items-center gap-1.5">
+                          <Users className="w-3.5 h-3.5 text-indigo-600" />
+                          <span>Équipes supplémentaires gérées (ex: Service Rapide) :</span>
+                        </span>
+                        {formAdditionalTeams.length > 0 && (
+                          <span className="text-[10px] font-extrabold text-indigo-700 bg-indigo-100 px-2 py-0.5 rounded-full border border-indigo-200">
+                            +{formAdditionalTeams.length} équipe{formAdditionalTeams.length > 1 ? "s" : ""}
+                          </span>
+                        )}
+                      </div>
+
+                      <div className="grid grid-cols-2 sm:grid-cols-3 gap-1.5">
+                        {CANONICAL_TEAMS.filter((t) => t !== formTeam).map((addTeam) => {
+                          const isChecked = formAdditionalTeams.includes(addTeam);
+                          return (
+                            <button
+                              key={addTeam}
+                              type="button"
+                              onClick={() => toggleAdditionalTeam(addTeam)}
+                              className={`px-2.5 py-1.5 rounded-xl text-xs font-semibold flex items-center justify-between gap-1.5 transition-all cursor-pointer border ${
+                                isChecked
+                                  ? "bg-indigo-600 text-white border-indigo-600 shadow-xs font-bold"
+                                  : "bg-white/95 text-slate-700 border-slate-200 hover:bg-indigo-50/70 hover:border-indigo-300"
+                              }`}
+                            >
+                              <span className="truncate">{addTeam}</span>
+                              {isChecked ? (
+                                <CheckCircle2 className="w-3.5 h-3.5 text-white shrink-0" />
+                              ) : (
+                                <Plus className="w-3.5 h-3.5 text-slate-400 shrink-0" />
+                              )}
+                            </button>
+                          );
+                        })}
+                      </div>
+
+                      <div className="text-[10px] text-indigo-900 bg-indigo-50/90 p-2.5 rounded-xl border border-indigo-200/80 leading-relaxed space-y-1">
+                        <p>
+                          💡 <strong>Gestion multi-équipes :</strong> Ce {formRole === "chef_atelier" ? "Chef d’Atelier" : formRole === "facturation" ? "service Facturation" : "Chef d’Équipe"} gérera simultanément{" "}
+                          <strong className="text-blue-700 underline underline-offset-2">{formTeam}</strong>
+                          {formAdditionalTeams.length > 0 ? (
+                            <>
+                              {" "}et <strong className="text-indigo-700 underline underline-offset-2">{formAdditionalTeams.join(", ")}</strong>.
+                            </>
+                          ) : (
+                            <>. Cliquez sur une équipe additionnelle ci-dessus pour lui confier la gestion (ex: <em>Service Rapide</em>).</>
+                          )}
+                        </p>
+                        <p className="text-slate-600">
+                          Les ordres de réparation, véhicules et techniciens de ces équipes seront accessibles avec ce seul compte.
+                        </p>
+                      </div>
+                    </div>
+                  )}
+
+                  {formRole === "reception" && (
+                    <p className="text-[10px] text-blue-700 leading-tight">
+                      Cet agent Réception sera lié au centre <strong>{formTeam || "à renseigner"}</strong>.
+                    </p>
+                  )}
                 </div>
               )}
+
+              {/* Section Personnalisation des Droits & Accès Granulaires */}
+              <div className="p-3.5 bg-slate-50/90 rounded-2xl border border-slate-200/90 space-y-3">
+                <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+                  <div className="flex items-center gap-2">
+                    <SlidersHorizontal className="w-4 h-4 text-purple-600 shrink-0" />
+                    <div>
+                      <span className="text-xs font-bold text-slate-900 block leading-tight">
+                        Autorisations & Droits d'Accès
+                      </span>
+                      <span className="text-[10px] text-slate-500">
+                        Précisez les pages à regarder et les actions de transfert autorisées
+                      </span>
+                    </div>
+                  </div>
+
+                  <div className="flex items-center gap-1.5 self-start sm:self-center">
+                    {isCustomized ? (
+                      <button
+                        type="button"
+                        onClick={resetToRoleDefaults}
+                        className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg text-[10px] font-bold text-purple-700 bg-purple-100 hover:bg-purple-200 border border-purple-300 transition-colors cursor-pointer"
+                        title="Rétablir les permissions standards de ce rôle"
+                      >
+                        <RotateCcw className="w-3 h-3" />
+                        <span>Rétablir par défaut</span>
+                      </button>
+                    ) : (
+                      <span className="text-[10px] font-bold text-slate-500 bg-white px-2 py-0.5 rounded-md border border-slate-200">
+                        Droits standards : {ROLES_META[formRole].badgeText}
+                      </span>
+                    )}
+                  </div>
+                </div>
+
+                {/* 1. CE QU'IL PEUT REGARDER */}
+                <div className="space-y-1.5 pt-1">
+                  <div className="flex items-center gap-1.5 text-[11px] font-extrabold text-blue-900 uppercase tracking-wide">
+                    <Eye className="w-3.5 h-3.5 text-blue-600 shrink-0" />
+                    <span>1. Pages & Vues (Ce qu'il peut Regarder) :</span>
+                  </div>
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-1.5">
+                    {VIEW_PERMISSIONS.map((perm) => {
+                      const Icon = perm.icon;
+                      const isChecked = Boolean(formCustomPermissions[perm.key]);
+                      return (
+                        <label
+                          key={perm.key}
+                          className={`flex items-start gap-2.5 p-2 rounded-xl border text-left cursor-pointer transition-all ${
+                            isChecked
+                              ? "bg-blue-50/70 border-blue-300 text-blue-950 shadow-2xs"
+                              : "bg-white border-slate-200/80 text-slate-500 hover:bg-slate-100/60"
+                          }`}
+                        >
+                          <input
+                            type="checkbox"
+                            checked={isChecked}
+                            onChange={() => togglePermission(perm.key)}
+                            className="mt-0.5 rounded border-slate-300 text-blue-600 focus:ring-blue-500 shrink-0 cursor-pointer"
+                          />
+                          <div className="min-w-0 flex-1">
+                            <div className="flex items-center gap-1.5">
+                              <Icon className={`w-3.5 h-3.5 shrink-0 ${isChecked ? "text-blue-600" : "text-slate-400"}`} />
+                              <span className={`text-xs font-bold ${isChecked ? "text-slate-900" : "text-slate-600"}`}>
+                                {perm.label}
+                              </span>
+                            </div>
+                            <p className="text-[10px] text-slate-500 leading-tight mt-0.5">
+                              {perm.desc}
+                            </p>
+                          </div>
+                        </label>
+                      );
+                    })}
+                  </div>
+                </div>
+
+                {/* 2. CE QU'IL PEUT TRANSFÉRER OU MODIFIER */}
+                <div className="space-y-1.5 pt-2 border-t border-slate-200/70">
+                  <div className="flex items-center gap-1.5 text-[11px] font-extrabold text-purple-900 uppercase tracking-wide">
+                    <ArrowRightLeft className="w-3.5 h-3.5 text-purple-600 shrink-0" />
+                    <span>2. Actions & Atelier (Ce qu'il peut Transférer ou Modifier) :</span>
+                  </div>
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-1.5">
+                    {ACTION_PERMISSIONS.map((perm) => {
+                      const Icon = perm.icon;
+                      const isChecked = Boolean(formCustomPermissions[perm.key]);
+                      return (
+                        <label
+                          key={perm.key}
+                          className={`flex items-start gap-2.5 p-2 rounded-xl border text-left cursor-pointer transition-all ${
+                            isChecked
+                              ? "bg-purple-50/70 border-purple-300 text-purple-950 shadow-2xs"
+                              : "bg-white border-slate-200/80 text-slate-500 hover:bg-slate-100/60"
+                          }`}
+                        >
+                          <input
+                            type="checkbox"
+                            checked={isChecked}
+                            onChange={() => togglePermission(perm.key)}
+                            className="mt-0.5 rounded border-slate-300 text-purple-600 focus:ring-purple-500 shrink-0 cursor-pointer"
+                          />
+                          <div className="min-w-0 flex-1">
+                            <div className="flex items-center gap-1.5">
+                              <Icon className={`w-3.5 h-3.5 shrink-0 ${isChecked ? "text-purple-600" : "text-slate-400"}`} />
+                              <span className={`text-xs font-bold ${isChecked ? "text-slate-900" : "text-slate-600"}`}>
+                                {perm.label}
+                              </span>
+                            </div>
+                            <p className="text-[10px] text-slate-500 leading-tight mt-0.5">
+                              {perm.desc}
+                            </p>
+                          </div>
+                        </label>
+                      );
+                    })}
+                  </div>
+                </div>
+              </div>
 
               {/* Password */}
               <div>

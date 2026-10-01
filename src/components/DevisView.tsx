@@ -180,7 +180,7 @@ export default function DevisView({
     };
   }, []);
 
-  // Filtre les véhicules qui sont actuellement en "ATENDE DEVIS" ou ayant une fiche devis
+  // Filtre les véhicules au statut « Lancement devis » ou ayant une fiche devis.
   const devisVehicles = useMemo(() => {
     return vehicles.filter((v) => {
       const av = (v.avancement || "").trim().toLowerCase();
@@ -190,6 +190,16 @@ export default function DevisView({
         (v.no && demandesDevisMap[v.no.trim()]) ||
         (v.chassis && demandesDevisMap[v.chassis.trim()])
       );
+      const devis =
+        demandesDevisMap[String(v.id)] ||
+        (v.no && demandesDevisMap[v.no.trim()]) ||
+        (v.chassis && demandesDevisMap[v.chassis.trim()]);
+
+      // Dès qu'une décision est prise, la Réception n'a plus à garder le
+      // dossier dans sa liste de travail. L'administration conserve la trace.
+      if (role === "reception" && (devis?.statutDevis === "Accepté" || devis?.statutDevis === "Refusé")) {
+        return false;
+      }
       return (
         hasDevis ||
         av === "atende devis" ||
@@ -198,7 +208,7 @@ export default function DevisView({
         etat.includes("devis")
       );
     });
-  }, [vehicles, demandesDevisMap]);
+  }, [vehicles, demandesDevisMap, role]);
 
   // Comptes statistiques
   const aAppelerCount = useMemo(() => {
@@ -207,7 +217,7 @@ export default function DevisView({
         demandesDevisMap[String(v.id)] ||
         (v.no && demandesDevisMap[v.no.trim()]) ||
         (v.chassis && demandesDevisMap[v.chassis.trim()]);
-      return !d || !d.statutDevis || d.statutDevis === "En attente accord";
+      return !d || !d.statutDevis || d.statutDevis === "Attente validation devis" || d.statutDevis === "En attente accord";
     }).length;
   }, [devisVehicles, demandesDevisMap]);
 
@@ -267,7 +277,7 @@ export default function DevisView({
         (row.no && demandesDevisMap[row.no.trim()]) ||
         (row.chassis && demandesDevisMap[row.chassis.trim()]);
 
-      const isAAppeler = !d || !d.statutDevis || d.statutDevis === "En attente accord";
+      const isAAppeler = !d || !d.statutDevis || d.statutDevis === "Attente validation devis" || d.statutDevis === "En attente accord";
       const isRelance = isDevisDepassee24h(d);
       const isAccorde = d?.statutDevis === "Accepté";
       const isRefuse = d?.statutDevis === "Refusé";
@@ -548,23 +558,23 @@ export default function DevisView({
       )}
 
       {/* En-tête de la Page Devis */}
-      <div className="bg-gradient-to-r from-orange-950 via-amber-950 to-slate-900 rounded-2xl p-6 text-white shadow-xl border border-orange-500/20 relative overflow-hidden">
+      <div className="bg-gradient-to-r from-orange-950 via-amber-950 to-slate-900 rounded-2xl p-4 text-white shadow-xl border border-orange-500/20 relative overflow-hidden">
         <div className="absolute right-0 top-0 w-96 h-96 bg-orange-500/10 rounded-full blur-3xl pointer-events-none" />
-        <div className="relative z-10 flex flex-col md:flex-row md:items-center justify-between gap-4">
-          <div className="flex items-center gap-4">
-            <div className="p-3.5 bg-orange-500/20 text-orange-300 rounded-2xl border border-orange-400/30 shadow-inner">
-              <FileSignature className="w-8 h-8" />
+        <div className="relative z-10 flex flex-col md:flex-row md:items-center justify-between gap-3">
+          <div className="flex items-center gap-3">
+            <div className="p-2.5 bg-orange-500/20 text-orange-300 rounded-xl border border-orange-400/30 shadow-inner">
+              <FileSignature className="w-6 h-6" />
             </div>
             <div>
               <div className="flex items-center gap-2">
-                <h1 className="text-xl sm:text-2xl font-black tracking-tight text-white">
+                <h1 className="text-lg sm:text-xl font-black tracking-tight text-white">
                   Véhicules en Attente Devis (N° DV)
                 </h1>
                 <span className="px-2.5 py-0.5 rounded-full text-xs font-black bg-orange-500/30 text-orange-200 border border-orange-400/40">
                   {devisVehicles.length} dossiers
                 </span>
               </div>
-              <p className="text-xs text-orange-200/80 mt-1 max-w-3xl">
+              <p className="text-[11px] leading-snug text-orange-200/80 mt-0.5 max-w-3xl">
                 Suivi des devis créés par les équipes d'atelier. La Réception appelle le client dès notification de création. Si le client ne répond pas sous 1 jour (24h), un rappel est déclenché. En cas d'acceptation, le véhicule retourne à son équipe ; en cas de refus, l'avancement passe automatiquement à <strong>Terminer</strong>.
               </p>
             </div>
@@ -576,7 +586,7 @@ export default function DevisView({
                 type="button"
                 onClick={onRefresh}
                 disabled={isRefreshing}
-                className="inline-flex items-center gap-2 px-4 py-2.5 bg-white/10 hover:bg-white/15 active:scale-95 text-white rounded-xl border border-white/10 text-xs font-bold transition-all disabled:opacity-50 cursor-pointer shadow-xs"
+                className="inline-flex items-center gap-2 px-3 py-2 bg-white/10 hover:bg-white/15 active:scale-95 text-white rounded-xl border border-white/10 text-xs font-bold transition-all disabled:opacity-50 cursor-pointer shadow-xs"
               >
                 <RotateCw size={14} className={isRefreshing ? "animate-spin" : ""} />
                 <span>Actualiser</span>
@@ -586,13 +596,13 @@ export default function DevisView({
         </div>
 
         {/* Cartes d'indicateurs rapides */}
-        <div className="grid grid-cols-2 sm:grid-cols-5 gap-3 mt-6 pt-5 border-t border-orange-500/20">
-          <div className="bg-white/5 rounded-xl p-3 border border-white/10">
+        <div className="grid grid-cols-2 sm:grid-cols-5 gap-2 mt-3 pt-3 border-t border-orange-500/20">
+          <div className="bg-white/5 rounded-xl p-2.5 border border-white/10">
             <div className="text-[11px] text-orange-200/70 font-semibold">Total Devis</div>
             <div className="text-2xl font-black text-white mt-0.5">{devisVehicles.length}</div>
           </div>
 
-          <div className="bg-white/5 rounded-xl p-3 border border-white/10">
+          <div className="bg-white/5 rounded-xl p-2.5 border border-white/10">
             <div className="text-[11px] text-amber-300 font-semibold flex items-center gap-1">
               <PhoneCall size={12} />
               <span>À appeler</span>
@@ -601,7 +611,7 @@ export default function DevisView({
             <div className="text-[10px] text-amber-200/60 mt-0.5">Nouveaux créés</div>
           </div>
 
-          <div className="bg-white/5 rounded-xl p-3 border border-white/10">
+          <div className="bg-white/5 rounded-xl p-2.5 border border-white/10">
             <div className="text-[11px] text-rose-300 font-semibold flex items-center gap-1">
               <AlertTriangle size={12} />
               <span>Relance &gt; 24h</span>
@@ -612,7 +622,7 @@ export default function DevisView({
             <div className="text-[10px] text-rose-200/60 mt-0.5">Sans réponse 1j</div>
           </div>
 
-          <div className="bg-white/5 rounded-xl p-3 border border-white/10">
+          <div className="bg-white/5 rounded-xl p-2.5 border border-white/10">
             <div className="text-[11px] text-emerald-300 font-semibold flex items-center gap-1">
               <CheckCircle2 size={12} />
               <span>Acceptés</span>
@@ -621,7 +631,7 @@ export default function DevisView({
             <div className="text-[10px] text-emerald-200/60 mt-0.5">Renvoyés équipe</div>
           </div>
 
-          <div className="bg-white/5 rounded-xl p-3 border border-white/10">
+          <div className="bg-white/5 rounded-xl p-2.5 border border-white/10">
             <div className="text-[11px] text-slate-300 font-semibold flex items-center gap-1">
               <XCircle size={12} />
               <span>Refusés</span>
@@ -757,7 +767,7 @@ export default function DevisView({
                       <p className="text-xs text-slate-400 max-w-sm">
                         {search
                           ? "Aucun résultat ne correspond à votre recherche."
-                          : "Lorsqu'une équipe choisit 'ATENDE DEVIS', le véhicule apparaît automatiquement ici avec son N° DV."}
+                          : "Lorsqu'une équipe choisit « Lancement devis », le véhicule apparaît automatiquement ici avec son N° DV."}
                       </p>
                     </div>
                   </td>
@@ -971,7 +981,7 @@ export default function DevisView({
                             <select
                               disabled={isSaving || !canEdit}
                               style={getAvancementBadgeStyle(row.avancement)}
-                              value={row.avancement || "ATENDE DEVIS"}
+                              value={row.avancement || "Lancement devis"}
                               onChange={(e) => void onUpdateAvancement(row, e.target.value)}
                               className="px-2 py-1 text-xs rounded-lg border font-bold shadow-2xs outline-none cursor-pointer focus:ring-2 focus:ring-orange-500/20 disabled:opacity-60"
                               title="Avancement de l'intervention"

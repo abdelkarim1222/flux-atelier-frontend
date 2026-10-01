@@ -24,6 +24,8 @@ export const ROLES_META: Record<RoleType, RoleInfo> = {
       canViewDevis: true,
       canViewSuiviTemps: true,
       canViewEssai: true,
+      canViewFacturation: true,
+      canManageEquipes: true,
       defaultTab: "chargement",
     },
   },
@@ -46,6 +48,8 @@ export const ROLES_META: Record<RoleType, RoleInfo> = {
       canViewDevis: true,
       canViewSuiviTemps: true,
       canViewEssai: true,
+      canViewFacturation: true,
+      canManageEquipes: true,
       defaultTab: "chargement",
     },
   },
@@ -63,11 +67,13 @@ export const ROLES_META: Record<RoleType, RoleInfo> = {
       canEditEmplacement: false,
       canEditEtat: false,
       canEditAvancement: false,  // Réception ne peut pas modifier l'avancement atelier
-      canViewMap: false,
+      canViewMap: true,          // Accessible à tous les rôles
       canViewAttenteAchat: false, // Interdit pour Réception
       canViewDevis: true,        // Consultable & géré par Réception (appels clients, relance 24h, refus)
       canViewSuiviTemps: false,   // Interdit pour Réception (Réservé Administration & Chef Atelier)
       canViewEssai: false,        // Réception ne peut pas consulter
+      canViewFacturation: false,
+      canManageEquipes: false,
       defaultTab: "suivi_entrees",
     },
   },
@@ -85,12 +91,38 @@ export const ROLES_META: Record<RoleType, RoleInfo> = {
       canEditEmplacement: true,
       canEditEtat: true,
       canEditAvancement: true,
-      canViewMap: false,
+      canViewMap: true,          // Accessible à tous les rôles
       canViewAttenteAchat: false, // Interdit pour Chef d'Équipe (Masqué du menu + Redirection)
       canViewDevis: false,       // Masqué du menu Chef d'Équipe (géré par Réception/Admin)
       canViewSuiviTemps: false,  // Interdit pour Chef d'Équipe (Réservé Administration & Chef Atelier)
       canViewEssai: true,        // Consultable par Chef d'Équipe
+      canViewFacturation: false,
+      canManageEquipes: false,
       defaultTab: "chargement",
+    },
+  },
+  facturation: {
+    id: "facturation",
+    title: "Facturation",
+    description: "Validation des modes de paiement, facturation & autorisations de sortie",
+    badgeBg: "bg-amber-100 text-amber-800 border-amber-300",
+    badgeText: "Facturation",
+    accentColor: "#d97706",
+    permissions: {
+      canViewAll: false,
+      canEditChargement: false,
+      canAddEntree: false,
+      canEditEmplacement: false,
+      canEditEtat: false,
+      canEditAvancement: false,
+      canViewMap: true,          // Accessible à tous les rôles
+      canViewAttenteAchat: false,
+      canViewDevis: false,
+      canViewSuiviTemps: false,
+      canViewEssai: false,
+      canViewFacturation: true,
+      canManageEquipes: false,
+      defaultTab: "facturation",
     },
   },
 };
@@ -102,7 +134,15 @@ interface RoleContextValue {
   setRole: (role: RoleType) => void;
 }
 
-const RoleContext = createContext<RoleContextValue | undefined>(undefined);
+const defaultRole: RoleType = "chef_atelier";
+const defaultRoleValue: RoleContextValue = {
+  role: defaultRole,
+  roleInfo: ROLES_META[defaultRole],
+  permissions: ROLES_META[defaultRole].permissions,
+  setRole: () => {},
+};
+
+const RoleContext = createContext<RoleContextValue>(defaultRoleValue);
 
 const LOCAL_STORAGE_KEY = "flux_atelier_active_role";
 
@@ -145,14 +185,18 @@ export function RoleProvider({ children }: { children: ReactNode }) {
     }
   }, [role, currentUser]);
 
-  const roleInfo = ROLES_META[role];
+  const roleInfo = ROLES_META[role] || ROLES_META[defaultRole];
+  const permissions: RolePermissions = {
+    ...roleInfo.permissions,
+    ...(currentUser?.customPermissions || {}),
+  };
 
   return (
     <RoleContext.Provider
       value={{
         role,
         roleInfo,
-        permissions: roleInfo.permissions,
+        permissions,
         setRole,
       }}
     >
@@ -163,8 +207,5 @@ export function RoleProvider({ children }: { children: ReactNode }) {
 
 export function useRole() {
   const context = useContext(RoleContext);
-  if (!context) {
-    throw new Error("useRole must be used within a RoleProvider");
-  }
-  return context;
+  return context || defaultRoleValue;
 }

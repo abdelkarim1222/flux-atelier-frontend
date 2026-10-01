@@ -101,14 +101,27 @@ export function normalizeTeamName(t: string): string {
 /**
  * Checks if a vehicle belongs to the given user's workshop team.
  * Specific rule:
+ * - If userTeam is "Toutes", it matches all teams.
+ * - If userTeam contains multiple teams (e.g. "Daily1, Service Rapide"), it matches if ANY of them matches.
  * - If vehicleTeam is "Daily", it matches BOTH Daily1 and Daily2.
  * - Otherwise it matches the specific team (Service Rapide, Lourd, Carrosserie, Elictrique, Changan).
  */
 export function isVehicleMatchingTeam(vehicleTeam: string, userTeam: string): boolean {
   if (!userTeam) return true;
 
+  const cleanUserTeam = userTeam.trim();
+  if (cleanUserTeam.toLowerCase() === "toutes" || cleanUserTeam.toLowerCase() === "all") {
+    return true;
+  }
+
+  // Si le Chef d'Équipe gère plusieurs équipes (ex: "Daily1, Service Rapide")
+  if (cleanUserTeam.includes(",")) {
+    const teams = cleanUserTeam.split(",").map((t) => t.trim()).filter(Boolean);
+    return teams.some((t) => isVehicleMatchingTeam(vehicleTeam, t));
+  }
+
   const vNorm = (vehicleTeam || "").toLowerCase().replace(/[^a-z0-9]/g, "");
-  const uNorm = (userTeam || "").toLowerCase().replace(/[^a-z0-9]/g, "");
+  const uNorm = cleanUserTeam.toLowerCase().replace(/[^a-z0-9]/g, "");
 
   if (!vNorm || vNorm === "-" || vNorm === "na") {
     // Si aucune équipe n'est affectée au véhicule, il reste visible pour ne pas être perdu
@@ -157,4 +170,28 @@ export function isVehicleMatchingTeam(vehicleTeam: string, userTeam: string): bo
 
   return normalizeTeamName(vehicleTeam) === normalizeTeamName(userTeam);
 }
+
+/**
+ * Décompose une chaîne d'équipes assignées (ex: "Daily1, Service Rapide")
+ * en équipe principale et équipes secondaires.
+ */
+export function parseAssignedTeams(assignedTeam: string | undefined): {
+  primary: string;
+  additional: string[];
+  all: string[];
+} {
+  if (!assignedTeam || !assignedTeam.trim()) {
+    return { primary: "Daily1", additional: [], all: ["Daily1"] };
+  }
+  const parts = assignedTeam.split(",").map((t) => t.trim()).filter(Boolean);
+  if (parts.length === 0) {
+    return { primary: "Daily1", additional: [], all: ["Daily1"] };
+  }
+  return {
+    primary: parts[0],
+    additional: parts.slice(1),
+    all: parts,
+  };
+}
+
 

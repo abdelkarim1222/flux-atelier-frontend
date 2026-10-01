@@ -1131,6 +1131,11 @@ button {
   width: 150px;
 }
 
+.vehicle-detail-table.table-chargement-chef .col-state,
+.table-chargement-chef .col-state {
+  width: 250px;
+}
+
 .vehicle-detail-table .col-immat {
   width: 135px;
 }
@@ -1435,6 +1440,49 @@ button {
 
   .map-panel {
     min-height: 460px;
+  }
+
+  /* Téléphones étroits : le panneau d'états devient repliable pour ne pas
+     cacher le plan. Le bouton ☰ le rouvre à tout moment. */
+  .plan-stage .map-toolbar {
+    top: 8px;
+    left: 8px;
+    width: min(232px, calc(100vw - 16px));
+    max-height: calc(100% - 16px);
+    overflow-y: auto;
+    padding-top: 38px;
+  }
+
+  .plan-stage .map-toolbar-close-btn {
+    position: absolute;
+    top: 8px;
+    right: 8px;
+    display: flex;
+    z-index: 1;
+    font-size: 18px;
+    font-weight: 900;
+  }
+
+  .plan-stage .map-toolbar.map-toolbar-collapsed {
+    width: 42px;
+    height: 42px;
+    min-height: 42px;
+    overflow: hidden;
+    padding: 0;
+  }
+
+  .plan-stage .map-toolbar.map-toolbar-collapsed .map-toolbar-close-btn {
+    inset: 0;
+    width: 42px;
+    height: 42px;
+    font-size: 16px;
+  }
+
+  .plan-stage .map-toolbar.map-toolbar-collapsed .map-toolbar-brand,
+  .plan-stage .map-toolbar.map-toolbar-collapsed .map-toolbar-divider,
+  .plan-stage .map-toolbar.map-toolbar-collapsed .map-statuses-bar,
+  .plan-stage .map-toolbar.map-toolbar-collapsed .map-chips {
+    display: none;
   }
 
   .atelier-map {
@@ -1997,5 +2045,91 @@ button {
   }
 }
 
+/* Les styles de la carte sont définis plus haut dans le fichier : ces règles
+   placées en fin de feuille gardent donc la priorité sur téléphone. */
+@media (max-width: 640px) {
+  html,
+  body,
+  #root,
+  .pbix-monitor {
+    max-width: 100%;
+    overflow-x: hidden;
+  }
 
+  .monitor-topbar {
+    padding: 0 8px;
+    gap: 6px;
+  }
+
+  .monitor-brand {
+    gap: 6px;
+  }
+
+  .monitor-brand h1 {
+    font-size: 13px;
+  }
+
+  .monitor-actions {
+    margin-left: auto;
+    gap: 4px;
+    flex-shrink: 0;
+  }
+
+  .monitor-user-summary {
+    width: 30px;
+    height: 30px;
+    padding: 3px;
+    justify-content: center;
+  }
+
+  .monitor-user-summary > div:last-child,
+  .monitor-refresh-label {
+    display: none;
+  }
+
+  .monitor-actions .monitor-button {
+    width: 32px;
+    min-width: 32px;
+    padding: 0;
+    gap: 0;
+  }
+
+  .plan-stage .map-toolbar {
+    top: 8px;
+    left: 8px;
+    width: min(220px, calc(100vw - 16px));
+    max-height: calc(100% - 16px);
+    overflow-y: auto;
+    padding: 38px 10px 10px;
+    gap: 7px;
+  }
+
+  .plan-stage .map-toolbar.map-toolbar-collapsed {
+    width: 42px;
+    height: 42px;
+    min-height: 42px;
+    overflow: hidden;
+    padding: 0;
+  }
+
+  .plan-stage .map-toolbar.map-toolbar-collapsed .map-toolbar-close-btn {
+    inset: 0;
+    width: 42px;
+    height: 42px;
+    font-size: 16px;
+  }
+
+  .plan-stage .map-toolbar.map-toolbar-collapsed .map-toolbar-brand,
+  .plan-stage .map-toolbar.map-toolbar-collapsed .map-toolbar-divider,
+  .plan-stage .map-toolbar.map-toolbar-collapsed .map-statuses-bar,
+  .plan-stage .map-toolbar.map-toolbar-collapsed .map-chips {
+    display: none;
+  }
+}
+
+@media (max-width: 380px) {
+  .monitor-reset-button {
+    display: none;
+  }
+}
 

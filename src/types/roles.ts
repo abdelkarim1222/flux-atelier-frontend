@@ -1,4 +1,4 @@
-export type RoleType = "administration" | "chef_atelier" | "reception" | "chef_equipe";
+export type RoleType = "administration" | "chef_atelier" | "reception" | "chef_equipe" | "facturation";
 
 export interface RolePermissions {
   canViewAll: boolean;
@@ -12,7 +12,11 @@ export interface RolePermissions {
   canViewDevis: boolean;
   canViewSuiviTemps: boolean;
   canViewEssai: boolean;
-  defaultTab: "chargement" | "suivi_entrees" | "plan_atelier";
+  canViewFacturation: boolean;
+  /** Consultation de tous les dossiers Facturation, sans élargir les autres pages atelier. */
+  canViewAllFacturation?: boolean;
+  canManageEquipes?: boolean;
+  defaultTab: "chargement" | "suivi_entrees" | "plan_atelier" | "facturation";
 }
 
 export interface RoleInfo {

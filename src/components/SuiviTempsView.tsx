@@ -64,7 +64,10 @@ export default function SuiviTempsView({ userTeam }: SuiviTempsViewProps = {}) {
     }, 1000);
     return () => clearInterval(id);
   }, []);
-  void now; // used via nowRef below
+  // Les durées des attentes en cours sont affichées en minutes : on recalcule
+  // les colonnes au changement de minute, tout en gardant la seconde précise
+  // pour les compteurs d'achat déjà visibles dans l'écran.
+  const clockMinute = Math.floor(now / 60_000);
 
   /** Formate une durée en ms en "Xh Ym Zs" ou "Ym Zs" */
   const formatElapsed = (ms: number): string => {
@@ -153,6 +156,11 @@ export default function SuiviTempsView({ userTeam }: SuiviTempsViewProps = {}) {
         dateEntreeHeure: s.dateEntreeHeure || f?.dateEntree,
         dateDebutRep: s.dateDebutRep,
         dateFinRep: f?.dateFinRep || s.dateFinRep,
+        dateModification: f?.dateModification,
+        dateDevis: f?.dateDevis,
+        dateDemande: f?.dateDemande,
+        dateReaffectation: f?.dateReaffectation,
+        dateDebutEssai: f?.dateDebutEssai,
       });
     });
 
@@ -175,12 +183,17 @@ export default function SuiviTempsView({ userTeam }: SuiviTempsViewProps = {}) {
         dateEntreeHeure: f.dateEntree,
         dateDebutRep: undefined,
         dateFinRep: f.dateFinRep,
+        dateModification: f.dateModification,
+        dateDevis: f.dateDevis,
+        dateDemande: f.dateDemande,
+        dateReaffectation: f.dateReaffectation,
+        dateDebutEssai: f.dateDebutEssai,
       });
     });
 
     // Calculer les temps pour chaque véhicule
     return unifiedList.map((v) => calculateVehicleTimes(v));
-  }, [vehicles, suiviList]);
+  }, [vehicles, suiviList, clockMinute]);
 
   // Liste des équipes uniques pour le filtre
   const equipes = useMemo(() => {

@@ -613,7 +613,7 @@ export default function AcheterView({
                             <option value="attends acheter">attends acheter (Attente pièces)</option>
                             <optgroup label="Relancer en atelier (Pièces reçues)">
                               {[
-                                "ATENDE DEVIS",
+                                "Lancement devis",
                                 "En cours - 10%",
                                 "En cours - 20%",
                                 "En cours - 30%",

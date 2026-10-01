@@ -52,10 +52,12 @@ const PRESET_POSTES = [
 ];
 
 export default function GestionEquipesView() {
-  const { currentUser } = useAuth();
+  const { currentUser, accounts } = useAuth();
   const isAdmin = currentUser?.role === "administration";
   const isChefAtelier = currentUser?.role === "chef_atelier";
-  const canView = isAdmin || isChefAtelier;
+  const canManageEquipes = Boolean(currentUser?.customPermissions?.canManageEquipes);
+  const canEdit = isAdmin || isChefAtelier || canManageEquipes;
+  const canView = isAdmin || isChefAtelier || canManageEquipes;
 
   const [members, setMembers] = useState<EquipeMember[]>(() => {
     const custom = getCustomEquipeMembers();
@@ -144,7 +146,7 @@ export default function GestionEquipesView() {
 
   // Open modal for creating a new member
   const openCreateModal = (targetTeam?: string) => {
-    if (!isAdmin) return;
+    if (!canEdit) return;
     setEditingMember(null);
     setFormTeam(targetTeam || (selectedTeamFilter !== "all" ? selectedTeamFilter : "Daily1"));
     setFormMatricule("");
@@ -159,7 +161,7 @@ export default function GestionEquipesView() {
 
   // Open modal for editing a member
   const openEditModal = (member: EquipeMember) => {
-    if (!isAdmin) return;
+    if (!canEdit) return;
     setEditingMember(member);
     setFormTeam(member.team);
     setFormMatricule(member.matricule || "");
@@ -175,8 +177,8 @@ export default function GestionEquipesView() {
   // Handle Form Submit for Member
   const handleMemberSubmit = (e: React.FormEvent) => {
     e.preventDefault();
-    if (!isAdmin) {
-      setFormError("Action réservée au profil Administration.");
+    if (!canEdit) {
+      setFormError("Action réservée aux profils autorisés.");
       return;
     }
 
@@ -249,7 +251,7 @@ export default function GestionEquipesView() {
 
   // Handle Delete Member
   const handleDeleteMember = () => {
-    if (!isAdmin || !deletingMember) return;
+    if (!canEdit || !deletingMember) return;
     const updated = members.filter((m) => {
       const isSameMat = Boolean(deletingMember.matricule && m.matricule && m.matricule.trim() === deletingMember.matricule.trim());
       const isSameName = normalizePersonName(m.name) === normalizePersonName(deletingMember.name);
@@ -416,12 +418,13 @@ export default function GestionEquipesView() {
                     <ChevronDown size={11} className="text-slate-500" />
                   </div>
                 </th>
-                <th className="py-2 px-3 w-[28%]">
+                <th className="py-2 px-3 w-[18%]">
                   <div className="flex items-center justify-between">
                     <span>Poste</span>
                     <ChevronDown size={11} className="text-slate-500" />
                   </div>
                 </th>
+                <th className="py-2 px-3 w-[16%]">Accès</th>
               </tr>
             </thead>
             <tbody className="divide-y divide-slate-200">
@@ -434,6 +437,11 @@ export default function GestionEquipesView() {
               ) : (
                 teamMembers.map((member, idx) => {
                   const isChef = member.poste.toUpperCase().includes("CHEF");
+                  const linkedAccount = accounts.find((account) =>
+                    account.role === "reception" &&
+                    (normalizePersonName(account.name) === normalizePersonName(member.name) ||
+                      account.assignedTeam === member.matricule)
+                  );
                   const isMatch =
                     query &&
                     (member.name.toLowerCase().includes(query) ||
@@ -501,6 +509,17 @@ export default function GestionEquipesView() {
                             {member.poste || "MECANICIEN"}
                           </span>
                         )}
+                      </td>
+                      <td className="py-2 px-3 text-[10px] font-bold">
+                        {member.poste.toUpperCase() === "RÉCEPTION" ? (
+                          linkedAccount ? (
+                            <span className="inline-flex items-center gap-1 text-emerald-700">
+                              <ShieldCheck size={12} /> Compte lié
+                            </span>
+                          ) : (
+                            <span className="text-amber-700">À lier dans Accès</span>
+                          )
+                        ) : <span className="text-slate-400">—</span>}
                       </td>
                     </tr>
                   );

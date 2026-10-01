@@ -130,9 +130,10 @@ export default function EssaiView({
   );
 
   // Les essais en cours restent visibles pour tout profil autorisé à cette page.
-  // Les essais anciens (conformes ou non conformes) sont une archive réservée
-  // à l'Administration et aux Chefs d'équipe.
-  const canViewEssaiHistory = role === "administration" || role === "chef_equipe";
+  // Dès qu'un essai est clôturé, son historique est une archive réservée à
+  // l'Administration. Un chef d'équipe ne conserve donc pas les essais terminés
+  // dans sa page Essai.
+  const canViewEssaiHistory = role === "administration";
 
   // Les véhicules sortis d'essai restent visibles tant qu'ils ont un historique :
   // le tableau constitue ainsi la preuve des essais effectués.
@@ -247,7 +248,7 @@ export default function EssaiView({
             <div className="text-[11px] text-purple-200/70 font-semibold">Historique des essais</div>
             <div className="text-xs font-medium text-purple-100 mt-1 flex items-center gap-1">
               <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400" />
-              <span>{canViewEssaiHistory ? "Conformes et non-conformes conservés" : "Réservé à l'Administration et aux Chefs d'équipe"}</span>
+              <span>{canViewEssaiHistory ? "Conformes et non-conformes conservés" : "Réservé à l'Administration"}</span>
             </div>
           </div>
         </div>
@@ -324,7 +325,10 @@ export default function EssaiView({
                       (Boolean(essai.chassis) && essai.chassis === row.chassis)
                     )
                     .sort((a, b) => b.timestamp - a.timestamp);
-                  const lastEssai = essaisForVehicle[0];
+                  // Les résultats précédents ne sont affichés que pour
+                  // l'administration, y compris lorsqu'un véhicule revient en essai.
+                  const visibleEssais = canViewEssaiHistory ? essaisForVehicle : [];
+                  const lastEssai = visibleEssais[0];
 
                   return (
                     <tr
@@ -408,14 +412,14 @@ export default function EssaiView({
                           {lastEssai ? (
                             <div className="w-full space-y-1.5">
                               <div className="text-[10px] flex flex-wrap items-center gap-1 px-2 py-1 rounded-md bg-slate-100 text-slate-700 border border-slate-200">
-                                <span className="font-semibold text-slate-600">{essaisForVehicle.length} essai{essaisForVehicle.length > 1 ? "s" : ""} • dernier :</span>
+                                <span className="font-semibold text-slate-600">{visibleEssais.length} essai{visibleEssais.length > 1 ? "s" : ""} • dernier :</span>
                                 <span className="font-semibold">{lastEssai.dateControle}</span>
                                 <span className={`font-bold ${lastEssai.resultat === "CONFORME" ? "text-emerald-700" : "text-rose-700"}`}>
                                   {lastEssai.resultat}
                                 </span>
                               </div>
                               <div className="space-y-1 border-l-2 border-purple-200 pl-2">
-                                {essaisForVehicle.map((essai) => (
+                                {visibleEssais.map((essai) => (
                                   <div key={essai.id} className="text-[10px] leading-snug text-slate-600">
                                     <span className="font-bold text-slate-800">{essai.dateControle}</span>
                                     <span> — {essai.essayeur} : </span>
@@ -446,7 +450,7 @@ export default function EssaiView({
                                 <option value="Terminer">Terminer (Test validé)</option>
                                 <optgroup label="Renvoyer en En cours">
                                   {[
-                                    "ATENDE DEVIS",
+                                    "Lancement devis",
                                     "En cours - 10%",
                                     "En cours - 20%",
                                     "En cours - 30%",

@@ -24,6 +24,8 @@ import {
   Pencil,
   Trash2,
   Eye,
+  RotateCcw,
+  Send,
 } from "lucide-react";
 import {
   fetchSuiviEntreesData,
@@ -32,19 +34,24 @@ import {
   updateReceptionRowEtat,
   updateReceptionRowEmplacement,
   livrerVehiculeReception,
+  reouvrirOrLivre,
+  traiterRetourReouvert,
   DELIVERED_EMPLACEMENT,
 } from "../services/database";
 import { EMPLACEMENT_ZONES, FULL_PARKING_EMPLACEMENT, normalizeEmplacementCode } from "../services/emplacementService";
 import type { Flux, WorkshopStatus } from "../data/mockData";
 import { useRole } from "../context/RoleContext";
+import { useAuth } from "../context/AuthContext";
 import NouvelleEntreeModal from "./NouvelleEntreeModal";
 import NouveauVinModal from "./NouveauVinModal";
 import ModifierEntreeModal from "./ModifierEntreeModal";
 import ConfirmationSuppressionModal from "./ConfirmationSuppressionModal";
 import DetailVehiculeModal from "./DetailVehiculeModal";
+import { recordVehicleModification } from "../services/timeTracking";
 
 export interface SuiviEntreesTableProps {
   onNavigateToMap?: (emplacement: string) => void;
+  initialNotice?: string | null;
 }
 
 export interface UnifiedReceptionRow {
@@ -77,6 +84,20 @@ export interface UnifiedReceptionRow {
   dateDebutRep?: string;
   dateDebutTravail?: string;
   heureDebutTravail?: string;
+  modePaiement?: string;
+  statutFacturation?: string;
+  statutFacturationFinale?: string;
+  facturationValideePar?: string;
+  dateValidationFacturation?: string;
+  dateLivraisonClient?: string;
+  livrePar?: string;
+  recordKey?: string;
+  interventionId?: string;
+  interventionNumero?: number;
+  retourVehicule?: boolean;
+  statutRetour?: string;
+  descriptionRetour?: string;
+  dateRetour?: string;
 }
 
 type SortField =
@@ -110,6 +131,34 @@ function isAvancementTermine(avancement?: string): boolean {
     clean === "100%" ||
     clean.includes("100%")
   );
+}
+
+export function isVehiculeLivre(item: {
+  etat?: string;
+  avancement?: string;
+  emplacement?: string;
+  statut?: string;
+  etatIntervention?: string;
+  dateLivraisonClient?: string;
+}): boolean {
+  const etat = String(item.etat || "").toLowerCase();
+  const statut = String(item.statut || "").toLowerCase();
+  const etatIntervention = String(item.etatIntervention || "").toLowerCase();
+  const avancement = String(item.avancement || "").toLowerCase();
+  const dateLivraison = String(item.dateLivraisonClient || "").trim();
+
+  if (
+    etat.includes("livr") ||
+    statut.includes("livr") ||
+    etatIntervention.includes("livr") ||
+    avancement.includes("livr")
+  ) {
+    return true;
+  }
+  if (dateLivraison && dateLivraison !== "-" && dateLivraison !== "NA") {
+    return true;
+  }
+  return false;
 }
 
 function parseDateEntreeTimestamp(dateStr?: string): number {
@@ -202,11 +251,16 @@ function parseAvancementPct(value: string): number | null {
   return null;
 }
 
-export default function SuiviEntreesTable({ onNavigateToMap }: SuiviEntreesTableProps = {}) {
+
+export default function SuiviEntreesTable({ onNavigateToMap, initialNotice }: SuiviEntreesTableProps = {}) {
   const { permissions, role } = useRole();
-  // Les Chefs d'équipe consultent uniquement ce tableau : aucune fiche, édition
-  // ou suppression n'est exposée depuis le suivi des entrées.
+  const { currentUser } = useAuth();
+  const assignedReceptionCs = role === "reception" ? (currentUser?.assignedTeam || "").trim().toUpperCase() : "";
+  // Seuls l'Administration et le Chef d'Atelier ont accès à la colonne ACTIONS (Modifier, Supprimer).
+  // La Réception n'a pas accès à la colonne ACTIONS (pas de suppression ni modification de fiche).
+  const canManageActions = role === "administration" || role === "chef_atelier";
   const canManageEntries = role !== "chef_equipe";
+  const canViewDetails = role !== "chef_equipe";
   const [items, setItems] = useState<UnifiedReceptionRow[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -214,6 +268,7 @@ export default function SuiviEntreesTable({ onNavigateToMap }: SuiviEntreesTable
   const [selectedEquipe, setSelectedEquipe] = useState<string>("Toutes");
   const [selectedEtat, setSelectedEtat] = useState<string>("Tous");
   const [isModalOpen, setIsModalOpen] = useState(false);
+  const [isHistoricalModalOpen, setIsHistoricalModalOpen] = useState(false);
   const [isVinModalOpen, setIsVinModalOpen] = useState(false);
   const [editingRow, setEditingRow] = useState<UnifiedReceptionRow | null>(null);
   const [deletingRow, setDeletingRow] = useState<UnifiedReceptionRow | null>(null);
@@ -222,64 +277,200 @@ export default function SuiviEntreesTable({ onNavigateToMap }: SuiviEntreesTable
 
   // Saving state for live updates on État / Emplacement
   const [savingRowId, setSavingRowId] = useState<string | null>(null);
-  const [notice, setNotice] = useState<string | null>(null);
+  const [notice, setNotice] = useState<string | null>(initialNotice || null);
 
-  // Modal Mode de paiement (affiché quand on clique « Livrer »)
+  useEffect(() => {
+    if (initialNotice) {
+      setNotice(initialNotice);
+    }
+  }, [initialNotice]);
+
+  // Modal Mode de paiement (affiché quand on clique « Livrer » en override Direction)
   const [paiementModal, setPaiementModal] = useState<{
     item: UnifiedReceptionRow;
     mode: string;
   } | null>(null);
+  const [returnReceptionModal, setReturnReceptionModal] = useState<UnifiedReceptionRow | null>(null);
+  const [returnDescription, setReturnDescription] = useState("");
+  const [returnTeam, setReturnTeam] = useState("");
+  const [returnSaving, setReturnSaving] = useState(false);
 
   const MODES_PAIEMENT = [
-    { value: "Espèces",         icon: "💵" },
-    { value: "Chèque",           icon: "📝" },
-    { value: "Virement",         icon: "🏦" },
-    { value: "Carte bancaire",   icon: "💳" },
-    { value: "Bon de commande",  icon: "📋" },
-    { value: "Autre",            icon: "⚙️" },
+    { value: "Facture",                 icon: "📄" },
+    { value: "Bon de commande",         icon: "📋" },
+    { value: "Att Facture",             icon: "📑" },
+    { value: "Édition fin de travaux",  icon: "📑" },
+    { value: "Espèces",                 icon: "💵" },
+    { value: "Chèque",                  icon: "📝" },
+    { value: "Virement",                icon: "🏦" },
+    { value: "Carte bancaire",          icon: "💳" },
+    { value: "Autre",                   icon: "⚙️" },
   ];
 
+  const RETURN_TEAMS = ["Daily1", "Daily2", "Changan", "Lourd", "Service Rapide", "Électrique", "Carrosserie"];
+
+  const handleReopenOr = async (item: UnifiedReceptionRow) => {
+    if (!window.confirm(`Réouvrir l'OR ${item.noOr} ? L'intervention livrée sera conservée dans l'historique et une nouvelle intervention sera envoyée à la Réception.`)) return;
+    setSavingRowId(item.id);
+    setNotice(null);
+    try {
+      const result = await reouvrirOrLivre(item);
+      setNotice(result.message || `OR ${item.noOr} réouvert et envoyé à la Réception.`);
+      await loadData(false);
+    } catch (err) {
+      setNotice(err instanceof Error ? `Impossible de réouvrir l'OR : ${err.message}` : "Impossible de réouvrir l'OR.");
+    } finally {
+      setSavingRowId(null);
+    }
+  };
+
+  const openReturnReceptionModal = (item: UnifiedReceptionRow) => {
+    setReturnReceptionModal(item);
+    setReturnDescription(item.descriptionRetour || "");
+    setReturnTeam("");
+  };
+
+  const handleSendReopenedReturn = async () => {
+    if (!returnReceptionModal || !returnDescription.trim() || !returnTeam) return;
+    setReturnSaving(true);
+    try {
+      await traiterRetourReouvert({
+        recordKey: returnReceptionModal.recordKey || returnReceptionModal.id,
+        noOr: returnReceptionModal.noOr,
+        chassis: returnReceptionModal.chassis,
+        descriptionRetour: returnDescription.trim(),
+        equipe: returnTeam,
+      });
+      setNotice(`Retour de l'OR ${returnReceptionModal.noOr} envoyé à l'équipe ${returnTeam}.`);
+      setReturnReceptionModal(null);
+      await loadData(false);
+    } catch (err) {
+      setNotice(err instanceof Error ? `Impossible d'envoyer le retour : ${err.message}` : "Impossible d'envoyer le retour à l'équipe.");
+    } finally {
+      setReturnSaving(false);
+    }
+  };
+
+  // Livraison avec modal (pour override Direction si aucun mode prédéfini)
   const handleConfirmLivraison = async () => {
     if (!paiementModal || !paiementModal.mode) return;
     const { item, mode } = paiementModal;
+    const previousRow = item;
     setPaiementModal(null);
 
-    // Optimistic UI update
+    // Optimistic UI update : pour la réception, le véhicule livré disparaît immédiatement de la vue
     setSavingRowId(item.id);
     setNotice(null);
     setItems((current) =>
-      current.map((row) =>
-        row.id === item.id
-          ? { ...row, etat: "Livr\u00e9", emplacement: DELIVERED_EMPLACEMENT }
-          : row
-      )
+      role === "reception"
+        ? current.filter((row) => row.id !== item.id)
+        : current.map((row) =>
+            row.id === item.id
+              ? {
+                  ...row,
+                  etat: "Livré",
+                  emplacement: DELIVERED_EMPLACEMENT,
+                  dateLivraisonClient: new Date().toLocaleString("fr-FR"),
+                }
+              : row
+          )
     );
 
     try {
       if (isDatabaseWriteConfigured()) {
-        // livrerVehicule : action r\u00e9ception autoris\u00e9e (\u00e9vite le 400 de updateEtat)
         await livrerVehiculeReception(item, mode);
         setNotice(
-          `Dossier ${item.noOr} livr\u00e9 \u2014 Mode de paiement\u00a0: ${mode}. Emplacement\u00a0: ${DELIVERED_EMPLACEMENT}.`
+          `Dossier ${item.noOr} livré — Mode de paiement : ${mode}. Emplacement : ${DELIVERED_EMPLACEMENT}.`
         );
       } else {
         setNotice(
-          `Dossier ${item.noOr} livr\u00e9 en local (mode\u00a0: ${mode}). (Configurez DATABASE_URL pour enregistrer dans PostgreSQL).`
+          `Dossier ${item.noOr} livré en local (mode : ${mode}). (Configurez DATABASE_URL pour enregistrer dans PostgreSQL).`
         );
       }
+      recordVehicleModification(
+        item,
+        "Véhicule livré",
+        `Mode de paiement : ${mode} • Emplacement : ${DELIVERED_EMPLACEMENT}`,
+      );
     } catch (err) {
       // Revert on error
-      setItems((current) =>
-        current.map((row) =>
-          row.id === item.id
-            ? { ...row, etat: item.etat, emplacement: item.emplacement }
+      setItems((current) => {
+        if (role === "reception") {
+          const exists = current.some((r) => r.id === previousRow.id);
+          return exists ? current : [previousRow, ...current];
+        }
+        return current.map((row) =>
+          row.id === previousRow.id
+            ? { ...row, etat: previousRow.etat, emplacement: previousRow.emplacement }
             : row
-        )
-      );
+        );
+      });
       setNotice(
         err instanceof Error
-          ? `Erreur livraison\u00a0: ${err.message}`
+          ? `Erreur livraison : ${err.message}`
           : "Impossible d'enregistrer la livraison dans PostgreSQL."
+      );
+    } finally {
+      setSavingRowId(null);
+    }
+  };
+
+  // Livraison directe pour la Réception une fois le dossier validé par la Facturation (« À livrer »)
+  const handleConfirmLivraisonDirect = async (item: UnifiedReceptionRow) => {
+    const mode = item.modePaiement || "Facture";
+    const previousRow = item;
+    setSavingRowId(item.id);
+    setNotice(null);
+
+    // Optimistic UI update : le véhicule livré disparaît immédiatement pour la Réception
+    setItems((current) =>
+      role === "reception"
+        ? current.filter((row) => row.id !== item.id)
+        : current.map((row) =>
+            row.id === item.id
+              ? {
+                  ...row,
+                  etat: "Livré",
+                  emplacement: DELIVERED_EMPLACEMENT,
+                  dateLivraisonClient: new Date().toLocaleString("fr-FR"),
+                }
+              : row
+          )
+    );
+
+    try {
+      if (isDatabaseWriteConfigured()) {
+        await livrerVehiculeReception(item, mode);
+        setNotice(
+          `Dossier ${item.noOr} livré au client. Véhicule sorti d'atelier (Mode : ${mode}).`
+        );
+      } else {
+        setNotice(
+          `Dossier ${item.noOr} livré au client (mode : ${mode}).`
+        );
+      }
+      recordVehicleModification(
+        item,
+        "Véhicule livré",
+        `Le client a récupéré son véhicule • Mode de paiement : ${mode} • Emplacement : ${DELIVERED_EMPLACEMENT}`,
+      );
+    } catch (err) {
+      // Revert on error
+      setItems((current) => {
+        if (role === "reception") {
+          const exists = current.some((r) => r.id === previousRow.id);
+          return exists ? current : [previousRow, ...current];
+        }
+        return current.map((row) =>
+          row.id === previousRow.id
+            ? { ...row, etat: previousRow.etat, emplacement: previousRow.emplacement }
+            : row
+        );
+      });
+      setNotice(
+        err instanceof Error
+          ? `Erreur livraison : ${err.message}`
+          : "Impossible d'enregistrer la livraison du véhicule."
       );
     } finally {
       setSavingRowId(null);
@@ -307,9 +498,16 @@ export default function SuiviEntreesTable({ onNavigateToMap }: SuiviEntreesTable
       const fluxByOr = new Map<string, Flux>();
       const fluxByChassis = new Map<string, Flux>();
 
+      const interventionKey = (row: Record<string, unknown>) => {
+        const intervention = String(row.interventionId || row.recordKey || "").trim();
+        return intervention ? `intervention:${intervention}` : "";
+      };
+
       chargementData.forEach((row) => {
         const orKey = normalizeKey(row.ordre || row.no);
         const chKey = normalizeKey(row.chassis);
+        const key = interventionKey(row as unknown as Record<string, unknown>);
+        if (key) fluxByOr.set(key, row);
         if (orKey) fluxByOr.set(orKey, row);
         if (chKey) fluxByChassis.set(chKey, row);
       });
@@ -319,13 +517,16 @@ export default function SuiviEntreesTable({ onNavigateToMap }: SuiviEntreesTable
       const merged: UnifiedReceptionRow[] = suiviData.map((s, idx) => {
         const orKey = normalizeKey(s.noOr);
         const chKey = normalizeKey(s.chassis);
-        const f = fluxByOr.get(orKey) || fluxByChassis.get(chKey);
+        const ownInterventionKey = interventionKey(s as unknown as Record<string, unknown>);
+        // Un même véhicule peut revenir avec un nouvel OR. L'OR identifie le
+        // dossier de travail ; le châssis ne sert de secours que sans OR.
+        const f = (ownInterventionKey ? fluxByOr.get(ownInterventionKey) : undefined) || fluxByOr.get(orKey) || (!orKey ? fluxByChassis.get(chKey) : undefined);
 
         if (orKey) matchedOrs.add(orKey);
-        if (chKey) matchedOrs.add(chKey);
+        else if (chKey) matchedOrs.add(chKey);
 
         const equipe =
-          f?.equipe && f.equipe !== "-" ? f.equipe : s.equipe || "-";
+          s.equipe && s.equipe !== "-" ? s.equipe : f?.equipe && f.equipe !== "-" ? f.equipe : "-";
         const matricule =
           f?.technicien && f.technicien !== "-"
             ? f.technicien
@@ -342,14 +543,28 @@ export default function SuiviEntreesTable({ onNavigateToMap }: SuiviEntreesTable
           f?.dateFinRep && f.dateFinRep !== "-"
             ? f.dateFinRep
             : s.dateFinRep || "-";
-        const emplacement = f?.emplacement || "NA";
-        const etat =
-          f?.etatIntervention || f?.statut || s.etat || "En attente";
+        const isLivre =
+          String(s.etat || "").toLowerCase().includes("livr") ||
+          String(f?.etatIntervention || "").toLowerCase().includes("livr") ||
+          String(f?.statut || "").toLowerCase().includes("livr") ||
+          Boolean((s as any).dateLivraisonClient || (f as any)?.dateLivraisonClient);
+
+        const emplacement = isLivre
+          ? DELIVERED_EMPLACEMENT
+          : (f?.emplacement && f.emplacement !== "NA" && f.emplacement !== "-"
+              ? f.emplacement
+              : (s as any).emplacement || "NA");
+
+        const etat = isLivre
+          ? "Livré"
+          : (f?.etatIntervention || f?.statut || s.etat || "En attente");
+
         const immatriculation =
           s.immatriculation || f?.immatriculation || f?.serie || "-";
 
         return {
-          id: `suivi-${s.id || idx}`,
+          id: String((s as any).recordKey || s.id || `suivi-${idx}`),
+          recordKey: String((s as any).recordKey || (f as any)?.recordKey || ""),
           sheetRowNumber: f?.sheetRowNumber || s.sheetRowNumber || idx + 2,
           chargementRowNumber: f?.sheetRowNumber,
           suiviRowNumber: s.sheetRowNumber || idx + 2,
@@ -378,18 +593,40 @@ export default function SuiviEntreesTable({ onNavigateToMap }: SuiviEntreesTable
           dateDebutRep: f?.dateDebutRep || (s as any).dateDebutRep || f?.dateDebutTravail || (s as any).dateDebutTravail,
           dateDebutTravail: f?.dateDebutTravail || (s as any).dateDebutTravail || f?.dateDebutRep,
           heureDebutTravail: f?.heureDebutTravail || (s as any).heureDebutTravail,
+          modePaiement: f?.modePaiement || (s as any).modePaiement,
+          statutFacturation: f?.statutFacturation || (s as any).statutFacturation,
+          statutFacturationFinale: f?.statutFacturationFinale || (s as any).statutFacturationFinale,
+          facturationValideePar: f?.facturationValideePar || (s as any).facturationValideePar,
+          dateValidationFacturation: f?.dateValidationFacturation || (s as any).dateValidationFacturation,
+          dateLivraisonClient: (s as any).dateLivraisonClient || (f as any)?.dateLivraisonClient,
+          livrePar: (s as any).livrePar || (f as any)?.livrePar,
+          interventionId: (s as any).interventionId || (f as any)?.interventionId,
+          interventionNumero: (s as any).interventionNumero || (f as any)?.interventionNumero,
+          retourVehicule: Boolean((s as any).retourVehicule || (f as any)?.retourVehicule),
+          statutRetour: (s as any).statutRetour || (f as any)?.statutRetour,
+          descriptionRetour: (s as any).descriptionRetour || (f as any)?.descriptionRetour,
+          dateRetour: (s as any).dateRetour || (f as any)?.dateRetour,
         };
       });
 
       chargementData.forEach((f, idx) => {
         const orKey = normalizeKey(f.ordre || f.no);
         const chKey = normalizeKey(f.chassis);
-        if ((orKey && matchedOrs.has(orKey)) || (chKey && matchedOrs.has(chKey))) {
+        if ((orKey && matchedOrs.has(orKey)) || (!orKey && chKey && matchedOrs.has(chKey))) {
           return;
         }
 
+        const isLivre =
+          String(f.etatIntervention || "").toLowerCase().includes("livr") ||
+          String(f.statut || "").toLowerCase().includes("livr") ||
+          Boolean((f as any).dateLivraisonClient);
+
+        const etat = isLivre ? "Livré" : (f.etatIntervention || f.statut || "En cours");
+        const emplacement = isLivre ? DELIVERED_EMPLACEMENT : (f.emplacement || "NA");
+
         merged.push({
-          id: `charge-${f.id || idx}`,
+          id: String((f as any).recordKey || f.id || `charge-${idx}`),
+          recordKey: String((f as any).recordKey || ""),
           sheetRowNumber: f.sheetRowNumber || 1000 + idx,
           chargementRowNumber: f.sheetRowNumber,
           suiviRowNumber: undefined,
@@ -399,13 +636,13 @@ export default function SuiviEntreesTable({ onNavigateToMap }: SuiviEntreesTable
           chassis: f.chassis || "-",
           immatriculation: f.immatriculation || f.serie || "-",
           nomClient: f.client || "Client non spécifié",
-          etat: f.etatIntervention || f.statut || "En cours",
+          etat,
           equipe: f.equipe || "-",
           matricule: f.technicien || "-",
           nomTechnicien: f.nomTechnicien,
           avancement: f.avancement || "-",
           dateFinRep: f.dateFinRep || "-",
-          emplacement: f.emplacement || "NA",
+          emplacement,
           dateEntreeHeure: f.dateEntree,
           marque: f.marque || "IVECO",
           modele: f.modele || "-",
@@ -417,6 +654,19 @@ export default function SuiviEntreesTable({ onNavigateToMap }: SuiviEntreesTable
           dateDebutRep: f.dateDebutRep || f.dateDebutTravail,
           dateDebutTravail: f.dateDebutTravail || f.dateDebutRep,
           heureDebutTravail: f.heureDebutTravail,
+          modePaiement: f.modePaiement,
+          statutFacturation: f.statutFacturation,
+          statutFacturationFinale: f.statutFacturationFinale,
+          facturationValideePar: f.facturationValideePar,
+          dateValidationFacturation: f.dateValidationFacturation,
+          dateLivraisonClient: (f as any).dateLivraisonClient,
+          livrePar: (f as any).livrePar,
+          interventionId: (f as any).interventionId,
+          interventionNumero: (f as any).interventionNumero,
+          retourVehicule: Boolean((f as any).retourVehicule),
+          statutRetour: (f as any).statutRetour,
+          descriptionRetour: (f as any).descriptionRetour,
+          dateRetour: (f as any).dateRetour,
         });
       });
 
@@ -509,6 +759,11 @@ export default function SuiviEntreesTable({ onNavigateToMap }: SuiviEntreesTable
           `Dossier ${item.noOr} mis à jour en local : État "${nextEtat}". (Pour enregistrer dans PostgreSQL, configurez DATABASE_URL).`
         );
       }
+      recordVehicleModification(
+        item,
+        "État modifié à la réception",
+        `${previousEtat || "-"} → ${nextEtat}${nextEmplacement !== previousEmplacement ? ` • Emplacement : ${previousEmplacement || "-"} → ${nextEmplacement}` : ""}`,
+      );
     } catch (err) {
       // Revert on error
       setItems((current) =>
@@ -577,6 +832,11 @@ export default function SuiviEntreesTable({ onNavigateToMap }: SuiviEntreesTable
           `Emplacement ${item.noOr} mis à jour en local : ${nextEmplacement}. (Configurez DATABASE_URL pour PostgreSQL).`
         );
       }
+      recordVehicleModification(
+        item,
+        "Emplacement modifié à la réception",
+        `${previousEmplacement || "-"} → ${nextEmplacement}`,
+      );
     } catch (err) {
       // Revert on error
       setItems((current) =>
@@ -638,23 +898,30 @@ export default function SuiviEntreesTable({ onNavigateToMap }: SuiviEntreesTable
   }, [items]);
 
   const etats = useMemo(() => {
+    const source = role === "reception"
+      ? items.filter((item) => !isVehiculeLivre(item) && (!assignedReceptionCs || item.cs.trim().toUpperCase() === assignedReceptionCs))
+      : items;
     const list = Array.from(
       new Set(
-        items
+        source
           .map((e) => e.etat.trim())
           .filter((et) => et && et !== "-" && et.toLowerCase() !== "na")
       )
     ).sort();
     return ["Tous", ...list];
-  }, [items]);
+  }, [items, role, assignedReceptionCs]);
 
   const stats = useMemo(() => {
-    const total = items.length;
+    // L'historique des véhicules livrés est réservé à l'Administration.
+    const visibleItems = role === "administration"
+      ? items
+      : items.filter((item) => !isVehiculeLivre(item) && (role !== "reception" || !assignedReceptionCs || item.cs.trim().toUpperCase() === assignedReceptionCs));
+    const total = visibleItems.length;
     let enCours = 0;
     let attente = 0;
     let livre = 0;
 
-    items.forEach((item) => {
+    visibleItems.forEach((item) => {
       const e = item.etat.toLowerCase();
       if (e.includes("livr") || e.includes("termin")) {
         livre++;
@@ -666,11 +933,18 @@ export default function SuiviEntreesTable({ onNavigateToMap }: SuiviEntreesTable
     });
 
     return { total, enCours, attente, livre };
-  }, [items]);
+  }, [items, role, assignedReceptionCs]);
 
   const filteredData = useMemo(() => {
     const q = search.trim().toLowerCase();
     const filtered = items.filter((item) => {
+      // Seule l'Administration peut consulter les véhicules livrés.
+      if (role !== "administration" && isVehiculeLivre(item)) {
+        return false;
+      }
+      if (role === "reception" && assignedReceptionCs && item.cs.trim().toUpperCase() !== assignedReceptionCs) {
+        return false;
+      }
       const matchesEquipe =
         selectedEquipe === "Toutes" || item.equipe.trim() === selectedEquipe;
       const matchesEtat =
@@ -780,8 +1054,10 @@ export default function SuiviEntreesTable({ onNavigateToMap }: SuiviEntreesTable
     search,
     selectedEquipe,
     selectedEtat,
+    assignedReceptionCs,
     sortField,
     sortDirection,
+    role,
   ]);
 
   const getEtatBadge = (etat: string) => {
@@ -790,7 +1066,7 @@ export default function SuiviEntreesTable({ onNavigateToMap }: SuiviEntreesTable
       return "bg-emerald-50 text-emerald-700 border-emerald-200";
     }
     if (e.includes("attente client")) {
-      return "bg-amber-50 text-amber-800 border-amber-200";
+      return "bg-amber-50 text-amber-900 border-amber-300";
     }
     if (e.includes("attente rep") || e.includes("pdr")) {
       return "bg-rose-50 text-rose-700 border-rose-200";
@@ -960,15 +1236,28 @@ export default function SuiviEntreesTable({ onNavigateToMap }: SuiviEntreesTable
 
             {canManageEntries && permissions.canAddEntree ? (
               <div className="flex items-center gap-2">
-                <button
-                  type="button"
-                  onClick={() => setIsVinModalOpen(true)}
-                  className="inline-flex items-center gap-2 px-3.5 py-2 text-xs font-bold text-slate-700 bg-white hover:bg-slate-50 border border-slate-300 hover:border-slate-400 rounded-xl shadow-xs transition-all transform hover:-translate-y-0.5 active:translate-y-0 cursor-pointer"
-                  title="Enregistrer un nouveau N° de Châssis dans la base VIN (Réception)"
-                >
-                  <Car className="w-4 h-4 text-blue-600" />
-                  + Ajouter VIN
-                </button>
+                {canManageActions && (
+                  <>
+                    <button
+                      type="button"
+                      onClick={() => setIsVinModalOpen(true)}
+                      className="inline-flex items-center gap-2 px-3.5 py-2 text-xs font-bold text-slate-700 bg-white hover:bg-slate-50 border border-slate-300 hover:border-slate-400 rounded-xl shadow-xs transition-all transform hover:-translate-y-0.5 active:translate-y-0 cursor-pointer"
+                      title="Enregistrer un nouveau N° de Châssis dans la base VIN (Direction)"
+                    >
+                      <Car className="w-4 h-4 text-blue-600" />
+                      + Ajouter VIN
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setIsHistoricalModalOpen(true)}
+                      className="inline-flex items-center gap-2 px-3.5 py-2 text-xs font-bold text-amber-900 bg-amber-50 hover:bg-amber-100 border border-amber-300 rounded-xl shadow-xs transition-all cursor-pointer"
+                      title="Ajouter un véhicule ancien avec une date manuelle"
+                    >
+                      <Calendar className="w-4 h-4 text-amber-700" />
+                      + Véhicule historique
+                    </button>
+                  </>
+                )}
 
                 <button
                   type="button"
@@ -1009,7 +1298,7 @@ export default function SuiviEntreesTable({ onNavigateToMap }: SuiviEntreesTable
         )}
 
         {/* Quick KPI Strip */}
-        <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 mt-4 pt-4 border-t border-slate-100">
+        <div className={`grid grid-cols-2 ${role === "reception" ? "sm:grid-cols-3" : "sm:grid-cols-4"} gap-3 mt-4 pt-4 border-t border-slate-100`}>
           <div className="bg-slate-50/80 rounded-xl p-2.5 border border-slate-200/60 flex items-center gap-2.5">
             <div className="w-8 h-8 rounded-lg bg-slate-200 text-slate-700 flex items-center justify-center shrink-0">
               <Car className="w-4 h-4" />
@@ -1052,19 +1341,21 @@ export default function SuiviEntreesTable({ onNavigateToMap }: SuiviEntreesTable
             </div>
           </div>
 
-          <div className="bg-emerald-50/70 rounded-xl p-2.5 border border-emerald-200/60 flex items-center gap-2.5">
-            <div className="w-8 h-8 rounded-lg bg-emerald-100 text-emerald-700 flex items-center justify-center shrink-0">
-              <CheckCircle2 className="w-4 h-4" />
-            </div>
-            <div>
-              <div className="text-sm font-bold text-emerald-900">
-                {stats.livre}
+          {role !== "reception" && (
+            <div className="bg-emerald-50/70 rounded-xl p-2.5 border border-emerald-200/60 flex items-center gap-2.5">
+              <div className="w-8 h-8 rounded-lg bg-emerald-100 text-emerald-700 flex items-center justify-center shrink-0">
+                <CheckCircle2 className="w-4 h-4" />
               </div>
-              <div className="text-[10px] font-semibold text-emerald-700 uppercase tracking-wider">
-                Livrés / Prêts
+              <div>
+                <div className="text-sm font-bold text-emerald-900">
+                  {stats.livre}
+                </div>
+                <div className="text-[10px] font-semibold text-emerald-700 uppercase tracking-wider">
+                  Livrés / Prêts
+                </div>
               </div>
             </div>
-          </div>
+          )}
         </div>
 
         {/* Search & Quick Filters Bar */}
@@ -1322,8 +1613,8 @@ export default function SuiviEntreesTable({ onNavigateToMap }: SuiviEntreesTable
                   </div>
                 </th>
 
-                {/* 12. Actions (Modifier / Supprimer) */}
-                {canManageEntries && (
+                {/* 12. Actions (Modifier / Supprimer) - Réservé Direction */}
+                {canManageActions && (
                   <th className="py-3 px-3.5 whitespace-nowrap text-center sticky right-0 bg-slate-100/95 backdrop-blur-md shadow-[-4px_0_6px_-2px_rgba(0,0,0,0.05)] z-10">
                     Actions
                   </th>
@@ -1333,7 +1624,7 @@ export default function SuiviEntreesTable({ onNavigateToMap }: SuiviEntreesTable
             <tbody className="divide-y divide-slate-100">
               {loading && items.length === 0 ? (
                 <tr>
-                  <td colSpan={canManageEntries ? 13 : 12} className="py-16 text-center text-slate-400">
+                  <td colSpan={canManageActions ? 13 : 12} className="py-16 text-center text-slate-400">
                     <div className="flex flex-col items-center justify-center gap-2.5">
                       <RefreshCcw className="w-7 h-7 animate-spin text-emerald-600" />
                       <p className="font-semibold text-slate-700 text-sm">
@@ -1347,7 +1638,7 @@ export default function SuiviEntreesTable({ onNavigateToMap }: SuiviEntreesTable
                 </tr>
               ) : filteredData.length === 0 ? (
                 <tr>
-                  <td colSpan={canManageEntries ? 13 : 12} className="py-16 text-center text-slate-400">
+                  <td colSpan={canManageActions ? 13 : 12} className="py-16 text-center text-slate-400">
                     <div className="flex flex-col items-center justify-center gap-2">
                       <Car className="w-9 h-9 text-slate-300" />
                       <p className="font-bold text-slate-700 text-sm">
@@ -1387,18 +1678,27 @@ export default function SuiviEntreesTable({ onNavigateToMap }: SuiviEntreesTable
                       itemTs > 0 &&
                       nowTs - itemTs < 24 * 60 * 60 * 1000 &&
                       nowTs >= itemTs - 60000;
-                    const canEdit = canManageEntries && isAvancementTermine(item.avancement);
+                    const isTermine =
+                      isAvancementTermine(item.avancement) ||
+                      item.etat === "Attente Client" ||
+                      item.etat === "Prêt / Fini" ||
+                      Boolean(item.modePaiement || item.dateValidationFacturation);
                     const isSaving = savingRowId === item.id;
-                    const isDelivered =
-                      item.etat.toLowerCase().includes("livr") ||
-                      item.etat.toLowerCase().includes("termin");
+                    const isDelivered = isVehiculeLivre(item);
+                    const isReturnAwaitingReception = item.statutRetour === "a_receptionner" ||
+                      String(item.etat || "").toLowerCase().includes("à réceptionner");
+                    // Att Facture autorise la livraison : le règlement final
+                    // intervient ensuite, à la fin du mois.
+                    const hasFacturation = ["Facture", "Bon de commande", "Att Facture", "Attente Facture", "Édition fin de travaux"].includes(item.modePaiement || "");
+                    const canEditEmplacement =
+                      (permissions.canEditEmplacement || permissions.canViewAll) && isTermine;
 
                   return (
                     <tr
                       key={item.id}
-                      onClick={canManageEntries ? () => setDetailRow(item) : undefined}
-                      className={`hover:bg-blue-50/40 transition-colors group ${canManageEntries ? "cursor-pointer" : ""}`}
-                      title={canManageEntries ? "Cliquer pour voir la fiche détaillée et la condition du véhicule" : undefined}
+                      onClick={canViewDetails ? () => setDetailRow(item) : undefined}
+                      className={`hover:bg-blue-50/40 transition-colors group ${canViewDetails ? "cursor-pointer" : ""}`}
+                      title={canViewDetails ? "Cliquer pour voir la fiche détaillée et la condition du véhicule" : undefined}
                     >
                       {/* 1. N° OR */}
                       <td className="py-3 px-3.5 font-bold text-slate-900 whitespace-nowrap">
@@ -1491,48 +1791,96 @@ export default function SuiviEntreesTable({ onNavigateToMap }: SuiviEntreesTable
                             <Loader2 className="w-3 h-3 animate-spin text-emerald-600" />
                             <span>Mise à jour...</span>
                           </div>
-                        ) : canEdit ? (
-                          <div className="flex items-center gap-2">
-                            {/* Sélecteur d'état rapide ou bouton passer à Livré */}
-                            {isDelivered ? (
-                              <div className="flex items-center gap-1.5">
-                                <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-[10px] font-extrabold bg-emerald-100 text-emerald-800 border border-emerald-300 shadow-2xs">
-                                  <Check className="w-3 h-3 text-emerald-600" />
-                                  Livré
-                                </span>
-                                <select
-                                  value="Livré"
-                                  onChange={(e) =>
-                                    handleUpdateEtat(item, e.target.value)
-                                  }
-                                  className="text-[10px] bg-slate-50 border border-slate-200 text-slate-600 rounded px-1.5 py-0.5 cursor-pointer hover:bg-slate-100"
-                                  title="Changer l'état"
+                        ) : isReturnAwaitingReception ? (
+                          <div className="flex flex-col items-start gap-1.5">
+                            <span className="inline-flex items-center gap-1 px-2.5 py-1 rounded-full text-[10px] font-extrabold bg-violet-100 text-violet-800 border border-violet-300">
+                              <RotateCcw className="w-3 h-3" /> Retour véhicule – À réceptionner
+                            </span>
+                            {role === "reception" && (
+                              <button
+                                type="button"
+                                onClick={() => openReturnReceptionModal(item)}
+                                className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg bg-violet-600 text-white hover:bg-violet-700 text-[10px] font-bold transition-colors"
+                              >
+                                <Send className="w-3 h-3" /> Traiter le retour
+                              </button>
+                            )}
+                          </div>
+                        ) : isDelivered ? (
+                          <div className="flex items-center gap-1.5">
+                            <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-[10px] font-extrabold bg-emerald-100 text-emerald-800 border border-emerald-300 shadow-2xs">
+                              <Check className="w-3 h-3 text-emerald-600" />
+                              Livré
+                            </span>
+                            {canManageActions && (
+                              <select
+                                value="Livré"
+                                onChange={(e) =>
+                                  handleUpdateEtat(item, e.target.value)
+                                }
+                                className="text-[10px] bg-slate-50 border border-slate-200 text-slate-600 rounded px-1.5 py-0.5 cursor-pointer hover:bg-slate-100"
+                                title="Changer l'état (Direction)"
+                              >
+                                <option value="Livré">Livré</option>
+                                <option value="Attente Client">Attente Client</option>
+                                <option value="En cours">En cours</option>
+                              </select>
+                            )}
+                          </div>
+                        ) : isTermine ? (
+                          <div className="flex flex-col gap-1 items-start">
+                            {/* Ligne 1 : Badge Attente Client + Bouton Livrer vert (conforme à l'image) */}
+                            <div className="flex items-center gap-1.5 flex-wrap">
+                              <span
+                                className={`inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-bold border ${getEtatBadge(
+                                  item.etat || "Attente Client"
+                                )}`}
+                              >
+                                {item.etat || "Attente Client"}
+                              </span>
+                              {hasFacturation ? (
+                                <button
+                                  type="button"
+                                  onClick={() => handleConfirmLivraisonDirect(item)}
+                                  className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-semibold text-slate-900 bg-emerald-600 hover:bg-emerald-700 hover:text-white active:scale-95 shadow-2xs transition-all cursor-pointer"
+                                  title={`Facturation validée (${item.modePaiement || "Facture"}). Cliquer pour confirmer et mettre Livré au client.`}
                                 >
-                                  <option value="Livré">Livré</option>
-                                  <option value="Attente Client">Attente Client</option>
-                                  <option value="En cours">En cours</option>
-                                </select>
-                              </div>
-                            ) : (
-                              <div className="flex items-center gap-1.5">
+                                  <CheckCircle2 className="w-3.5 h-3.5 text-slate-900" />
+                                  <span>Livrer</span>
+                                </button>
+                              ) : role === "reception" ? (
                                 <span
-                                  className={`inline-flex items-center px-2 py-0.5 rounded-full text-[10px] font-bold border ${getEtatBadge(
-                                    item.etat
-                                  )}`}
+                                  className="inline-flex items-center gap-1 px-2.5 py-0.5 text-xs font-bold text-amber-800 bg-amber-50 border border-amber-300 rounded-full shadow-2xs"
+                                  title="Travaux terminés en atelier. En attente de validation du mode de paiement par la Facturation."
                                 >
-                                  {item.etat || "Attente client"}
+                                  <Clock className="w-3.5 h-3.5 text-amber-600" />
+                                  <span>Attente Facturation</span>
                                 </span>
+                              ) : (
                                 <button
                                   type="button"
                                   onClick={() =>
-                                    setPaiementModal({ item, mode: "" })
+                                    setPaiementModal({ item, mode: item.modePaiement || "Facture" })
                                   }
-                                  className="inline-flex items-center gap-1 px-2.5 py-1 text-[10px] font-extrabold text-white bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-700 hover:to-teal-700 active:scale-95 rounded-lg shadow-xs transition-all cursor-pointer"
-                                  title="Choisir le mode de paiement et passer à Livré"
+                                  className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-semibold text-slate-900 bg-emerald-600 hover:bg-emerald-700 hover:text-white active:scale-95 shadow-2xs transition-all cursor-pointer"
+                                  title="Choisir le mode de paiement et passer à Livré (Direction)"
                                 >
-                                  <CheckCircle2 className="w-3 h-3" />
+                                  <CheckCircle2 className="w-3.5 h-3.5 text-slate-900" />
                                   <span>Livrer</span>
                                 </button>
+                              )}
+                            </div>
+
+                            {/* Ligne 2 : Boîte bleue Début : date/heure (affichée pour tous, Réception comprise, conforme à l'image) */}
+                            {(item.dateDebutRep || item.dateDebutTravail || item.dateEntreeHeure) && (
+                              <div
+                                className="text-[11px] font-medium text-blue-700 bg-blue-50/90 px-2 py-0.5 rounded-md border border-blue-200 flex items-center gap-1.5 w-fit mt-0.5"
+                                title={`Début des travaux : ${item.dateDebutRep || item.dateDebutTravail || item.dateEntreeHeure}`}
+                              >
+                                <Clock size={12} className="text-blue-600 shrink-0" />
+                                <span>
+                                  Début : {item.dateDebutRep || item.dateDebutTravail || formatDisplayDate(item.dateEntreeHeure)}
+                                </span>
                               </div>
                             )}
                           </div>
@@ -1551,21 +1899,38 @@ export default function SuiviEntreesTable({ onNavigateToMap }: SuiviEntreesTable
                             <Lock className="w-3 h-3 text-slate-300" />
                           </div>
                         )}
-                        {item.dateAcceptation && (
-                          <div className="text-[10px] font-semibold text-emerald-800 bg-emerald-50 px-1.5 py-0.5 rounded border border-emerald-200 mt-1 w-fit" title={`Accepté par ${item.acceptePar || "le chef d'équipe"}`}>
-                            ✓ Accepté : {item.dateAcceptation}
-                          </div>
-                        )}
-                        {(item.dateDebutRep || item.dateDebutTravail) && (
-                          <div className="text-[10px] font-semibold text-blue-800 bg-blue-50 px-1.5 py-0.5 rounded border border-blue-200 mt-1 w-fit flex items-center gap-1" title={`Début des travaux : ${item.dateDebutRep || item.dateDebutTravail}`}>
-                            <Clock size={10} className="text-blue-600 shrink-0" />
-                            <span>Début : {item.dateDebutRep || item.dateDebutTravail}</span>
-                          </div>
-                        )}
-                        {item.dateMiseEnAttente && !item.dateAcceptation && (
-                          <div className="text-[10px] font-semibold text-amber-800 bg-amber-50 px-1.5 py-0.5 rounded border border-amber-200 mt-1 w-fit">
-                            ⏸ Mis en attente : {item.dateMiseEnAttente}
-                          </div>
+
+                        {/* Métadonnées temporelles et caisse additionnelles pour Direction / Facturation */}
+                        {role !== "reception" && (
+                          <>
+                            {item.modePaiement && (
+                              <div className="flex items-center gap-1 text-[10px] font-bold px-2 py-0.5 rounded-md mt-1 w-fit bg-amber-50 text-amber-900 border border-amber-300" title={`Mode de paiement validé par ${item.facturationValideePar || "Facturation"} le ${item.dateValidationFacturation || ""}`}>
+                                <span>💳 Caisse :</span>
+                                <span className="font-extrabold">{item.modePaiement}</span>
+                                {item.statutFacturationFinale === "facture" ? (
+                                  <span className="text-[9px] text-emerald-800 bg-emerald-100 px-1 rounded font-black">Facturé</span>
+                                ) : item.modePaiement === "Édition fin de travaux" || item.modePaiement === "Att Facture" ? (
+                                  <span className="text-[9px] text-amber-900 bg-amber-200 px-1 rounded font-black">À facturer</span>
+                                ) : null}
+                              </div>
+                            )}
+                            {item.dateAcceptation && (
+                              <div className="text-[10px] font-semibold text-emerald-800 bg-emerald-50 px-1.5 py-0.5 rounded border border-emerald-200 mt-1 w-fit" title={`Accepté par ${item.acceptePar || "le chef d'équipe"}`}>
+                                ✓ Accepté : {item.dateAcceptation}
+                              </div>
+                            )}
+                            {!isTermine && (item.dateDebutRep || item.dateDebutTravail) && (
+                              <div className="text-[10px] font-semibold text-blue-800 bg-blue-50 px-1.5 py-0.5 rounded border border-blue-200 mt-1 w-fit flex items-center gap-1" title={`Début des travaux : ${item.dateDebutRep || item.dateDebutTravail}`}>
+                                <Clock size={10} className="text-blue-600 shrink-0" />
+                                <span>Début : {item.dateDebutRep || item.dateDebutTravail}</span>
+                              </div>
+                            )}
+                            {item.dateMiseEnAttente && !item.dateAcceptation && (
+                              <div className="text-[10px] font-semibold text-amber-800 bg-amber-50 px-1.5 py-0.5 rounded border border-amber-200 mt-1 w-fit">
+                                ⏸ Mis en attente : {item.dateMiseEnAttente}
+                              </div>
+                            )}
+                          </>
                         )}
                       </td>
 
@@ -1616,7 +1981,7 @@ export default function SuiviEntreesTable({ onNavigateToMap }: SuiviEntreesTable
                             <div className="flex items-center justify-between gap-2 mb-1">
                               <span
                                 className={`text-[11px] font-bold truncate max-w-[130px] ${
-                                  canEdit ? "text-emerald-700" : "text-slate-800"
+                                  isTermine ? "text-emerald-700" : "text-slate-800"
                                 }`}
                                 title={item.avancement}
                               >
@@ -1680,7 +2045,7 @@ export default function SuiviEntreesTable({ onNavigateToMap }: SuiviEntreesTable
                             <Loader2 className="w-3 h-3 animate-spin text-emerald-600" />
                             <span>Sauvegarde...</span>
                           </div>
-                        ) : canEdit ? (
+                        ) : canEditEmplacement ? (
                           <div className="relative inline-flex items-center gap-1">
                             <select
                               value={item.emplacement}
@@ -1801,38 +2166,50 @@ export default function SuiviEntreesTable({ onNavigateToMap }: SuiviEntreesTable
                         )}
                       </td>
 
-                      {/* 12. Actions : Détails, Modifier & Supprimer */}
-                      {canManageEntries && <td
-                        onClick={(e) => e.stopPropagation()}
-                        className="py-3 px-3.5 whitespace-nowrap text-center sticky right-0 bg-white group-hover:bg-slate-50/90 transition-colors shadow-[-4px_0_6px_-2px_rgba(0,0,0,0.05)]"
-                      >
-                        <div className="flex items-center justify-center gap-1.5">
-                          <button
-                            type="button"
-                            onClick={() => setDetailRow(item)}
-                            className="p-1.5 rounded-lg text-emerald-600 hover:text-emerald-800 hover:bg-emerald-50 border border-emerald-200/70 transition-all cursor-pointer shadow-2xs group/btn"
-                            title={`Voir la fiche détaillée et la condition du véhicule (OR ${item.noOr})`}
-                          >
-                            <Eye className="w-3.5 h-3.5 group-hover/btn:scale-110 transition-transform" />
-                          </button>
-                          <button
-                            type="button"
-                            onClick={() => setEditingRow(item)}
-                            className="p-1.5 rounded-lg text-blue-600 hover:text-blue-800 hover:bg-blue-50 border border-blue-200/70 transition-all cursor-pointer shadow-2xs group/btn"
-                            title={`Modifier le dossier ${item.noOr}`}
-                          >
-                            <Pencil className="w-3.5 h-3.5 group-hover/btn:scale-110 transition-transform" />
-                          </button>
-                          <button
-                            type="button"
-                            onClick={() => setDeletingRow(item)}
-                            className="p-1.5 rounded-lg text-red-600 hover:text-red-800 hover:bg-red-50 border border-red-200/70 transition-all cursor-pointer shadow-2xs group/btn"
-                            title={`Supprimer le dossier ${item.noOr}`}
-                          >
-                            <Trash2 className="w-3.5 h-3.5 group-hover/btn:scale-110 transition-transform" />
-                          </button>
-                        </div>
-                      </td>}
+                      {/* 12. Actions : Détails, Modifier & Supprimer (Réservé Direction) */}
+                      {canManageActions && (
+                        <td
+                          onClick={(e) => e.stopPropagation()}
+                          className="py-3 px-3.5 whitespace-nowrap text-center sticky right-0 bg-white group-hover:bg-slate-50/90 transition-colors shadow-[-4px_0_6px_-2px_rgba(0,0,0,0.05)]"
+                        >
+                          <div className="flex items-center justify-center gap-1.5">
+                            <button
+                              type="button"
+                              onClick={() => setDetailRow(item)}
+                              className="p-1.5 rounded-lg text-emerald-600 hover:text-emerald-800 hover:bg-emerald-50 border border-emerald-200/70 transition-all cursor-pointer shadow-2xs group/btn"
+                              title={`Voir la fiche détaillée et la condition du véhicule (OR ${item.noOr})`}
+                            >
+                              <Eye className="w-3.5 h-3.5 group-hover/btn:scale-110 transition-transform" />
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => setEditingRow(item)}
+                              className="p-1.5 rounded-lg text-blue-600 hover:text-blue-800 hover:bg-blue-50 border border-blue-200/70 transition-all cursor-pointer shadow-2xs group/btn"
+                              title={`Modifier le dossier ${item.noOr}`}
+                            >
+                              <Pencil className="w-3.5 h-3.5 group-hover/btn:scale-110 transition-transform" />
+                            </button>
+                            {role === "administration" && isDelivered && (
+                              <button
+                                type="button"
+                                onClick={() => void handleReopenOr(item)}
+                                className="inline-flex items-center gap-1 p-1.5 rounded-lg text-violet-700 hover:text-violet-900 hover:bg-violet-50 border border-violet-200 transition-all cursor-pointer shadow-2xs group/btn"
+                                title={`Réouvrir l'OR ${item.noOr} et créer une nouvelle intervention à la Réception`}
+                              >
+                                <RotateCcw className="w-3.5 h-3.5 group-hover/btn:rotate-[-30deg] transition-transform" />
+                              </button>
+                            )}
+                            <button
+                              type="button"
+                              onClick={() => setDeletingRow(item)}
+                              className="p-1.5 rounded-lg text-red-600 hover:text-red-800 hover:bg-red-50 border border-red-200/70 transition-all cursor-pointer shadow-2xs group/btn"
+                              title={`Supprimer le dossier ${item.noOr}`}
+                            >
+                              <Trash2 className="w-3.5 h-3.5 group-hover/btn:scale-110 transition-transform" />
+                            </button>
+                          </div>
+                        </td>
+                      )}
                     </tr>
                   );
                 });
@@ -1903,6 +2280,16 @@ export default function SuiviEntreesTable({ onNavigateToMap }: SuiviEntreesTable
           setTimeout(() => loadData(true), 1200);
         }}
       />
+      <NouvelleEntreeModal
+        isOpen={isHistoricalModalOpen}
+        historique
+        onClose={() => setIsHistoricalModalOpen(false)}
+        onSuccess={() => {
+          setIsHistoricalModalOpen(false);
+          void loadData(false);
+          setNotice("Véhicule historique enregistré.");
+        }}
+      />
 
       {/* Modal d'enregistrement d'un nouveau VIN (Réception sécurisée sans consultation) */}
       <NouveauVinModal
@@ -1937,15 +2324,62 @@ export default function SuiviEntreesTable({ onNavigateToMap }: SuiviEntreesTable
 
       {/* Modal de consultation des détails complets et de la condition du véhicule */}
       <DetailVehiculeModal
-        isOpen={canManageEntries && Boolean(detailRow)}
+        isOpen={canViewDetails && Boolean(detailRow)}
         onClose={() => setDetailRow(null)}
         vehicule={detailRow}
         onEdit={(v) => {
           const target = items.find((i) => i.id === v.id) || detailRow;
           if (target) setEditingRow(target);
         }}
-        canEdit={canManageEntries && (permissions.canAddEntree || permissions.canViewAll)}
+        canEdit={canManageActions}
       />
+
+      {/* Réception : l'Administration a déjà créé la nouvelle intervention.
+          La description est obligatoire avant l'envoi vers l'équipe. */}
+      {returnReceptionModal && (
+        <div className="fixed inset-0 z-[999] flex items-center justify-center p-4 bg-slate-950/50 backdrop-blur-sm">
+          <div className="w-full max-w-lg rounded-2xl bg-white shadow-2xl border border-violet-200 overflow-hidden">
+            <div className="px-5 py-4 bg-violet-700 text-white flex items-start justify-between gap-3">
+              <div>
+                <div className="flex items-center gap-2 font-black"><RotateCcw className="w-5 h-5" /> Retour véhicule à réceptionner</div>
+                <p className="text-xs text-violet-100 mt-1">OR {returnReceptionModal.noOr} • intervention {returnReceptionModal.interventionNumero || 2}</p>
+              </div>
+              <button type="button" onClick={() => setReturnReceptionModal(null)} className="text-violet-100 hover:text-white text-xl leading-none" aria-label="Fermer">×</button>
+            </div>
+            <div className="p-5 space-y-4">
+              <p className="text-sm text-slate-600">Indiquez le motif du retour, puis choisissez l’équipe qui prendra en charge la nouvelle intervention.</p>
+              <label className="block text-xs font-extrabold text-slate-700">
+                Description du retour <span className="text-red-600">*</span>
+                <textarea
+                  value={returnDescription}
+                  onChange={(e) => setReturnDescription(e.target.value)}
+                  rows={3}
+                  placeholder="Ex. Client retourne à l’atelier : bruit moteur après réparation."
+                  className="mt-1.5 w-full rounded-xl border border-slate-300 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-violet-400"
+                />
+              </label>
+              <label className="block text-xs font-extrabold text-slate-700">
+                Équipe concernée <span className="text-red-600">*</span>
+                <select value={returnTeam} onChange={(e) => setReturnTeam(e.target.value)} className="mt-1.5 w-full rounded-xl border border-slate-300 px-3 py-2 text-sm bg-white focus:outline-none focus:ring-2 focus:ring-violet-400">
+                  <option value="">Choisir une équipe</option>
+                  {RETURN_TEAMS.map((team) => <option key={team} value={team}>{team}</option>)}
+                </select>
+              </label>
+              <div className="flex justify-end gap-2 pt-1">
+                <button type="button" onClick={() => setReturnReceptionModal(null)} className="px-3 py-2 rounded-xl text-sm font-bold text-slate-600 hover:bg-slate-100">Annuler</button>
+                <button
+                  type="button"
+                  disabled={returnSaving || !returnDescription.trim() || !returnTeam}
+                  onClick={() => void handleSendReopenedReturn()}
+                  className="inline-flex items-center gap-2 px-4 py-2 rounded-xl bg-violet-700 text-white text-sm font-bold hover:bg-violet-800 disabled:opacity-50"
+                >
+                  {returnSaving ? <Loader2 className="w-4 h-4 animate-spin" /> : <Send className="w-4 h-4" />} Envoyer à l’équipe
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* ═══════════════ MODAL MODE DE PAIEMENT ══════════════════════════════ */}
       {paiementModal && (

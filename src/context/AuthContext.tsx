@@ -1,5 +1,5 @@
 import { createContext, useCallback, useContext, useEffect, useState, type ReactNode } from 'react';
-import type { RoleType } from '../types/roles';
+import type { RolePermissions, RoleType } from '../types/roles';
 import type { AuthorizedAccount } from '../config/accounts';
 import { apiRequest, hydrateSqlLocalCache } from '../services/api';
 
@@ -9,6 +9,7 @@ export interface User {
   email: string;
   role: RoleType;
   assignedTeam?: string;
+  customPermissions?: Partial<RolePermissions>;
 }
 
 interface AccountInput extends Omit<AuthorizedAccount, 'id'> {
@@ -48,6 +49,7 @@ function asUser(value: AuthorizedAccount | User): User {
     email: value.email,
     role: value.role,
     assignedTeam: value.assignedTeam,
+    customPermissions: value.customPermissions,
   };
 }
 
@@ -70,12 +72,18 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
   useEffect(() => {
     let active = true;
-    apiRequest<{ user: User }>('/api/auth/me')
+    apiRequest<{ user: User | null }>('/api/auth/me')
       .then(async ({ user }) => {
         if (!active) return;
+        if (!user) {
+          setCurrentUser(null);
+          localStorage.removeItem(SESSION_STORAGE_KEY);
+          return;
+        }
         setCurrentUser(user);
         localStorage.setItem(SESSION_STORAGE_KEY, JSON.stringify(user));
-        await hydrateSqlLocalCache();
+        localStorage.setItem('flux_atelier_active_role', user.role);
+        await hydrateSqlLocalCache(user.role);
         if (user.role === 'administration' || user.role === 'chef_atelier') {
           await refreshAccounts();
         }
@@ -104,7 +112,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       setCurrentUser(user);
       localStorage.setItem(SESSION_STORAGE_KEY, JSON.stringify(user));
       localStorage.setItem('flux_atelier_active_role', user.role);
-      await hydrateSqlLocalCache();
+      await hydrateSqlLocalCache(user.role);
       if (user.role === 'administration' || user.role === 'chef_atelier') await refreshAccounts();
       return { success: true };
     } catch (error) {

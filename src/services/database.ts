@@ -5,6 +5,7 @@ import {
 } from "../data/mockData";
 
 import { FULL_PARKING_EMPLACEMENT, calculerEmplacementAutomatique } from "./emplacementService";
+import { getWorkshopNow } from "./workshopTime";
 
 export const DELIVERED_EMPLACEMENT = "Livraison au client";
 
@@ -195,6 +196,10 @@ export const DEFAULT_EQUIPE_MAPPINGS: EquipeMember[] = [
   // 7. Elictrique
   { team: "Elictrique", name: "SALIM BOUSHIH", poste: "CHEF EQUIPE", matricule: "1433" },
   { team: "Elictrique", name: "OMAR ZINAOUI", poste: "ELECTRICIEN", matricule: "9999" },
+
+  // Réception : chaque agent est lié à son centre dans Gestion des accès.
+  { team: "Réception", name: "JLASSI BECHIR", poste: "RÉCEPTION", matricule: "R18" },
+  { team: "Réception", name: "SAMER HAFEDHLAOUI", poste: "RÉCEPTION", matricule: "R16" },
 ];
 
 export function normalizePersonName(name: string): string {
@@ -252,7 +257,18 @@ export function getCustomEquipeMembers(): EquipeMember[] | null {
     if (!raw) return DEFAULT_EQUIPE_MAPPINGS;
     const parsed = JSON.parse(raw);
     if (Array.isArray(parsed) && parsed.length > 0) {
-      return parsed;
+      // Garantit que les deux postes Réception restent visibles après une
+      // ancienne sauvegarde locale des équipes.
+      const receptionMembers = DEFAULT_EQUIPE_MAPPINGS.filter(
+        (member) => member.poste === "RÉCEPTION"
+      );
+      const missingReceptionMembers = receptionMembers.filter(
+        (required) => !parsed.some((member) =>
+          normalizePersonName(String(member?.name || "")) === normalizePersonName(required.name) ||
+          String(member?.matricule || "").trim().toUpperCase() === required.matricule
+        )
+      );
+      return [...parsed, ...missingReceptionMembers];
     }
   } catch {
     // Ignored
@@ -637,7 +653,7 @@ export async function updateDatabaseTechnicien(
 }
 
 export const BASE_AVANCEMENT_OPTIONS = [
-  "ATENDE DEVIS",
+  "Lancement devis",
   "En cours - 10%",
   "En cours - 20%",
   "En cours - 30%",
@@ -808,7 +824,7 @@ export interface DemandeDevis {
   technicien?: string;     // Matricule du technicien assigné à la création du devis
   nomTechnicien?: string;  // Nom complet du technicien assigné
   demandeur?: string;
-  statutDevis?: "En attente accord" | "Client appelé" | "Accepté" | "Refusé" | "Annulé";
+  statutDevis?: "Attente validation devis" | "En attente accord" | "Client appelé" | "Accepté" | "Refusé" | "Annulé";
   commentaire?: string;
   dateAppel?: string;      // Date et heure du premier appel au client
   appelant?: string;        // Nom de la réceptionniste ayant appelé
@@ -838,7 +854,7 @@ export function saveDemandeDevisLocal(devis: DemandeDevis): void {
     all[key] = {
       ...devis,
       equipeOrigine: devis.equipeOrigine || devis.equipe || all[key]?.equipeOrigine || all[key]?.equipe,
-      statutDevis: devis.statutDevis || all[key]?.statutDevis || "En attente accord",
+      statutDevis: devis.statutDevis || all[key]?.statutDevis || "Attente validation devis",
       createdAtTimestamp: devis.createdAtTimestamp || all[key]?.createdAtTimestamp || Date.now(),
     };
     localStorage.setItem(STORAGE_KEY_DEMANDES_DEVIS, JSON.stringify(all));
@@ -1180,15 +1196,7 @@ export async function accepterEntreeParChefEquipe(params: {
   dateDebutTravail?: string;
   heureDebutTravail?: string;
 }): Promise<{ ok: boolean; dateDecision: string }> {
-  const now = new Date();
-  const dd = String(now.getDate()).padStart(2, "0");
-  const mm = String(now.getMonth() + 1).padStart(2, "0");
-  const yyyy = now.getFullYear();
-  const hh = String(now.getHours()).padStart(2, "0");
-  const min = String(now.getMinutes()).padStart(2, "0");
-  const ss = String(now.getSeconds()).padStart(2, "0");
-  const dateDecision = `${dd}/${mm}/${yyyy} ${hh}:${min}:${ss}`;
-  const currentTime = `${hh}:${min}:${ss}`;
+  const { dateTime: dateDecision, time: currentTime } = getWorkshopNow();
 
   try {
     await callDatabaseAction("accepterEntreeChefEquipe", {
@@ -1259,6 +1267,272 @@ export async function accepterEntreeParChefEquipe(params: {
 
   return { ok: true, dateDecision };
 }
+
+// ==========================================
+// NOTIFICATIONS & GESTION FACTURATION
+// ==========================================
+export type FacturationPaymentMode = "Facture" | "Bon de commande" | "Att Facture" | "Édition fin de travaux";
+
+export interface FacturationNotification {
+  id: string; // facturation_${noOr}_${chassis}
+  vehicleId?: number;
+  noOr: string;
+  or?: string;
+  chassis: string;
+  immatriculation?: string;
+  marque?: string;
+  modele?: string;
+  nomClient?: string;
+  client?: string;
+  equipe?: string;
+  technicien?: string;
+  nomTechnicien?: string;
+  dateFinTravaux: string;
+  statutFin?: string;
+  statutPaiement: "en_attente" | "facture" | "bon_commande" | "edition_fin_travaux";
+  modePaiement?: FacturationPaymentMode;
+  numeroFacture?: string;
+  numeroBC?: string;
+  numeroEdition?: string;
+  commentaire?: string;
+  dateDecision?: string;
+  decisionPar?: string;
+  statutFacturationFinale?: "non_facture" | "facture";
+  dateFacturationFinale?: string;
+  facturePar?: string;
+  createdAt: number;
+  notifiedAt?: number;
+}
+
+const STORAGE_KEY_FACTURATION_NOTIFS = "flux_atelier_facturation_notifications";
+
+export function getFacturationNotifications(): FacturationNotification[] {
+  try {
+    const raw = localStorage.getItem(STORAGE_KEY_FACTURATION_NOTIFS);
+    if (raw) return JSON.parse(raw);
+  } catch (e) {
+    console.warn("Erreur lecture notifications facturation:", e);
+  }
+  return [];
+}
+
+export function saveFacturationNotification(notif: FacturationNotification): void {
+  try {
+    const list = getFacturationNotifications().filter((n) => n.id !== notif.id);
+    list.unshift(notif);
+    localStorage.setItem(STORAGE_KEY_FACTURATION_NOTIFS, JSON.stringify(list));
+    persistSqlSnapshot("facturation_notifications", list);
+    window.dispatchEvent(new CustomEvent("facturation_notifications_updated", { detail: notif }));
+  } catch (e) {
+    console.warn("Erreur sauvegarde notification facturation:", e);
+  }
+}
+
+export function removeFacturationNotification(notifId: string): void {
+  try {
+    const list = getFacturationNotifications().filter((n) => n.id !== notifId);
+    localStorage.setItem(STORAGE_KEY_FACTURATION_NOTIFS, JSON.stringify(list));
+    persistSqlSnapshot("facturation_notifications", list);
+    deleteSqlRecord("facturation_notifications", notifId);
+    window.dispatchEvent(new CustomEvent("facturation_notifications_updated"));
+  } catch (e) {
+    console.warn("Erreur suppression notification facturation:", e);
+  }
+}
+
+export function notifierFinTravauxTechnicien(
+  vehicle: Partial<Flux>,
+  authorName?: string,
+  timestampStr?: string
+): FacturationNotification {
+  const now = new Date();
+  const dd = String(now.getDate()).padStart(2, "0");
+  const mm = String(now.getMonth() + 1).padStart(2, "0");
+  const yyyy = now.getFullYear();
+  const hh = String(now.getHours()).padStart(2, "0");
+  const min = String(now.getMinutes()).padStart(2, "0");
+  const dateFinTravaux = timestampStr || `${dd}/${mm}/${yyyy} ${hh}:${min}`;
+
+  const noOr = String(vehicle.no || vehicle.ordre || "").trim();
+  const chassis = String(vehicle.chassis || "").trim();
+  const notifId = `facturation_${noOr || "sans_or"}_${chassis || Date.now()}`;
+
+  const existingList = getFacturationNotifications();
+  const existing = existingList.find(
+    (n) => (noOr && (n.noOr === noOr || n.or === noOr)) || (chassis && n.chassis === chassis)
+  );
+
+  if (existing) {
+    // Si le dossier a déjà été validé par la facturation, on ne l'écrase pas en "en_attente"
+    if (existing.statutPaiement !== "en_attente") {
+      return existing;
+    }
+  }
+
+  const notif: FacturationNotification = {
+    id: existing?.id || notifId,
+    vehicleId: vehicle.id,
+    noOr: noOr || existing?.noOr || "",
+    or: noOr || existing?.noOr || "",
+    chassis: chassis || existing?.chassis || "",
+    immatriculation: vehicle.serie || vehicle.immatriculation || existing?.immatriculation || "",
+    marque: vehicle.marque || existing?.marque || "",
+    modele: vehicle.modele || existing?.modele || "",
+    nomClient: vehicle.client || existing?.nomClient || "",
+    client: vehicle.client || existing?.nomClient || "",
+    equipe: vehicle.equipe || existing?.equipe || "",
+    technicien: vehicle.nomTechnicien || vehicle.technicien || authorName || existing?.technicien || "",
+    nomTechnicien: vehicle.nomTechnicien || vehicle.technicien || authorName || existing?.technicien || "",
+    dateFinTravaux,
+    statutFin: vehicle.avancement || vehicle.etatIntervention || "Terminé",
+    statutPaiement: "en_attente",
+    createdAt: existing?.createdAt || Date.now(),
+    notifiedAt: existing?.notifiedAt || Date.now(),
+  };
+
+  saveFacturationNotification(notif);
+  return notif;
+}
+
+export async function validerPaiementFacturation(params: {
+  noOr: string;
+  chassis: string;
+  modePaiement: FacturationPaymentMode;
+  numeroFacture?: string;
+  numeroBC?: string;
+  numeroEdition?: string;
+  commentaire?: string;
+  validePar?: string;
+  regularisation?: boolean;
+  equipe?: string;
+  client?: string;
+  nomClient?: string;
+}): Promise<{ ok: boolean; message?: string }> {
+  const now = new Date();
+  const dd = String(now.getDate()).padStart(2, "0");
+  const mm = String(now.getMonth() + 1).padStart(2, "0");
+  const yyyy = now.getFullYear();
+  const hh = String(now.getHours()).padStart(2, "0");
+  const min = String(now.getMinutes()).padStart(2, "0");
+  const nowFormatted = `${dd}/${mm}/${yyyy} ${hh}:${min}`;
+
+  const res = await callDatabaseAction<{ ok: boolean; message?: string }>("validerFacturation", {
+    noOr: params.noOr,
+    chassis: params.chassis,
+    modePaiement: params.modePaiement,
+    numeroFacture: params.numeroFacture || "",
+    numeroBC: params.numeroBC || "",
+    numeroEdition: params.numeroEdition || "",
+    commentaire: params.commentaire || "",
+    validePar: params.validePar || "",
+    regularisation: params.regularisation ? "true" : "",
+    equipe: params.equipe || "",
+    client: params.client || params.nomClient || "",
+    nomClient: params.nomClient || params.client || "",
+  });
+
+  // Mettre à jour l'enregistrement local de notification
+  const list = getFacturationNotifications();
+  const notif = list.find(
+    (n) => params.noOr ? n.noOr === params.noOr : Boolean(params.chassis && n.chassis === params.chassis)
+  );
+
+  const isAttFacture =
+    params.modePaiement === "Att Facture" ||
+    params.modePaiement === "Édition fin de travaux" ||
+    (params.modePaiement as string) === "Attente Facture";
+
+  const statutPaiement = isAttFacture
+    ? "edition_fin_travaux"
+    : params.modePaiement === "Bon de commande"
+    ? "bon_commande"
+    : "facture";
+
+  if (notif) {
+    notif.statutPaiement = statutPaiement;
+    notif.modePaiement = params.modePaiement;
+    notif.numeroFacture = params.numeroFacture;
+    notif.numeroBC = params.numeroBC;
+    notif.numeroEdition = params.numeroEdition;
+    notif.commentaire = params.commentaire;
+    notif.dateDecision = nowFormatted;
+    notif.decisionPar = params.validePar;
+    notif.statutFacturationFinale = isAttFacture ? "non_facture" : "facture";
+    if (params.equipe) notif.equipe = params.equipe;
+    if (params.client || params.nomClient) {
+      notif.client = params.client || params.nomClient || notif.client;
+      notif.nomClient = params.nomClient || params.client || notif.nomClient;
+    }
+    saveFacturationNotification(notif);
+  } else {
+    saveFacturationNotification({
+      id: `facturation_${params.noOr}_${params.chassis}`,
+      noOr: params.noOr,
+      chassis: params.chassis,
+      dateFinTravaux: nowFormatted,
+      statutPaiement,
+      modePaiement: params.modePaiement,
+      numeroFacture: params.numeroFacture,
+      numeroBC: params.numeroBC,
+      numeroEdition: params.numeroEdition,
+      commentaire: params.commentaire,
+      dateDecision: nowFormatted,
+      decisionPar: params.validePar,
+      statutFacturationFinale: isAttFacture ? "non_facture" : "facture",
+      equipe: params.equipe || "",
+      client: params.client || params.nomClient || "",
+      nomClient: params.nomClient || params.client || "",
+      createdAt: Date.now(),
+    });
+  }
+
+  window.dispatchEvent(new CustomEvent("facturation_notifications_updated"));
+  window.dispatchEvent(new CustomEvent("flux_refresh_requested"));
+  return res;
+}
+
+export async function marquerDossierFacture(params: {
+  noOr: string;
+  chassis: string;
+  numeroFacture?: string;
+  commentaire?: string;
+  facturePar?: string;
+}): Promise<{ ok: boolean; message?: string }> {
+  const now = new Date();
+  const dd = String(now.getDate()).padStart(2, "0");
+  const mm = String(now.getMonth() + 1).padStart(2, "0");
+  const yyyy = now.getFullYear();
+  const hh = String(now.getHours()).padStart(2, "0");
+  const min = String(now.getMinutes()).padStart(2, "0");
+  const nowFormatted = `${dd}/${mm}/${yyyy} ${hh}:${min}`;
+
+  const res = await callDatabaseAction<{ ok: boolean; message?: string }>("marquerFacture", {
+    noOr: params.noOr,
+    chassis: params.chassis,
+    numeroFacture: params.numeroFacture || "",
+    commentaire: params.commentaire || "",
+    facturePar: params.facturePar || "",
+  });
+
+  const list = getFacturationNotifications();
+  const notif = list.find(
+    (n) => params.noOr ? n.noOr === params.noOr : Boolean(params.chassis && n.chassis === params.chassis)
+  );
+
+  if (notif) {
+    notif.statutFacturationFinale = "facture";
+    notif.dateFacturationFinale = nowFormatted;
+    notif.facturePar = params.facturePar;
+    if (params.numeroFacture) notif.numeroFacture = params.numeroFacture;
+    if (params.commentaire) notif.commentaire = params.commentaire;
+    saveFacturationNotification(notif);
+  }
+
+  window.dispatchEvent(new CustomEvent("facturation_notifications_updated"));
+  window.dispatchEvent(new CustomEvent("flux_refresh_requested"));
+  return res;
+}
+
 
 // ==========================================
 // SUIVI TECHNICIEN RÉAFFECTÉ & REPRISE TRAVAIL
@@ -1409,7 +1683,8 @@ export function getTeamFromVr(vrCode: string): string {
   const clean = (vrCode || "").trim().toLowerCase();
   if (clean.includes("rapide")) return "Service Rapide";
   if (clean.includes("carross")) return "Carrosserie";
-  if (clean.includes("elict") || clean.includes("elect")) return "Electrique";
+  // Le nom canonique de l'équipe dans l'application est « Elictrique ».
+  if (clean.includes("elict") || clean.includes("elect")) return "Elictrique";
   if (clean.includes("lourd")) return "Lourd";
   if (clean.includes("changan")) return "Changan";
   if (clean.includes("daily")) return "Daily";
@@ -1881,7 +2156,7 @@ export async function updateDatabaseStatutAchat(
 export async function updateDatabaseStatutDevis(
   row: Flux,
   devis: DemandeDevis,
-  nouveauStatut: "En attente accord" | "Client appelé" | "Accepté" | "Refusé" | "Annulé"
+  nouveauStatut: "Attente validation devis" | "En attente accord" | "Client appelé" | "Accepté" | "Refusé" | "Annulé"
 ) {
   return callSheetWriteAction(row, "updateStatutDevis", {
     numeroDevis: devis.numeroDevis || "",
@@ -1940,8 +2215,8 @@ export async function updateDatabaseAvancement(
   }
 
   // Horodatage systématique selon les 12 statuts demandés :
-  // 1. ATENDE DEVIS
-  if (cleanAv === "ATENDE DEVIS" || cleanAv.toLowerCase().includes("devis")) {
+  // 1. Lancement devis
+  if (cleanAv === "Lancement devis" || cleanAv === "ATENDE DEVIS" || cleanAv.toLowerCase().includes("devis")) {
     values.emplacement = "P";
     values.dateDevis = extraParams?.dateDevis || dateModif;
   }
@@ -2047,7 +2322,7 @@ export async function livrerVehiculeReception(
   },
   modePaiement: string
 ) {
-  return callDatabaseAction<{ ok: boolean; message?: string }>("livrerVehicule", {
+  const result = await callDatabaseAction<{ ok: boolean; message?: string }>("livrerVehicule", {
     no: row.noOr,
     noOr: row.noOr,
     cs: row.cs || "",
@@ -2056,6 +2331,43 @@ export async function livrerVehiculeReception(
     rowSuivi: row.suiviRowNumber || "",
     modePaiement,
   });
+  // La livraison clôture la file opérationnelle Facturation sur ce poste.
+  // L'archive serveur du véhicule reste, elle, réservée à l'administration.
+  if (result.ok) {
+    const remaining = getFacturationNotifications().filter(
+      (notification) => row.noOr
+        ? notification.noOr !== row.noOr
+        : notification.chassis !== row.chassis
+    );
+    localStorage.setItem(STORAGE_KEY_FACTURATION_NOTIFS, JSON.stringify(remaining));
+    window.dispatchEvent(new CustomEvent("facturation_notifications_updated"));
+  }
+  return result;
+}
+
+/** Crée un nouveau cycle d'intervention sans modifier l'OR livré d'origine.
+ * Cette action est contrôlée côté serveur et réservée à l'Administration. */
+export async function reouvrirOrLivre(row: { noOr: string; chassis: string }) {
+  const result = await callDatabaseAction<{ ok: boolean; message?: string; recordKey?: string }>("reouvrirOR", {
+    noOr: row.noOr,
+    no: row.noOr,
+    chassis: row.chassis,
+  });
+  if (typeof window !== "undefined") window.dispatchEvent(new CustomEvent("flux_refresh_requested"));
+  return result;
+}
+
+/** Réception : décrit le retour, puis transmet la nouvelle intervention à l'équipe choisie. */
+export async function traiterRetourReouvert(payload: {
+  recordKey: string;
+  noOr: string;
+  chassis: string;
+  descriptionRetour: string;
+  equipe: string;
+}) {
+  const result = await callDatabaseAction<{ ok: boolean; message?: string }>("traiterRetourReouvert", payload);
+  if (typeof window !== "undefined") window.dispatchEvent(new CustomEvent("flux_refresh_requested"));
+  return result;
 }
 
 export async function updateReceptionRowEmplacement(
@@ -2225,10 +2537,14 @@ export function mergeRecentAddedVehicles(rows: Flux[]): Flux[] {
 
 export async function ajouterNouvelleEntree(entree: {
   noOr: string; cs: string; chassis: string; immatriculation?: string; codeClient?: string; nomClient: string;
-  dateEntreeHeure?: string; marque: string; modele: string; categorie?: string; equipe?: string; emplacement?: string;
+  dateEntreeHeure?: string; marque: string; modele: string; categorie?: string; equipe?: string; emplacement?: string; historique?: boolean;
 }) {
+  const noOr = entree.noOr.trim();
+  if (!noOr || noOr === "-") {
+    throw new Error("Le N° OR est obligatoire. Aucun dossier ne peut être ouvert sans OR.");
+  }
   assertSheetWriteConfigured();
-  registerPendingAddedVehicle(entree);
+  registerPendingAddedVehicle({ ...entree, noOr });
   const dateEntreeHeure = (entree.dateEntreeHeure || "").trim() || (() => {
     const now = new Date();
     const dd = String(now.getDate()).padStart(2, "0");
@@ -2241,16 +2557,24 @@ export async function ajouterNouvelleEntree(entree: {
   })();
 
   const equipeName = (entree.equipe || "Daily").trim();
-  const autoEmp = (entree.emplacement && entree.emplacement !== "-" && entree.emplacement !== "NA")
+  let autoEmp = (entree.emplacement && entree.emplacement !== "-" && entree.emplacement !== "NA")
     ? entree.emplacement
-    : calculerEmplacementAutomatique(
+    : "";
+  if (!autoEmp) {
+    try {
+      const allVehicles = await fetchDatabaseFluxData();
+      autoEmp = calculerEmplacementAutomatique(
         { statut: "Attente Réparation", etatIntervention: "Attente Réparation", equipe: equipeName },
-        []
+        allVehicles
       );
+    } catch {
+      autoEmp = "P1";
+    }
+  }
 
-  await callDatabaseAction("ajouterEntree", {
+  await callDatabaseAction(entree.historique ? "ajouterEntreeHistorique" : "ajouterEntree", {
       ...entree,
-      noOr: entree.noOr.trim(),
+      noOr,
       cs: entree.cs.trim(),
       chassis: entree.chassis.trim().toUpperCase(),
       immatriculation: (entree.immatriculation || "").trim().toUpperCase(),
@@ -2268,10 +2592,10 @@ export async function ajouterNouvelleEntree(entree: {
     });
 
   // Notifier immédiatement le Chef d'équipe correspondant
-  const notifId = `entree_${entree.noOr.trim()}_${entree.chassis.trim().toUpperCase()}`;
+  const notifId = `entree_${noOr}_${entree.chassis.trim().toUpperCase()}`;
   const notif: NouvelleEntreeNotification = {
     id: notifId,
-    noOr: entree.noOr.trim(),
+    noOr,
     chassis: entree.chassis.trim().toUpperCase(),
     immatriculation: (entree.immatriculation || "").trim().toUpperCase(),
     marque: entree.marque.trim() || "IVECO",
@@ -2417,6 +2741,8 @@ export async function modifierVin(payload: NouveauVinPayload): Promise<{ ok: boo
 }
 
 export interface ModifierEntreePayload {
+  id?: string | number;
+  recordKey?: string;
   noOr: string; cs: string; chassis: string; codeClient?: string; nomClient?: string; dateEntreeHeure?: string;
   marque?: string; modele?: string; categorie?: string; etat?: string; equipe?: string; emplacement?: string;
   rowSuivi?: number; rowNumber?: number; origNo?: string; origCs?: string; origChassis?: string;
@@ -2427,8 +2753,12 @@ export async function modifierDossierEntree(payload: ModifierEntreePayload): Pro
   const cleanNo = (payload.noOr || "").trim() === "-" ? "" : (payload.noOr || "").trim();
   const cleanCs = (payload.cs || "").trim() === "-" ? "" : (payload.cs || "").trim();
   const cleanChassis = (payload.chassis || "").trim().toUpperCase() === "-" ? "" : (payload.chassis || "").trim().toUpperCase();
+  const idStr = payload.id !== undefined && payload.id !== null ? String(payload.id).trim() : "";
   const result = await callDatabaseAction<{ ok: boolean; message?: string }>("modifierEntree", {
-    ...payload, noOr: cleanNo, no: cleanNo, cs: cleanCs, chassis: cleanChassis,
+    ...payload,
+    id: idStr,
+    recordKey: payload.recordKey || idStr,
+    noOr: cleanNo, no: cleanNo, cs: cleanCs, chassis: cleanChassis,
     marque: (payload.marque || "IVECO").trim(), modele: (payload.modele || "").trim(), categorie: (payload.categorie || "").trim(),
   });
   if (typeof window !== "undefined") window.dispatchEvent(new CustomEvent("flux_refresh_requested"));

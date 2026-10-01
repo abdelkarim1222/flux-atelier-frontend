@@ -3,11 +3,14 @@ CREATE TABLE IF NOT EXISTS accounts (
   name TEXT NOT NULL,
   email TEXT NOT NULL UNIQUE,
   password_hash TEXT NOT NULL,
-  role TEXT NOT NULL CHECK (role IN ('administration', 'chef_atelier', 'reception', 'chef_equipe')),
+  role TEXT NOT NULL CHECK (role IN ('administration', 'chef_atelier', 'reception', 'chef_equipe', 'facturation')),
   assigned_team TEXT,
+  custom_permissions JSONB DEFAULT '{}'::jsonb,
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
+ALTER TABLE accounts ADD COLUMN IF NOT EXISTS custom_permissions JSONB DEFAULT '{}'::jsonb;
 
 CREATE TABLE IF NOT EXISTS vehicles (
   id BIGSERIAL PRIMARY KEY,
@@ -83,7 +86,7 @@ CREATE INDEX IF NOT EXISTS vehicle_inventory_customer_idx ON vehicle_inventory (
 CREATE TABLE IF NOT EXISTS app_records (
   collection TEXT NOT NULL CHECK (collection IN (
     'teams', 'averages', 'purchases', 'quotes', 'essai_controls',
-    'vehicle_times', 'transfers', 'reassignments', 'essais', 'devis_notifications', 'entree_notifications'
+    'vehicle_times', 'transfers', 'reassignments', 'essais', 'devis_notifications', 'entree_notifications', 'facturation_notifications'
   )),
   record_key TEXT NOT NULL,
   vehicle_key TEXT,
@@ -99,5 +102,9 @@ CREATE INDEX IF NOT EXISTS app_records_collection_updated_idx ON app_records (co
 ALTER TABLE app_records DROP CONSTRAINT IF EXISTS app_records_collection_check;
 ALTER TABLE app_records ADD CONSTRAINT app_records_collection_check CHECK (collection IN (
   'teams', 'averages', 'purchases', 'quotes', 'essai_controls',
-  'vehicle_times', 'transfers', 'reassignments', 'essais', 'devis_notifications', 'entree_notifications'
+  'vehicle_times', 'transfers', 'reassignments', 'essais', 'devis_notifications', 'entree_notifications', 'facturation_notifications'
 ));
+
+ALTER TABLE accounts DROP CONSTRAINT IF EXISTS accounts_role_check;
+ALTER TABLE accounts ADD CONSTRAINT accounts_role_check CHECK (role IN ('administration', 'chef_atelier', 'reception', 'chef_equipe', 'facturation'));
+

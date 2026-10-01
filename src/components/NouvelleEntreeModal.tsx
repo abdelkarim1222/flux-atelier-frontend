@@ -19,15 +19,18 @@ import {
 } from "lucide-react";
 import {
   ajouterNouvelleEntree,
+  fetchDatabaseFluxData,
   isDatabaseWriteConfigured,
   searchVehicleByVin,
   type VinVehicleInfo,
 } from "../services/database";
 import { getAllDestinationTeams, type DestinationTeam } from "../config/teams";
 import NouveauVinModal from "./NouveauVinModal";
+import { useAuth } from "../context/AuthContext";
 
 interface NouvelleEntreeModalProps {
   isOpen: boolean;
+  historique?: boolean;
   onClose: () => void;
   onSuccess: (newEntry?: {
     noOr: string;
@@ -46,9 +49,14 @@ interface NouvelleEntreeModalProps {
 
 export default function NouvelleEntreeModal({
   isOpen,
+  historique = false,
   onClose,
   onSuccess,
 }: NouvelleEntreeModalProps) {
+  const { currentUser } = useAuth();
+  const assignedReceptionCs = currentUser?.role === "reception" && /^R\d+$/i.test(currentUser.assignedTeam || "")
+    ? currentUser.assignedTeam!.toUpperCase()
+    : "";
   const getNowFormatted = (withSeconds = false) => {
     const now = new Date();
     const dd = String(now.getDate()).padStart(2, "0");
@@ -95,10 +103,10 @@ export default function NouvelleEntreeModal({
   // Réinitialisation du formulaire à chaque ouverture
   useEffect(() => {
     if (isOpen) {
-      setIsAutoTime(true);
+      setIsAutoTime(!historique);
       setFormData({
         noOr: "",
-        cs: "R10",
+        cs: assignedReceptionCs || "R10",
         chassis: "",
         immatriculation: "",
         codeClient: "",
@@ -115,11 +123,11 @@ export default function NouvelleEntreeModal({
       setFoundVinDetails(null);
       lastSearchedVin.current = "";
     }
-  }, [isOpen]);
+  }, [isOpen, assignedReceptionCs, historique]);
 
   // Horloge en direct tant que le modal est ouvert et que le mode automatique est actif
   useEffect(() => {
-    if (!isOpen || !isAutoTime) return;
+    if (!isOpen || !isAutoTime || historique) return;
     const interval = setInterval(() => {
       setFormData((prev) => ({
         ...prev,
@@ -127,7 +135,7 @@ export default function NouvelleEntreeModal({
       }));
     }, 1000);
     return () => clearInterval(interval);
-  }, [isOpen, isAutoTime]);
+  }, [isOpen, isAutoTime, historique]);
 
   // Fermeture par la touche Échap
   useEffect(() => {
@@ -217,7 +225,8 @@ export default function NouvelleEntreeModal({
     e.preventDefault();
     setError("");
 
-    if (!formData.noOr.trim()) {
+    const cleanNoOr = formData.noOr.trim();
+    if (!cleanNoOr) {
       setError("Le N° OR est obligatoire.");
       return;
     }
@@ -235,13 +244,24 @@ export default function NouvelleEntreeModal({
 
     try {
       setLoading(true);
+      // Contrôle d'unicité du N° OR (les autres champs peuvent être identiques, mais le N° OR doit être unique)
+      const existingVehicles = await fetchDatabaseFluxData().catch(() => []);
+      const orConflict = existingVehicles.some((v) => {
+        const vNo = String(v.no || v.ordre || (v as unknown as { numeroOR?: string }).numeroOR || "").trim();
+        return vNo.toLowerCase() === cleanNoOr.toLowerCase();
+      });
+      if (orConflict) {
+        setError(`Le N° OR « ${cleanNoOr} » existe déjà. Un nouvel Ordre de Réparation doit obligatoirement avoir un numéro unique.`);
+        setLoading(false);
+        return;
+      }
       // Calculer l'horodatage exact et automatique au moment précis de l'enregistrement
-      const submissionDate = getNowFormatted(true);
+      const submissionDate = historique ? formData.dateEntreeHeure.trim() : getNowFormatted(true);
 
       const newEntryPayload = {
         ...formData,
         noOr: formData.noOr.trim(),
-        cs: formData.cs.trim() || "R18",
+        cs: assignedReceptionCs || formData.cs.trim() || "R18",
         chassis: formData.chassis.trim().toUpperCase(),
         immatriculation: formData.immatriculation.trim().toUpperCase(),
         marque: formData.marque.trim() || "IVECO",
@@ -250,6 +270,7 @@ export default function NouvelleEntreeModal({
         modele: formData.modele.trim() || "-",
         categorie: formData.categorie.trim() || "-",
         equipe: (formData.equipe || "Daily").trim(),
+        historique,
       };
 
       await ajouterNouvelleEntree(newEntryPayload);
@@ -297,7 +318,7 @@ export default function NouvelleEntreeModal({
                 id="modal-nouvelle-entree-title"
                 className="text-base font-bold text-white flex items-center gap-2"
               >
-                Nouvelle Entrée Véhicule (Réception)
+                {historique ? "Ajouter un Véhicule Historique" : "Nouvelle Entrée Véhicule (Réception)"}
                 <span className="inline-flex items-center gap-1 text-[10px] bg-emerald-400/20 text-emerald-200 border border-emerald-400/30 px-2 py-0.5 rounded-full font-semibold">
                   <Sparkles className="w-3 h-3 text-emerald-300" />
                   Auto-Lookup Parc & VIN
@@ -368,16 +389,18 @@ export default function NouvelleEntreeModal({
                 </label>
                 <select
                   value={formData.cs}
+                  disabled={Boolean(assignedReceptionCs)}
                   onChange={(e) =>
                     setFormData({ ...formData, cs: e.target.value })
                   }
-                  className="w-full px-3 py-2 rounded-lg border border-slate-200 text-xs font-medium text-slate-900 focus:outline-none focus:ring-2 focus:ring-emerald-500/20 focus:border-emerald-500 bg-white"
+                  className="w-full px-3 py-2 rounded-lg border border-slate-200 text-xs font-medium text-slate-900 focus:outline-none focus:ring-2 focus:ring-emerald-500/20 focus:border-emerald-500 bg-white disabled:bg-slate-50 disabled:text-slate-500 disabled:cursor-not-allowed"
                 >
                   <option value="R10">R10</option>
                   <option value="R09">R09</option>
                   <option value="R18">R18</option>
                   <option value="R16">R16</option>
                 </select>
+                {assignedReceptionCs && <p className="mt-1 text-[10px] font-semibold text-emerald-700">Centre attribué automatiquement à votre compte Réception.</p>}
               </div>
 
               {/* N° Châssis (VIN) avec recherche auto */}
@@ -505,18 +528,9 @@ export default function NouvelleEntreeModal({
                   <div className="flex items-center gap-2">
                     <AlertCircle className="w-4 h-4 text-amber-600 shrink-0" />
                     <span>
-                      Véhicule non répertorié dans le Parc véhicules & engins ni dans la base VIN. Vous pouvez compléter les champs manuellement.
+                      Véhicule non répertorié dans le Parc véhicules & engins ni dans la base VIN. Les informations client et véhicule seront ajoutées par la Direction dans la base VIN.
                     </span>
                   </div>
-                  <button
-                    type="button"
-                    onClick={() => setIsVinModalOpen(true)}
-                    className="inline-flex items-center gap-1 px-2.5 py-1 text-[11px] font-bold text-amber-950 bg-amber-200 hover:bg-amber-300 rounded-lg transition-colors cursor-pointer shrink-0"
-                    title="Enregistrer ce véhicule dans la base VIN de PostgreSQL"
-                  >
-                    <Plus className="w-3.5 h-3.5" />
-                    Ajouter ce VIN
-                  </button>
                 </div>
               )}
 
@@ -536,16 +550,17 @@ export default function NouvelleEntreeModal({
                   <Clock className="w-4 h-4 text-emerald-600 absolute left-3 top-2.5 pointer-events-none" />
                   <input
                     type="text"
-                    readOnly
+                    readOnly={!historique}
+                    onChange={historique ? (e) => setFormData({ ...formData, dateEntreeHeure: e.target.value }) : undefined}
                     value={formData.dateEntreeHeure}
-                    className="w-full pl-9 pr-3 py-2 rounded-lg border border-emerald-300 bg-white text-xs font-mono font-black text-emerald-950 shadow-2xs cursor-default select-none focus:outline-none"
+                    className="w-full pl-9 pr-3 py-2 rounded-lg border border-emerald-300 bg-white text-xs font-mono font-black text-emerald-950 shadow-2xs focus:outline-none"
                     title="Date et heure actuelles générées automatiquement à la seconde exacte"
                   />
                 </div>
                 <p className="text-[10.5px] text-emerald-700 font-medium flex items-center gap-1">
                   <span>✨</span>
                   <span>
-                    La date et l'heure sont gérées automatiquement à la seconde exacte lors de l'enregistrement en tête de tableau.
+                    {historique ? "Saisissez la date et l'heure historiques au format JJ/MM/AAAA HH:MM." : "La date et l'heure sont gérées automatiquement à la seconde exacte lors de l'enregistrement en tête de tableau."}
                   </span>
                 </p>
               </div>
@@ -561,10 +576,9 @@ export default function NouvelleEntreeModal({
                     type="text"
                     placeholder="ex: STE CEPTUNES..."
                     value={formData.nomClient}
-                    onChange={(e) =>
-                      setFormData({ ...formData, nomClient: e.target.value })
-                    }
-                    className="w-full pl-9 pr-3 py-2 rounded-lg border border-slate-200 text-xs font-medium text-slate-900 focus:outline-none focus:ring-2 focus:ring-emerald-500/20 focus:border-emerald-500"
+                    readOnly={!historique}
+                    onChange={historique ? (e) => setFormData({ ...formData, nomClient: e.target.value }) : undefined}
+                    className="w-full pl-9 pr-3 py-2 rounded-lg border border-slate-200 bg-slate-50 text-xs font-medium text-slate-500 cursor-not-allowed"
                   />
                 </div>
               </div>
@@ -578,10 +592,9 @@ export default function NouvelleEntreeModal({
                   type="text"
                   placeholder="ex: C000042621"
                   value={formData.codeClient}
-                  onChange={(e) =>
-                    setFormData({ ...formData, codeClient: e.target.value })
-                  }
-                  className="w-full px-3 py-2 rounded-lg border border-slate-200 text-xs font-medium text-slate-900 focus:outline-none focus:ring-2 focus:ring-emerald-500/20 focus:border-emerald-500 font-mono"
+                  readOnly={!historique}
+                  onChange={historique ? (e) => setFormData({ ...formData, codeClient: e.target.value }) : undefined}
+                  className="w-full px-3 py-2 rounded-lg border border-slate-200 bg-slate-50 text-xs font-medium text-slate-500 cursor-not-allowed font-mono"
                 />
               </div>
 
@@ -592,10 +605,9 @@ export default function NouvelleEntreeModal({
                 </label>
                 <select
                   value={formData.marque}
-                  onChange={(e) =>
-                    setFormData({ ...formData, marque: e.target.value })
-                  }
-                  className="w-full px-3 py-2 rounded-lg border border-slate-200 text-xs font-medium text-slate-900 focus:outline-none focus:ring-2 focus:ring-emerald-500/20 focus:border-emerald-500 bg-white font-semibold"
+                    disabled={!historique}
+                    onChange={historique ? (e) => setFormData({ ...formData, marque: e.target.value }) : undefined}
+                  className="w-full px-3 py-2 rounded-lg border border-slate-200 bg-slate-50 text-xs font-medium text-slate-500 cursor-not-allowed font-semibold"
                 >
                   <option value="IVECO">IVECO</option>
                   <option value="FIAT">FIAT</option>
@@ -619,10 +631,9 @@ export default function NouvelleEntreeModal({
                   type="text"
                   placeholder="ex: 50C15, ML150, NEW STAR..."
                   value={formData.modele}
-                  onChange={(e) =>
-                    setFormData({ ...formData, modele: e.target.value })
-                  }
-                  className="w-full px-3 py-2 rounded-lg border border-slate-200 text-xs font-medium text-slate-900 focus:outline-none focus:ring-2 focus:ring-emerald-500/20 focus:border-emerald-500"
+                  readOnly={!historique}
+                  onChange={historique ? (e) => setFormData({ ...formData, modele: e.target.value }) : undefined}
+                  className="w-full px-3 py-2 rounded-lg border border-slate-200 bg-slate-50 text-xs font-medium text-slate-500 cursor-not-allowed"
                 />
               </div>
 
@@ -635,10 +646,9 @@ export default function NouvelleEntreeModal({
                   type="text"
                   placeholder="ex: DAILY 50C15 E4 EMP 4350 CLIMATISE"
                   value={formData.categorie}
-                  onChange={(e) =>
-                    setFormData({ ...formData, categorie: e.target.value })
-                  }
-                  className="w-full px-3 py-2 rounded-lg border border-slate-200 text-xs font-medium text-slate-900 focus:outline-none focus:ring-2 focus:ring-emerald-500/20 focus:border-emerald-500"
+                  readOnly={!historique}
+                  onChange={historique ? (e) => setFormData({ ...formData, categorie: e.target.value }) : undefined}
+                  className="w-full px-3 py-2 rounded-lg border border-slate-200 bg-slate-50 text-xs font-medium text-slate-500 cursor-not-allowed"
                 />
               </div>
 
@@ -747,4 +757,3 @@ export default function NouvelleEntreeModal({
     document.body
   );
 }
-

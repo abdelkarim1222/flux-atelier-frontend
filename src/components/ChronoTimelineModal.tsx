@@ -90,9 +90,15 @@ export default function ChronoTimelineModal({
   // Le temps restant d'une attente mécanicien doit continuer à évoluer tant que la fenêtre est ouverte.
   useEffect(() => {
     if (!isOpen) return;
-    const timer = window.setInterval(() => setNow(Date.now()), 30_000);
+    // Les attentes en cours doivent évoluer sans fermer/réouvrir la fenêtre.
+    const timer = window.setInterval(() => {
+      setNow(Date.now());
+      refreshCalc();
+    }, 30_000);
     return () => window.clearInterval(timer);
-  }, [isOpen]);
+  // refreshCalc lit les données les plus récentes du véhicule et des journaux.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isOpen, vehicle]);
 
   if (!isOpen || !vehicle || !calc) return null;
 
@@ -790,6 +796,10 @@ export default function ChronoTimelineModal({
                   badgeColor = "bg-violet-100 text-violet-800 border-violet-300";
                   dotColor = "bg-violet-600";
                   Icon = Gauge;
+                } else if (step.type === "modification") {
+                  badgeColor = "bg-slate-100 text-slate-800 border-slate-300";
+                  dotColor = "bg-slate-600";
+                  Icon = Edit2;
                 } else if (step.type === "fin") {
                   badgeColor = "bg-emerald-100 text-emerald-800 border-emerald-300";
                   dotColor = "bg-emerald-600";

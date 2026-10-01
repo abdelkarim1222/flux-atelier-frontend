@@ -140,8 +140,12 @@ function recordKey(record: Record<string, unknown>): string {
   return String(record.id ?? record.vehicleId ?? record.or ?? record.noOr ?? record.chassis ?? '');
 }
 
-export async function hydrateSqlLocalCache(): Promise<void> {
+export async function hydrateSqlLocalCache(currentRole?: string): Promise<void> {
   if (typeof window === 'undefined') return;
+  const role = currentRole || localStorage.getItem('flux_atelier_active_role') || '';
+  const canEssai = !role || ['administration', 'chef_atelier', 'chef_equipe'].includes(role);
+  const canViewVehicleTimes = !role || ['administration', 'chef_atelier', 'chef_equipe'].includes(role);
+
   for (const storageKey of [
     'flux_atelier_demandes_achat', 'flux_atelier_demandes_devis', 'flux_atelier_essais_controle',
     'flux_atelier_reaffectations', 'flux_atelier_vehicle_time_logs', 'flux_atelier_devis_accord_notifications',
@@ -152,9 +156,9 @@ export async function hydrateSqlLocalCache(): Promise<void> {
   const keyedCollections: Array<[string, string, (record: Record<string, unknown>) => string]> = [
     ['purchases', 'flux_atelier_demandes_achat', recordKey],
     ['quotes', 'flux_atelier_demandes_devis', recordKey],
-    ['essai_controls', 'flux_atelier_essais_controle', recordKey],
+    ...(canEssai ? [['essai_controls', 'flux_atelier_essais_controle', recordKey] as [string, string, (record: Record<string, unknown>) => string]] : []),
     ['reassignments', 'flux_atelier_reaffectations', recordKey],
-    ['vehicle_times', 'flux_atelier_vehicle_time_logs', (record) => String(record.vehicleKey ?? recordKey(record))],
+    ...(canViewVehicleTimes ? [['vehicle_times', 'flux_atelier_vehicle_time_logs', (record) => String(record.vehicleKey ?? recordKey(record))] as [string, string, (record: Record<string, unknown>) => string]] : []),
   ];
   await Promise.all(keyedCollections.map(async ([collection, storageKey, keyOf]) => {
     try {
@@ -171,6 +175,7 @@ export async function hydrateSqlLocalCache(): Promise<void> {
   const arrayCollections: Array<[string, string]> = [
     ['devis_notifications', 'flux_atelier_devis_accord_notifications'],
     ['entree_notifications', 'flux_atelier_nouvelle_entree_notifications'],
+    ['facturation_notifications', 'flux_atelier_facturation_notifications'],
     ['transfers', 'flux_atelier_transfers_timeline'],
     ['essais', 'flux_atelier_essais_timeline'],
   ];
@@ -195,7 +200,8 @@ export async function hydrateSqlLocalCache(): Promise<void> {
 
   for (const eventName of [
     'demandes_achat_updated', 'demandes_devis_updated', 'essais_controle_updated',
-    'devis_accord_updated', 'reaffectations_updated', 'vehicle_transfers_updated',
+    'devis_accord_updated', 'nouvelle_entree_notification_updated', 'facturation_notifications_updated',
+    'reaffectations_updated', 'vehicle_transfers_updated',
     'vehicle_essais_updated', 'vehicle_time_tracking_updated', 'equipes_custom_updated',
   ]) window.dispatchEvent(new Event(eventName));
 }
