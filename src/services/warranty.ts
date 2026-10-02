@@ -4,19 +4,10 @@ type WarrantyVehicle = Partial<Flux> & {
   typeDossier?: unknown;
 };
 
-/** True when the record belongs to the warranty workflow (R10 or explicitly tagged). */
+/** True only for the warranty Centre Service R10 workflow. */
 export function isWarrantyVehicle(vehicle: WarrantyVehicle): boolean {
   const cs = String(vehicle.cs || "").trim().toUpperCase();
-  const dossierType = String(vehicle.typeDossier || "").trim().toLowerCase();
-  const client = String(vehicle.client || "").trim().toLowerCase();
-
-  return (
-    cs === "R10" ||
-    cs.includes("GARANTIE") ||
-    Boolean(vehicle.isGarantie) ||
-    dossierType.includes("garantie") ||
-    client.includes("garantie")
-  );
+  return cs === "R10";
 }
 
 /** A completed workshop intervention, independently from the warranty-case status. */

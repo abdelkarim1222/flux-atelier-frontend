@@ -1,5 +1,4 @@
 import { useState, useEffect, useMemo } from "react";
-import { isWarrantyVehicle } from "../services/warranty";
 import {
   BarChart3,
   Calendar,
@@ -220,9 +219,6 @@ export default function MoyennesView({ vehicles: vehiclesProp }: MoyennesViewPro
     });
 
     vehicles.forEach((veh) => {
-      // Exclusion stricte des véhicules Garantie (Centre Service R10) du calcul des moyennes
-      if (isWarrantyVehicle(veh)) return;
-
       // Prioritize dateEntree (entry date from Suivi des Entrées). Strip time
       // component if present: "28/09/2026 08:30" → "28/09/2026"
       const rawDate = (veh.dateEntree || veh.date || "").trim().split(" ")[0];
@@ -234,23 +230,24 @@ export default function MoyennesView({ vehicles: vehiclesProp }: MoyennesViewPro
       const y = parseInt(match[3], 10);
       if (y !== yr || m !== mo || d < 1 || d > daysInMonth) return;
 
-      // ─── Tableau 1 : répartition par équipe ───────────────────────────────
-      const rawTeam = (veh.equipe || "").trim();
-      let enteredTeamName = rawTeam;
-      if (enteredTeamName.includes(",")) {
-        const parts = enteredTeamName.split(",").map((p) => p.trim());
-        const match = STANDARD_TEAMS.find((st) => parts.some((p) => p.toLowerCase() === st.toLowerCase()));
-        enteredTeamName = match || parts[0] || "Daily1";
-      }
-      if (!enteredTeamName || enteredTeamName === "-" || enteredTeamName.toLowerCase() === "non affectée") {
-        enteredTeamName = "Daily1";
-      }
-      // Conserver un libellé cohérent pour les données saisies avec une casse différente.
-      const teamName = STANDARD_TEAMS.find(
-        (team) => team.toLowerCase() === enteredTeamName.toLowerCase()
-      ) || (enteredTeamName.toLowerCase().includes("daily") ? "Daily1" : enteredTeamName);
-      ensureTeam(teamName);
-      teamDays[teamName][d - 1] += 1;
+      // ─── Tableau 1 : passages par équipe ──────────────────────────────────
+      // A vehicle transferred between teams is counted once in every team it
+      // passed through (e.g. Service Rapide → Daily counts 1 in both rows).
+      const teamHistory = [veh.equipe1, veh.equipe2, veh.equipe3, veh.equipe]
+        .flatMap((value) => String(value || "").split(","))
+        .map((value) => value.trim())
+        .filter((value) => value && value !== "-" && value.toLowerCase() !== "non affectée");
+      const normalizedTeams = Array.from(new Set((teamHistory.length ? teamHistory : ["Daily1"])
+        .map((rawTeam) => {
+          const teamName = STANDARD_TEAMS.find(
+            (team) => team.toLowerCase() === rawTeam.toLowerCase()
+          );
+          return teamName || (rawTeam.toLowerCase().includes("daily") ? "Daily1" : rawTeam);
+        })));
+      normalizedTeams.forEach((teamName) => {
+        ensureTeam(teamName);
+        teamDays[teamName][d - 1] += 1;
+      });
 
       // ─── Tableau 2 : répartition par famille de modèles ───────────────────
       let modelFamille: string | undefined;
@@ -266,10 +263,11 @@ export default function MoyennesView({ vehicles: vehiclesProp }: MoyennesViewPro
         else if (fullDesc.includes("IRISBUS") || fullDesc.includes("BUS") || fullDesc.includes("IV-AUTRES")) modelFamille = "IRISBUS";
         else if (fullDesc.includes("JMC") || fullDesc.includes("VIGUS")) modelFamille = "JMC";
       }
-      if (modelFamille) {
-        ensureModel(modelFamille);
-        modelDays[modelFamille][d - 1] += 1;
-      }
+      // Every entry must be represented in the model total, even when its
+      // code has not yet been assigned to a family in the correspondence list.
+      const resolvedFamille = modelFamille || "Non classé";
+      ensureModel(resolvedFamille);
+      modelDays[resolvedFamille][d - 1] += 1;
     });
 
     // Active days = days where at least one vehicle entered
@@ -420,16 +418,16 @@ export default function MoyennesView({ vehicles: vehiclesProp }: MoyennesViewPro
     );
   }, [displayData.correspondances, searchFilter]);
 
-  // 1. Filtrer les véhicules pour le mois et l'année sélectionnés
+  // 1. Same entry scope as the two yield tables: all workshop entries,
+  // including warranty vehicles, selected by their entry date.
   const periodVehicles = useMemo(() => {
     return vehicles.filter((veh) => {
-      // Exclusion stricte des véhicules Garantie (Centre Service R10) du calcul des moyennes
-      if (isWarrantyVehicle(veh)) return false;
-
-      const dStr = veh.date || veh.dateEntree || veh.dateDebutRep || "";
+      const dStr = veh.dateEntree || veh.date || veh.dateDebutRep || "";
       if (!dStr || dStr.includes("1899")) return false;
       const match = dStr.match(/^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{4})/);
-      if (!match) return true;
+      // An invalid date cannot be placed in a daily yield column, so it must
+      // not inflate the card above the tables.
+      if (!match) return false;
       const m = parseInt(match[2], 10);
       const y = parseInt(match[3], 10);
       return y === selectedYear && m === selectedMonth;
@@ -531,6 +529,42 @@ export default function MoyennesView({ vehicles: vehiclesProp }: MoyennesViewPro
       techniciensList,
     };
   }, [periodVehicles, vehicles, timeTrackingRevision]);
+
+  // Daily workload: a vehicle is assigned to the day on which the technician
+  // actually started work. When that timestamp is absent, use the repair start
+  // date, then the entry date as a final fallback.
+  const technicianDailyRows = useMemo(() => {
+    const daysInMonth = new Date(selectedYear, selectedMonth, 0).getDate();
+    const rows = new Map<string, { matricule: string; name: string; equipe: string; days: number[]; total: number }>();
+
+    vehicles.forEach((veh) => {
+      const matricule = (veh.technicien || "").trim();
+      const name = (veh.nomTechnicien || "").trim();
+      if ((!matricule || matricule === "-") && (!name || name === "-")) return;
+
+      const rawDate = (veh.dateDebutTravail || veh.dateDebutRep || veh.dateEntree || veh.date || "").trim().split(" ")[0];
+      const match = rawDate.match(/^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{4})$/);
+      if (!match) return;
+      const day = Number(match[1]);
+      const month = Number(match[2]);
+      const year = Number(match[3]);
+      if (year !== selectedYear || month !== selectedMonth || day < 1 || day > daysInMonth) return;
+
+      const key = matricule && matricule !== "-" ? matricule : name;
+      const existing = rows.get(key) || {
+        matricule: matricule && matricule !== "-" ? matricule : "-",
+        name: name && name !== "-" ? name : matricule,
+        equipe: veh.equipe || "-",
+        days: Array(daysInMonth).fill(0),
+        total: 0,
+      };
+      existing.days[day - 1] += 1;
+      existing.total += 1;
+      rows.set(key, existing);
+    });
+
+    return Array.from(rows.values()).sort((a, b) => b.total - a.total || a.name.localeCompare(b.name));
+  }, [vehicles, selectedYear, selectedMonth, timeTrackingRevision]);
 
   // CSV Export handler
   const handleExportCSV = () => {
@@ -971,7 +1005,7 @@ export default function MoyennesView({ vehicles: vehiclesProp }: MoyennesViewPro
             {/* TABLEAU 1: EQUIPE (1..31, Total, Moyenne) */}
             <div className="moyennes-print-table bg-white rounded-xl border border-slate-300 shadow-2xs overflow-hidden">
               <div className="overflow-x-auto">
-                <table className="w-full text-center border-collapse text-[11px]">
+                <table className="zebra-table w-full text-center border-collapse text-[11px]">
                   <thead>
                     {/* Blue Excel-style Header */}
                     <tr className="bg-[#1f4e79] text-white font-bold border-b border-[#1b3a57]">
@@ -1072,7 +1106,7 @@ export default function MoyennesView({ vehicles: vehiclesProp }: MoyennesViewPro
             {/* TABLEAU 2: MODÈLES (1..31, Total, Moyenne) */}
             <div className="moyennes-print-table bg-white rounded-xl border border-slate-300 shadow-2xs overflow-hidden">
               <div className="overflow-x-auto">
-                <table className="w-full text-center border-collapse text-[11px]">
+                <table className="zebra-table w-full text-center border-collapse text-[11px]">
                   <thead>
                     {/* Blue Excel-style Header */}
                     <tr className="bg-[#1f4e79] text-white font-bold border-b border-[#1b3a57]">
@@ -1252,7 +1286,7 @@ export default function MoyennesView({ vehicles: vehiclesProp }: MoyennesViewPro
           </div>
 
           <div className="overflow-x-auto">
-            <table className="w-full text-xs text-left border-collapse">
+            <table className="zebra-table w-full text-xs text-left border-collapse">
               <thead>
                 <tr className="bg-slate-100 text-slate-700 font-extrabold border-b border-slate-200">
                   <th className="py-2.5 px-3">N° Matricule</th>
@@ -1334,6 +1368,44 @@ export default function MoyennesView({ vehicles: vehiclesProp }: MoyennesViewPro
                 )}
               </tbody>
             </table>
+          </div>
+
+          <div className="border-t border-slate-300 bg-slate-50/70">
+            <div className="px-4 py-2.5 flex flex-wrap items-center justify-between gap-2">
+              <div>
+                <h2 className="font-black text-sm text-slate-900">VÉHICULES TRAVAILLÉS PAR JOUR</h2>
+                <p className="text-[11px] text-slate-500">Comptage selon la date de début de travail de chaque technicien.</p>
+              </div>
+              <span className="text-[11px] font-bold text-blue-800 bg-blue-50 border border-blue-200 rounded px-2 py-1">
+                {technicianDailyRows.length} technicien(s)
+              </span>
+            </div>
+            <div className="overflow-x-auto bg-white">
+              <table className="w-full min-w-[1250px] text-center border-collapse text-[11px]">
+                <thead>
+                  <tr className="bg-[#2a6296] text-white font-bold">
+                    <th className="sticky left-0 z-10 bg-[#1f4e79] py-2 px-3 text-left min-w-[110px]">Matricule</th>
+                    <th className="sticky left-[110px] z-10 bg-[#1f4e79] py-2 px-3 text-left min-w-[160px]">Technicien</th>
+                    {daysList.map((day) => <th key={day} className="py-2 px-2 min-w-8">{day}</th>)}
+                    <th className="py-2 px-3 bg-[#183d5f]">Total</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-slate-100">
+                  {technicianDailyRows.length === 0 ? (
+                    <tr><td colSpan={daysList.length + 3} className="py-6 text-slate-400">Aucun véhicule travaillé sur cette période.</td></tr>
+                  ) : technicianDailyRows.map((tech) => (
+                    <tr key={`daily-${tech.matricule}-${tech.name}`} className="hover:bg-blue-50/50">
+                      <td className="sticky left-0 z-10 bg-white py-2 px-3 text-left font-mono font-bold text-slate-800">{tech.matricule}</td>
+                      <td className="sticky left-[110px] z-10 bg-white py-2 px-3 text-left font-bold text-slate-900">{tech.name}</td>
+                      {tech.days.map((count, index) => (
+                        <td key={index} className={`py-2 px-2 font-bold ${count > 0 ? "text-blue-800 bg-blue-50/70" : "text-slate-300"}`}>{count}</td>
+                      ))}
+                      <td className="py-2 px-3 font-black text-blue-900 bg-blue-50">{tech.total}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
           </div>
         </div>
       )}

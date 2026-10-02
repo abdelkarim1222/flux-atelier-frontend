@@ -419,6 +419,7 @@ export function recordVehicleModification(
   },
   label: string,
   commentaire?: string,
+  customDate?: string | number,
 ): void {
   const noOr = String(vehicle.no || vehicle.ordre || vehicle.noOr || "").trim();
   const chassis = String(vehicle.chassis || "").trim();
@@ -436,13 +437,19 @@ export function recordVehicleModification(
     equipe: String(vehicle.equipe || ""),
     customSteps: [],
   };
-  const timestamp = Date.now();
+  const timestamp = typeof customDate === "number"
+    ? customDate
+    : (typeof customDate === "string" && parseDateTimestamp(customDate) > 0 ? parseDateTimestamp(customDate) : Date.now());
+  const dateFormatted = typeof customDate === "string" && customDate.includes("/")
+    ? customDate
+    : formatDateDisplay(timestamp);
+
   const step: VehicleTimeStep = {
     id: `modification-${timestamp}-${Math.random().toString(36).slice(2, 7)}`,
     type: "modification",
     label,
-    dateDebut: formatDateDisplay(timestamp),
-    dateFin: formatDateDisplay(timestamp),
+    dateDebut: dateFormatted,
+    dateFin: dateFormatted,
     dureeMinutes: 0,
     commentaire,
     automatique: true,
@@ -914,6 +921,20 @@ export function calculateVehicleTimes(
   const transferSteps: VehicleTimeStep[] = [];
   const treatedTransferIds = new Set<string>();
 
+  // Retrouver la dernière affectation technicien/équipe avant transfert
+  const lastAssignedTechComment = (() => {
+    for (let i = customSteps.length - 1; i >= 0; i--) {
+      const s = customSteps[i];
+      if (s.label?.includes("Prise en charge / affectation") && s.commentaire) {
+        return s.commentaire;
+      }
+    }
+    const tech = vehicle.technicien && vehicle.technicien !== "-"
+      ? ` • Technicien : ${vehicle.technicien} ${vehicle.nomTechnicien || ""}`.trim()
+      : (vehicle.nomTechnicien && vehicle.nomTechnicien !== "-" ? ` • Technicien : ${vehicle.nomTechnicien}` : "");
+    return `Équipe : ${vehicle.equipe || "Atelier"}${tech}`;
+  })();
+
   vehicleTransfers.forEach((tr, idx) => {
     if (treatedTransferIds.has(tr.id)) return;
     treatedTransferIds.add(tr.id);
@@ -927,32 +948,74 @@ export function calculateVehicleTimes(
         tsFin = tsFinEffective;
       }
       const diffMin = workingMinutes(tsDebut, tsFin);
+      const dateTransfertStr = formatDateDisplay(tsDebut);
+
+      // S'assurer qu'une étape « Prise en charge / terminer » existe avant chaque transfert
+      const hasTerminerForTransfer = customSteps.some(
+        (s) =>
+          (s.label === "Prise en charge / terminer" || s.label?.toLowerCase() === "prise en charge / terminer") &&
+          (Math.abs((parseDateTimestamp(s.dateDebut) || 0) - tsDebut) < 120000 || s.dateDebut === dateTransfertStr)
+      );
+
+      if (!hasTerminerForTransfer) {
+        transferSteps.push({
+          id: `fin-prise-charge-tr-${idx}`,
+          type: "modification",
+          label: "Prise en charge / terminer",
+          dateDebut: dateTransfertStr,
+          dateFin: dateTransfertStr,
+          dureeMinutes: 0,
+          commentaire: `${lastAssignedTechComment || `Équipe : ${tr.equipeDepart || equipe}`} • Fin de prise en charge avant transfert ${tr.vrCode}`,
+          automatique: true,
+        });
+      }
 
       transferSteps.push({
         id: `transfer-${idx}`,
         type: "travail",
         label: `Transfert ${tr.vrCode} (${tr.equipeDepart} → ${tr.equipeCible})`,
-        dateDebut: formatDateDisplay(tsDebut),
-        dateFin: tr.isAccepte ? formatDateDisplay(tsFin) : "En attente acceptation",
+        dateDebut: dateTransfertStr,
+        dateFin: tr.isAccepte ? formatDateDisplay(tsFin) : "En cours",
         dureeMinutes: diffMin,
-        commentaire: `Transféré le ${formatDateDisplay(tsDebut)} • ${tr.isAccepte ? "Accepté par " + (tr.acceptePar || "Équipe") : "En attente"}`,
+        commentaire: `Transféré le ${dateTransfertStr} • ${tr.isAccepte ? "Accepté par " + (tr.acceptePar || "Équipe") : "En attente"}`,
         automatique: true,
       });
     }
   });
 
   if (transferSteps.length === 0 && avancement.toLowerCase().startsWith("vr")) {
-    const tsModif = parseDateTimestamp(vehicle.dateModification);
+    const tsModif = parseDateTimestamp(vehicle.dateModification || (vehicle as any).dateHeureAvancement || (vehicle as any).dateAvancement);
     const tsDebutTransfer = tsModif > 0 ? tsModif : Date.now();
     const diffMin = workingMinutes(tsDebutTransfer, tsFinEffective);
+    const dateTransfertStr = formatDateDisplay(tsDebutTransfer);
+
+    const hasTerminerForTransfer = customSteps.some(
+      (s) =>
+        (s.label === "Prise en charge / terminer" || s.label?.toLowerCase() === "prise en charge / terminer") &&
+        (Math.abs((parseDateTimestamp(s.dateDebut) || 0) - tsDebutTransfer) < 120000 || s.dateDebut === dateTransfertStr)
+    );
+
+    if (!hasTerminerForTransfer) {
+      transferSteps.push({
+        id: "fin-prise-charge-vr-fallback",
+        type: "modification",
+        label: "Prise en charge / terminer",
+        dateDebut: dateTransfertStr,
+        dateFin: dateTransfertStr,
+        dureeMinutes: 0,
+        commentaire: `${lastAssignedTechComment || `Équipe : ${equipe}`} • Fin de prise en charge avant transfert ${avancement}`,
+        automatique: true,
+      });
+    }
+
     transferSteps.push({
       id: "transfer-active-auto",
       type: "travail",
       label: `Transfert ${avancement}`,
-      dateDebut: formatDateDisplay(tsDebutTransfer),
+      dateDebut: dateTransfertStr,
       dateFin: "En cours",
       dureeMinutes: diffMin,
-      commentaire: `Transfert ${avancement} initié le ${formatDateDisplay(tsDebutTransfer)}`,
+      commentaire: `Transfert ${avancement} initié le ${dateTransfertStr}`,
       automatique: true,
     });
   }
@@ -1121,22 +1184,59 @@ export function calculateVehicleTimes(
   steps.push(...modificationSteps);
 
   if (isTermine) {
+    const dateFinStr = formatDateDisplay(tsFinEffective);
+    const hasTerminerStep = customSteps.some(
+      (s) =>
+        (s.label === "Prise en charge / terminer" || s.label?.toLowerCase() === "prise en charge / terminer") &&
+        (Math.abs((parseDateTimestamp(s.dateDebut) || 0) - tsFinEffective) < 120000 || s.dateDebut === dateFinStr)
+    );
+
+    if (!hasTerminerStep) {
+      const tech = vehicle.technicien && vehicle.technicien !== "-" 
+        ? `${vehicle.technicien} ${vehicle.nomTechnicien || ""}`.trim() 
+        : (vehicle.nomTechnicien && vehicle.nomTechnicien !== "-" ? vehicle.nomTechnicien : "-");
+      steps.push({
+        id: "step-prise-en-charge-terminer",
+        type: "modification",
+        label: "Prise en charge / terminer",
+        dateDebut: dateFinStr,
+        dateFin: dateFinStr,
+        dureeMinutes: 0,
+        commentaire: `Équipe : ${equipe} • Technicien : ${tech} • Travaux terminés`,
+        automatique: true,
+      });
+    }
+
     steps.push({
       id: "step-fin",
       type: "fin",
       label: "Fin des travaux / Prêt",
-      dateDebut: formatDateDisplay(tsFinEffective),
+      dateDebut: dateFinStr,
       commentaire: `Temps de travail effectif net : ${formatMinutes(tempsTravailEffectifMin)}`,
       dureeMinutes: tempsTravailEffectifMin,
       automatique: true,
     });
   }
 
+  // Ordre de priorité si deux événements ont la même minute exacte
+  const getStepPriority = (step: VehicleTimeStep) => {
+    const label = (step.label || "").toLowerCase();
+    if (step.type === "reception") return 1;
+    if (step.type === "entree_equipe") return 2;
+    if (label.includes("prise en charge / affectation")) return 3;
+    if (step.type === "modification" && !label.includes("prise en charge / terminer")) return 4;
+    if (label.includes("prise en charge / terminer")) return 5;
+    if (label.startsWith("transfert") || step.id?.startsWith("transfer")) return 6;
+    if (step.type === "fin" || label.includes("fin des travaux")) return 7;
+    return 4;
+  };
+
   // Tri chronologique de l'ensemble des étapes
   steps.sort((a, b) => {
     const tsA = parseDateTimestamp(a.dateDebut);
     const tsB = parseDateTimestamp(b.dateDebut);
-    return tsA - tsB;
+    if (tsA !== tsB) return tsA - tsB;
+    return getStepPriority(a) - getStepPriority(b);
   });
 
   return {
@@ -1287,6 +1387,31 @@ export function recordAvancementStatusChange(
     const tsF = parseDateTimestamp(nowFormatted);
     if (tsD > 0 && tsF >= tsD) {
       lastOpenStep.dureeMinutes = getWorkshopWorkingMinutesBetween(tsD, tsF, vehicleWorksSaturday(vehicle as Partial<Flux> & Record<string, unknown>));
+    }
+  }
+
+  // Si transfert VR ou Terminer, enregistrer explicitement la fin de prise en charge
+  if (cleanAv.startsWith("vr") || cleanAv === "Terminer") {
+    const tech = vehicle.technicien && vehicle.technicien !== "-"
+      ? ` • Technicien : ${vehicle.technicien} ${vehicle.nomTechnicien || ""}`.trim()
+      : (vehicle.nomTechnicien && vehicle.nomTechnicien !== "-" ? ` • Technicien : ${vehicle.nomTechnicien}` : "");
+    const motif = cleanAv.startsWith("vr")
+      ? `Fin de prise en charge avant transfert ${cleanAv}`
+      : `Travaux terminés`;
+    const hasExistingTerminer = steps.some(
+      (s) => s.label === "Prise en charge / terminer" && s.dateDebut === nowFormatted
+    );
+    if (!hasExistingTerminer) {
+      steps.push({
+        id: `fin-prise-charge-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+        type: "modification",
+        label: "Prise en charge / terminer",
+        dateDebut: nowFormatted,
+        dateFin: nowFormatted,
+        dureeMinutes: 0,
+        commentaire: `Équipe : ${vehicle.equipe || "Atelier"}${tech} • ${motif}`,
+        automatique: true,
+      });
     }
   }
 

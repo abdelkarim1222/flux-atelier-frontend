@@ -18,6 +18,7 @@ import {
   Edit2,
   RefreshCcw,
   Gauge,
+  ArrowRightLeft,
 } from "lucide-react";
 import {
   calculateVehicleTimes,
@@ -797,9 +798,29 @@ export default function ChronoTimelineModal({
                   dotColor = "bg-violet-600";
                   Icon = Gauge;
                 } else if (step.type === "modification") {
-                  badgeColor = "bg-slate-100 text-slate-800 border-slate-300";
-                  dotColor = "bg-slate-600";
-                  Icon = Edit2;
+                  if (step.label.includes("Prise en charge / terminer") || step.label.toLowerCase() === "prise en charge / terminer") {
+                    badgeColor = "bg-emerald-100 text-emerald-800 border-emerald-300";
+                    dotColor = "bg-emerald-600";
+                    Icon = CheckCircle2;
+                  } else if (step.label.includes("Prise en charge / affectation")) {
+                    badgeColor = "bg-blue-100 text-blue-800 border-blue-300";
+                    dotColor = "bg-blue-600";
+                    Icon = Wrench;
+                  } else {
+                    badgeColor = "bg-slate-100 text-slate-800 border-slate-300";
+                    dotColor = "bg-slate-600";
+                    Icon = Edit2;
+                  }
+                } else if (step.type === "travail") {
+                  if (step.label.startsWith("Transfert") || step.label.includes("vr")) {
+                    badgeColor = "bg-amber-100 text-amber-800 border-amber-300";
+                    dotColor = "bg-amber-600";
+                    Icon = ArrowRightLeft;
+                  } else {
+                    badgeColor = "bg-slate-100 text-slate-800 border-slate-300";
+                    dotColor = "bg-slate-600";
+                    Icon = Clock;
+                  }
                 } else if (step.type === "fin") {
                   badgeColor = "bg-emerald-100 text-emerald-800 border-emerald-300";
                   dotColor = "bg-emerald-600";
@@ -823,7 +844,7 @@ export default function ChronoTimelineModal({
                             {step.label}
                           </span>
                           <span className="font-mono text-xs font-semibold text-slate-700">
-                            {step.dateDebut} {step.dateFin && `→ ${step.dateFin}`}
+                            {step.dateDebut} {step.dateFin && step.dateFin !== step.dateDebut && `→ ${step.dateFin}`}
                           </span>
                         </div>
 

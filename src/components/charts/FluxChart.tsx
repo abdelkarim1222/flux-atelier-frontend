@@ -10,7 +10,7 @@ export default function FluxTable() {
       </div>
 
       <div className="overflow-x-auto">
-        <table className="w-full text-left text-sm">
+        <table className="zebra-table w-full text-left text-sm">
           <thead className="bg-slate-50 text-slate-600">
             <tr>
               <th className="px-5 py-4">Date</th>

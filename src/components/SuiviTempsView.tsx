@@ -576,7 +576,7 @@ export default function SuiviTempsView({ userTeam }: SuiviTempsViewProps = {}) {
       {/* Main Table */}
       <div className="bg-white/95 backdrop-blur-md rounded-2xl border border-white/60 shadow-lg flex-1 flex flex-col min-h-[460px] overflow-hidden">
         <div className="overflow-x-auto flex-1">
-          <table className="w-full min-w-[1550px] text-left border-collapse text-xs">
+          <table className="zebra-table w-full min-w-[1550px] text-left border-collapse text-xs">
             <thead>
               <tr className="bg-slate-100/90 border-b border-slate-200 text-slate-600 font-bold uppercase tracking-wider text-[11px] select-none sticky top-0 z-10 backdrop-blur-md">
                 <th className="py-3 px-3.5 whitespace-nowrap">N° OR</th>

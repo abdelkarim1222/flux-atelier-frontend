@@ -12,6 +12,9 @@ import {
   FileCheck,
   Info,
   ArrowRight,
+  ShieldCheck,
+  Pencil,
+  RotateCcw,
 } from "lucide-react";
 import {
   type Flux,
@@ -20,8 +23,10 @@ import { isVehicleMatchingTeam } from "../config/teams";
 import {
   type FacturationNotification,
   type FacturationPaymentMode,
+  type AttFactureOption,
   getFacturationNotifications,
   validerPaiementFacturation,
+  reouvrirFacturationAdmin,
 } from "../services/database";
 import { useAuth } from "../context/AuthContext";
 
@@ -34,6 +39,11 @@ interface FacturationViewProps {
 }
 
 type FacturationTab = "en_attente" | "edition_fin_travaux" | "historique" | "tous";
+
+function createEngagementReglement(nomGarant: string): string {
+  const nom = nomGarant.trim();
+  return nom ? `M. ${nom} se porte garant du règlement de ladite facture.` : "";
+}
 
 export default function FacturationView({
   vehicles,
@@ -84,10 +94,54 @@ export default function FacturationView({
   const [inputNumeroBC, setInputNumeroBC] = useState("");
   const [inputNumeroEdition, setInputNumeroEdition] = useState("");
   const [inputCommentaire, setInputCommentaire] = useState("");
+  // "Att Facture" conserve le même mode de paiement, avec un choix
+  // complémentaire qui précise si un tiers garantit le règlement.
+  const [isAttFactureChoiceOpen, setIsAttFactureChoiceOpen] = useState(false);
+  const [attFactureOption, setAttFactureOption] = useState<AttFactureOption>("standard");
+  const [attFactureChoiceConfirmed, setAttFactureChoiceConfirmed] = useState(false);
+  const [nomGarant, setNomGarant] = useState("");
+  const [engagementReglement, setEngagementReglement] = useState("");
+  // Le sous-modal travaille sur un brouillon : Annuler ne modifie jamais le
+  // choix déjà confirmé dans le modal principal.
+  const [attFactureDraftOption, setAttFactureDraftOption] = useState<AttFactureOption>("standard");
+  const [attFactureDraftNomGarant, setAttFactureDraftNomGarant] = useState("");
+  const [attFactureDraftEngagement, setAttFactureDraftEngagement] = useState("");
+  const [modeBeforeAttFacture, setModeBeforeAttFacture] = useState<FacturationPaymentMode | null>(null);
+  const [attFactureChoiceError, setAttFactureChoiceError] = useState<string | null>(null);
 
   // Modal de régularisation Facture finale pour "Édition fin de travaux"
   const [regularisationItem, setRegularisationItem] = useState<FacturationNotification | null>(null);
   const [regularisationMode, setRegularisationMode] = useState<"Facture" | "Bon de commande">("Facture");
+
+  // Modal de modification / réouverture réservé exclusivement à l'Administration
+  const [adminEditItem, setAdminEditItem] = useState<{
+    noOr: string;
+    chassis: string;
+    immatriculation?: string;
+    marque?: string;
+    modele?: string;
+    client?: string;
+    equipe?: string;
+    technicien?: string;
+    modePaiement?: FacturationPaymentMode;
+    numeroFacture?: string;
+    numeroBC?: string;
+    numeroEdition?: string;
+    attFactureOption?: AttFactureOption;
+    nomGarant?: string;
+    engagementReglement?: string;
+    decisionPar?: string;
+    dateDecision?: string;
+  } | null>(null);
+
+  const [adminChosenMode, setAdminChosenMode] = useState<FacturationPaymentMode>("Facture");
+  const [adminNumeroFacture, setAdminNumeroFacture] = useState("");
+  const [adminNumeroBC, setAdminNumeroBC] = useState("");
+  const [adminNumeroEdition, setAdminNumeroEdition] = useState("");
+  const [adminAttFactureOption, setAdminAttFactureOption] = useState<AttFactureOption>("standard");
+  const [adminNomGarant, setAdminNomGarant] = useState("");
+  const [adminEngagementReglement, setAdminEngagementReglement] = useState("");
+  const [adminCommentaire, setAdminCommentaire] = useState("");
 
   // Écoute des mises à jour des notifications Facturation
   useEffect(() => {
@@ -166,6 +220,9 @@ export default function FacturationView({
       numeroFacture?: string;
       numeroBC?: string;
       numeroEdition?: string;
+      attFactureOption?: AttFactureOption;
+      nomGarant?: string;
+      engagementReglement?: string;
       statutFacturationFinale?: "non_facture" | "facture";
       dateDecision?: string;
       decisionPar?: string;
@@ -215,6 +272,9 @@ export default function FacturationView({
         numeroFacture: n.numeroFacture,
         numeroBC: n.numeroBC,
         numeroEdition: n.numeroEdition,
+        attFactureOption: n.attFactureOption,
+        nomGarant: n.nomGarant,
+        engagementReglement: n.engagementReglement,
         statutFacturationFinale: n.statutFacturationFinale,
         dateDecision: n.dateDecision,
         decisionPar: n.decisionPar,
@@ -260,6 +320,9 @@ export default function FacturationView({
         numeroFacture: vAny.numeroFacture as string | undefined,
         numeroBC: vAny.numeroBC as string | undefined,
         numeroEdition: vAny.numeroEdition as string | undefined,
+        attFactureOption: vAny.attFactureOption as AttFactureOption | undefined,
+        nomGarant: vAny.nomGarant as string | undefined,
+        engagementReglement: vAny.engagementReglement as string | undefined,
         statutFacturationFinale: vStatutFactFinale || (statutPaiement === "edition_fin_travaux" ? "non_facture" : undefined),
         dateDecision: vAny.dateValidationFacturation as string | undefined,
         decisionPar: vAny.facturationValideePar as string | undefined,
@@ -357,13 +420,92 @@ export default function FacturationView({
     setInputNumeroBC("");
     setInputNumeroEdition("");
     setInputCommentaire("");
+    setIsAttFactureChoiceOpen(false);
+    setAttFactureOption("standard");
+    setAttFactureChoiceConfirmed(false);
+    setNomGarant("");
+    setEngagementReglement("");
+    setAttFactureDraftOption("standard");
+    setAttFactureDraftNomGarant("");
+    setAttFactureDraftEngagement("");
+    setModeBeforeAttFacture(null);
+    setAttFactureChoiceError(null);
     setError(null);
+  };
+
+  const handleOpenAttFactureChoice = (fromModeSelection = false) => {
+    const isAlreadyAttFacture = chosenMode === "Att Facture" || chosenMode === "Édition fin de travaux";
+    if (fromModeSelection && !isAlreadyAttFacture) {
+      setModeBeforeAttFacture(chosenMode);
+      setChosenMode("Att Facture");
+      setAttFactureChoiceConfirmed(false);
+      setAttFactureDraftOption("standard");
+      setAttFactureDraftNomGarant("");
+      setAttFactureDraftEngagement("");
+    } else {
+      setModeBeforeAttFacture(null);
+      setAttFactureDraftOption(attFactureOption);
+      setAttFactureDraftNomGarant(nomGarant);
+      setAttFactureDraftEngagement(engagementReglement);
+    }
+    setIsAttFactureChoiceOpen(true);
+    setAttFactureChoiceError(null);
+  };
+
+  const handleCancelAttFactureChoice = () => {
+    setIsAttFactureChoiceOpen(false);
+    setAttFactureChoiceError(null);
+    if (modeBeforeAttFacture) {
+      setChosenMode(modeBeforeAttFacture);
+      setAttFactureChoiceConfirmed(false);
+    }
+    setModeBeforeAttFacture(null);
+  };
+
+  const handleGuaranteeNameChange = (value: string) => {
+    const previousGeneratedText = createEngagementReglement(attFactureDraftNomGarant);
+    setAttFactureDraftNomGarant(value);
+    setAttFactureDraftEngagement((previous) =>
+      !previous.trim() || previous === previousGeneratedText
+        ? createEngagementReglement(value)
+        : previous
+    );
+  };
+
+  const handleConfirmAttFactureChoice = () => {
+    if (attFactureDraftOption === "garant") {
+      if (!attFactureDraftNomGarant.trim()) {
+        setAttFactureChoiceError("Le nom du garant est obligatoire.");
+        return;
+      }
+      if (!attFactureDraftEngagement.trim()) {
+        setAttFactureChoiceError("La déclaration de garantie est obligatoire.");
+        return;
+      }
+    }
+    setAttFactureOption(attFactureDraftOption);
+    setNomGarant(attFactureDraftOption === "garant" ? attFactureDraftNomGarant.trim() : "");
+    setEngagementReglement(attFactureDraftOption === "garant" ? attFactureDraftEngagement.trim() : "");
+    setAttFactureChoiceConfirmed(true);
+    setIsAttFactureChoiceOpen(false);
+    setModeBeforeAttFacture(null);
+    setAttFactureChoiceError(null);
   };
 
   // Soumission de la validation du mode de paiement
   const handleSubmitPayment = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!selectedVehicleForPayment) return;
+    if (chosenMode === "Att Facture" && !attFactureChoiceConfirmed) {
+      setError("Choisissez d’abord la condition « Att Facture » ou « Garantie de règlement ».");
+      setIsAttFactureChoiceOpen(true);
+      return;
+    }
+    if (chosenMode === "Att Facture" && attFactureOption === "garant" && (!nomGarant.trim() || !engagementReglement.trim())) {
+      setError("Le nom du garant et sa déclaration de règlement sont obligatoires.");
+      setIsAttFactureChoiceOpen(true);
+      return;
+    }
     setIsSubmitting(true);
     setError(null);
     setNotice(null);
@@ -379,6 +521,12 @@ export default function FacturationView({
         numeroBC: inputNumeroBC.trim(),
         numeroEdition: inputNumeroEdition.trim(),
         commentaire: inputCommentaire.trim(),
+        attFactureOption: chosenMode === "Att Facture" ? attFactureOption : undefined,
+        nomGarant: chosenMode === "Att Facture" && attFactureOption === "garant" ? nomGarant.trim() : undefined,
+        engagementReglement:
+          chosenMode === "Att Facture" && attFactureOption === "garant"
+            ? engagementReglement.trim()
+            : undefined,
         validePar: userName,
         equipe: selectedVehicleForPayment.equipe,
         client: selectedVehicleForPayment.client,
@@ -387,8 +535,11 @@ export default function FacturationView({
 
       if (chosenMode === "Att Facture" || chosenMode === "Édition fin de travaux") {
         setActiveSubTab("edition_fin_travaux");
+        const condition = attFactureOption === "garant"
+          ? ` L’engagement de ${nomGarant.trim()} est enregistré.`
+          : "";
         setNotice(
-          `✅ OR ${selectedVehicleForPayment.noOr} transféré à la Réception en « Attente Client ». Il reste dans « Att Facture » jusqu'au règlement de fin de mois.`
+          `✅ OR ${selectedVehicleForPayment.noOr} transféré à la Réception en « Attente Client ». Il reste dans « Att Facture » jusqu'au règlement de fin de mois.${condition}`
         );
       } else {
         setActiveSubTab("historique");
@@ -436,6 +587,106 @@ export default function FacturationView({
       if (onRefresh) onRefresh();
     } catch (err) {
       setError(err instanceof Error ? err.message : "Erreur lors de l'enregistrement de la facture.");
+    } finally {
+      setIsSubmitting(false);
+    }
+  };
+
+  const handleOpenAdminEditModal = (item: {
+    noOr: string;
+    chassis: string;
+    immatriculation?: string;
+    marque?: string;
+    modele?: string;
+    client?: string;
+    equipe?: string;
+    technicien?: string;
+    modePaiement?: FacturationPaymentMode;
+    numeroFacture?: string;
+    numeroBC?: string;
+    numeroEdition?: string;
+    attFactureOption?: AttFactureOption;
+    nomGarant?: string;
+    engagementReglement?: string;
+    decisionPar?: string;
+    dateDecision?: string;
+  }) => {
+    setAdminEditItem(item);
+    setAdminChosenMode(item.modePaiement || "Facture");
+    setAdminNumeroFacture(item.numeroFacture || "");
+    setAdminNumeroBC(item.numeroBC || "");
+    setAdminNumeroEdition(item.numeroEdition || "");
+    setAdminAttFactureOption(item.attFactureOption || "standard");
+    setAdminNomGarant(item.nomGarant || "");
+    setAdminEngagementReglement(item.engagementReglement || "");
+    setAdminCommentaire("");
+    setError(null);
+  };
+
+  const handleAdminSubmitModify = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!adminEditItem) return;
+    if (adminChosenMode === "Att Facture" && adminAttFactureOption === "garant" && (!adminNomGarant.trim() || !adminEngagementReglement.trim())) {
+      setError("Le nom du garant et sa déclaration de règlement sont obligatoires.");
+      return;
+    }
+    setIsSubmitting(true);
+    setError(null);
+    setNotice(null);
+
+    const userName = currentUser?.name || currentUser?.email || "Administration";
+
+    try {
+      const res = await reouvrirFacturationAdmin({
+        noOr: adminEditItem.noOr,
+        chassis: adminEditItem.chassis,
+        actionType: "modify",
+        modePaiement: adminChosenMode,
+        numeroFacture: adminNumeroFacture.trim(),
+        numeroBC: adminNumeroBC.trim(),
+        numeroEdition: adminNumeroEdition.trim(),
+        attFactureOption: adminChosenMode === "Att Facture" ? adminAttFactureOption : undefined,
+        nomGarant: adminChosenMode === "Att Facture" && adminAttFactureOption === "garant" ? adminNomGarant.trim() : undefined,
+        engagementReglement: adminChosenMode === "Att Facture" && adminAttFactureOption === "garant" ? adminEngagementReglement.trim() : undefined,
+        commentaire: adminCommentaire.trim(),
+        modifiePar: userName,
+      });
+
+      setNotice(res.message || `Mode de paiement du dossier ${adminEditItem.noOr} modifié avec succès vers [${adminChosenMode}].`);
+      setAdminEditItem(null);
+      if (onRefresh) onRefresh();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Erreur lors de la modification du mode de paiement.");
+    } finally {
+      setIsSubmitting(false);
+    }
+  };
+
+  const handleAdminSubmitReopen = async () => {
+    if (!adminEditItem) return;
+    if (!window.confirm(`Êtes-vous sûr de vouloir réouvrir la facture du dossier ${adminEditItem.noOr} ?\nLe dossier sera remis en statut « En attente de paiement » pour être retraité.`)) {
+      return;
+    }
+    setIsSubmitting(true);
+    setError(null);
+    setNotice(null);
+
+    const userName = currentUser?.name || currentUser?.email || "Administration";
+
+    try {
+      const res = await reouvrirFacturationAdmin({
+        noOr: adminEditItem.noOr,
+        chassis: adminEditItem.chassis,
+        actionType: "reopen",
+        modifiePar: userName,
+      });
+
+      setNotice(res.message || `Facture du dossier ${adminEditItem.noOr} réouverte : remis en attente de paiement.`);
+      setAdminEditItem(null);
+      setActiveSubTab("en_attente");
+      if (onRefresh) onRefresh();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Erreur lors de la réouverture de la facture.");
     } finally {
       setIsSubmitting(false);
     }
@@ -756,7 +1007,7 @@ export default function FacturationView({
 
         {/* Table Content */}
         <div className="overflow-x-auto flex-1">
-          <table className="w-full text-left border-collapse">
+          <table className="zebra-table w-full text-left border-collapse">
             <thead>
               <tr className="bg-slate-100/80 border-b border-slate-200 text-[11px] font-extrabold text-slate-600 uppercase tracking-wider">
                 <th className="py-3 px-4">N° OR & Châssis</th>
@@ -878,6 +1129,15 @@ export default function FacturationView({
                                 <FileText className="w-3 h-3 text-orange-600" />
                                 Att Facture
                               </span>
+                              {item.attFactureOption === "garant" && (
+                                <span
+                                  className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-extrabold bg-violet-100 text-violet-900 border border-violet-300"
+                                  title={item.engagementReglement || "Engagement de règlement enregistré"}
+                                >
+                                  <ShieldCheck className="w-3 h-3 text-violet-700" />
+                                  Garant{item.nomGarant ? ` : ${item.nomGarant}` : ""}
+                                </span>
+                              )}
                               {item.etatVehicule && (
                                 <span
                                   className={`text-[9px] font-bold px-1.5 py-0.2 rounded border ${
@@ -931,42 +1191,68 @@ export default function FacturationView({
                         )}
 
                         {isEFTNonFacture && (
-                          <button
-                            type="button"
-                            onClick={() => {
-                              if (item.rawNotif) {
-                                setRegularisationItem(item.rawNotif);
-                              } else {
-                                setRegularisationItem({
-                                  id: `facturation_${item.noOr}_${item.chassis}`,
-                                  noOr: item.noOr,
-                                  chassis: item.chassis,
-                                  immatriculation: item.immatriculation,
-                                  marque: item.marque,
-                                  modele: item.modele,
-                                  nomClient: item.client,
-                                  equipe: item.equipe,
-                                  technicien: item.technicien,
-                                  dateFinTravaux: item.dateFinTravaux,
-                                  statutPaiement: "edition_fin_travaux",
-                                  modePaiement: "Att Facture",
-                                  statutFacturationFinale: "non_facture",
-                                  createdAt: Date.now(),
-                                });
-                              }
-                              setRegularisationMode("Facture");
-                            }}
-                            className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-xs font-black text-white bg-gradient-to-r from-orange-600 to-rose-600 hover:from-orange-700 hover:to-rose-700 shadow-sm hover:shadow transition-all cursor-pointer"
-                          >
-                            <FileCheck className="w-3.5 h-3.5" />
-                            <span>Facturer (Régulariser)</span>
-                          </button>
+                          <div className="flex items-center justify-end gap-2 flex-wrap">
+                            <button
+                              type="button"
+                              onClick={() => {
+                                if (item.rawNotif) {
+                                  setRegularisationItem(item.rawNotif);
+                                } else {
+                                  setRegularisationItem({
+                                    id: `facturation_${item.noOr}_${item.chassis}`,
+                                    noOr: item.noOr,
+                                    chassis: item.chassis,
+                                    immatriculation: item.immatriculation,
+                                    marque: item.marque,
+                                    modele: item.modele,
+                                    nomClient: item.client,
+                                    equipe: item.equipe,
+                                    technicien: item.technicien,
+                                    dateFinTravaux: item.dateFinTravaux,
+                                    statutPaiement: "edition_fin_travaux",
+                                    modePaiement: "Att Facture",
+                                    statutFacturationFinale: "non_facture",
+                                    createdAt: Date.now(),
+                                  });
+                                }
+                                setRegularisationMode("Facture");
+                              }}
+                              className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-xs font-black text-white bg-gradient-to-r from-orange-600 to-rose-600 hover:from-orange-700 hover:to-rose-700 shadow-sm hover:shadow transition-all cursor-pointer"
+                            >
+                              <FileCheck className="w-3.5 h-3.5" />
+                              <span>Facturer (Régulariser)</span>
+                            </button>
+                            {isAdministration && (
+                              <button
+                                type="button"
+                                onClick={() => handleOpenAdminEditModal(item)}
+                                className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-xl text-xs font-bold text-amber-900 bg-amber-100 hover:bg-amber-200 border border-amber-300 transition-all cursor-pointer shadow-2xs active:scale-95"
+                                title="Modifier le mode de paiement ou réouvrir la facture (Réservé Administration)"
+                              >
+                                <Pencil className="w-3 h-3 text-amber-700" />
+                                <span>Modifier / Réouvrir</span>
+                              </button>
+                            )}
+                          </div>
                         )}
 
                         {isSolde && (
-                          <div className="inline-flex items-center gap-1 text-[11px] text-slate-500 font-medium">
-                            <Check className="w-3.5 h-3.5 text-emerald-600" />
-                            <span>Validé par {item.decisionPar || "Facturation"}</span>
+                          <div className="flex items-center justify-end gap-2 flex-wrap">
+                            <div className="inline-flex items-center gap-1 text-[11px] text-slate-500 font-medium">
+                              <Check className="w-3.5 h-3.5 text-emerald-600" />
+                              <span>Validé par {item.decisionPar || "Facturation"}</span>
+                            </div>
+                            {isAdministration && (
+                              <button
+                                type="button"
+                                onClick={() => handleOpenAdminEditModal(item)}
+                                className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg text-xs font-bold text-amber-900 bg-amber-100 hover:bg-amber-200 border border-amber-300 transition-all cursor-pointer shadow-2xs active:scale-95"
+                                title="Modifier le mode de paiement ou réouvrir la facture (Réservé Administration)"
+                              >
+                                <Pencil className="w-3 h-3 text-amber-700" />
+                                <span>Modifier / Réouvrir</span>
+                              </button>
+                            )}
                           </div>
                         )}
                       </td>
@@ -988,7 +1274,13 @@ export default function FacturationView({
             if (e.target === e.currentTarget && !isSubmitting) setSelectedVehicleForPayment(null);
           }}
         >
-          <div className="bg-white rounded-3xl shadow-2xl w-full max-w-lg overflow-hidden animate-in fade-in zoom-in-95 duration-200 border border-slate-200">
+          <div
+            className="bg-white rounded-3xl shadow-2xl w-full max-w-lg overflow-hidden animate-in fade-in zoom-in-95 duration-200 border border-slate-200"
+            role="dialog"
+            aria-modal={!isAttFactureChoiceOpen}
+            aria-hidden={isAttFactureChoiceOpen || undefined}
+            aria-labelledby="payment-modal-title"
+          >
             {/* Header */}
             <div className="bg-gradient-to-r from-amber-500 via-orange-500 to-amber-600 px-6 py-5 flex items-center justify-between text-white">
               <div className="flex items-center gap-3">
@@ -996,7 +1288,7 @@ export default function FacturationView({
                   <Receipt className="w-6 h-6" />
                 </div>
                 <div>
-                  <h2 className="text-base font-black leading-tight">
+                  <h2 id="payment-modal-title" className="text-base font-black leading-tight">
                     Validation du Mode de Paiement
                   </h2>
                   <p className="text-amber-100 text-xs font-medium">
@@ -1056,7 +1348,11 @@ export default function FacturationView({
                         name="modePaiement"
                         value="Facture"
                         checked={chosenMode === "Facture"}
-                        onChange={() => setChosenMode("Facture")}
+                        onChange={() => {
+                          setChosenMode("Facture");
+                          setIsAttFactureChoiceOpen(false);
+                          setAttFactureChoiceConfirmed(false);
+                        }}
                         className="mt-1 text-emerald-600 focus:ring-emerald-500 cursor-pointer"
                       />
                       <div className="flex-1 min-w-0">
@@ -1087,7 +1383,11 @@ export default function FacturationView({
                         name="modePaiement"
                         value="Bon de commande"
                         checked={chosenMode === "Bon de commande"}
-                        onChange={() => setChosenMode("Bon de commande")}
+                        onChange={() => {
+                          setChosenMode("Bon de commande");
+                          setIsAttFactureChoiceOpen(false);
+                          setAttFactureChoiceConfirmed(false);
+                        }}
                         className="mt-1 text-blue-600 focus:ring-blue-500 cursor-pointer"
                       />
                       <div className="flex-1 min-w-0">
@@ -1118,7 +1418,7 @@ export default function FacturationView({
                         name="modePaiement"
                         value="Att Facture"
                         checked={chosenMode === "Att Facture" || chosenMode === "Édition fin de travaux"}
-                        onChange={() => setChosenMode("Att Facture")}
+                        onChange={() => handleOpenAttFactureChoice(true)}
                         className="mt-1 text-orange-600 focus:ring-orange-500 cursor-pointer"
                       />
                       <div className="flex-1 min-w-0">
@@ -1134,6 +1434,21 @@ export default function FacturationView({
                       </div>
                     </div>
                   </label>
+
+                  {chosenMode === "Att Facture" && (
+                    <button
+                      type="button"
+                      onClick={() => handleOpenAttFactureChoice()}
+                      className="ml-1 inline-flex items-center gap-1.5 text-[11px] font-bold text-orange-800 hover:text-orange-950 underline underline-offset-2 cursor-pointer"
+                    >
+                      <ShieldCheck className="w-3.5 h-3.5" />
+                      {attFactureChoiceConfirmed
+                        ? attFactureOption === "garant"
+                          ? "Modifier la garantie de règlement"
+                          : "Modifier la condition Att Facture"
+                        : "Choisir la condition Att Facture"}
+                    </button>
+                  )}
                 </div>
               </div>
 
@@ -1177,6 +1492,29 @@ export default function FacturationView({
                   <p className="text-[11px] text-orange-900 leading-snug">
                     Ce dossier est envoyé à la Réception en <strong>« Attente Client »</strong> pour livraison au client. Il reste dans l'onglet <strong>« Att Facture »</strong> jusqu'au règlement final.
                   </p>
+                  {attFactureChoiceConfirmed ? (
+                    <div className="rounded-lg border border-orange-200 bg-white/80 px-2.5 py-2 text-[11px] text-orange-950">
+                      {attFactureOption === "garant" ? (
+                        <div className="flex gap-1.5">
+                          <ShieldCheck className="mt-0.5 h-3.5 w-3.5 shrink-0 text-violet-700" />
+                          <span>
+                            <strong>Garantie de règlement — {nomGarant.trim()}</strong>
+                            <span className="block mt-0.5 text-orange-800">{engagementReglement}</span>
+                          </span>
+                        </div>
+                      ) : (
+                        <span><strong>Condition choisie :</strong> Att Facture.</span>
+                      )}
+                    </div>
+                  ) : (
+                    <button
+                      type="button"
+                      onClick={() => handleOpenAttFactureChoice()}
+                      className="w-full rounded-lg border border-dashed border-orange-300 bg-white/70 px-3 py-2 text-left text-[11px] font-bold text-orange-800 hover:bg-white cursor-pointer"
+                    >
+                      Choisir la condition de sortie : Att Facture ou garantie de règlement
+                    </button>
+                  )}
                   <div>
                     <label className="block text-xs font-bold text-orange-950 mb-1">
                       N° Document / Réf provisoire (optionnel) :
@@ -1226,6 +1564,170 @@ export default function FacturationView({
                 </button>
               </div>
             </form>
+          </div>
+        </div>
+      )}
+
+      {/* MODAL 1B : Condition particulière pour Att Facture */}
+      {selectedVehicleForPayment && isAttFactureChoiceOpen && (
+        <div
+          className="fixed inset-0 z-[1000] flex items-center justify-center p-4"
+          style={{ backgroundColor: "rgba(15,23,42,0.58)", backdropFilter: "blur(4px)" }}
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="att-facture-choice-title"
+          tabIndex={-1}
+          onClick={(event) => {
+            if (event.target === event.currentTarget && !isSubmitting) handleCancelAttFactureChoice();
+          }}
+          onKeyDown={(event) => {
+            if (event.key === "Escape" && !isSubmitting) handleCancelAttFactureChoice();
+          }}
+        >
+          <div className="w-full max-w-md overflow-hidden rounded-3xl border border-violet-200 bg-white shadow-2xl animate-in fade-in zoom-in-95 duration-200">
+            <div className="flex items-center justify-between bg-gradient-to-r from-violet-700 to-indigo-700 px-6 py-5 text-white">
+              <div className="flex items-center gap-3">
+                <div className="flex h-10 w-10 items-center justify-center rounded-2xl bg-white/20 backdrop-blur-xs">
+                  <ShieldCheck className="h-6 w-6" />
+                </div>
+                <div>
+                  <h2 id="att-facture-choice-title" className="text-base font-black leading-tight">Condition « Att Facture »</h2>
+                  <p className="text-xs font-medium text-violet-100">
+                    OR <strong className="font-mono text-white">{selectedVehicleForPayment.noOr}</strong>
+                  </p>
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={handleCancelAttFactureChoice}
+                disabled={isSubmitting}
+                className="flex h-8 w-8 items-center justify-center rounded-xl bg-white/20 font-bold text-white transition-colors hover:bg-white/30 disabled:opacity-50 cursor-pointer"
+                aria-label="Fermer le choix Att Facture"
+              >
+                ×
+              </button>
+            </div>
+
+            <div className="space-y-3 p-6">
+              <p className="text-xs font-medium leading-relaxed text-slate-600">
+                Choisissez la condition qui justifie la sortie du véhicule. Le dossier restera en suivi Facturation jusqu’au règlement final.
+              </p>
+
+              <label
+                className={`w-full rounded-2xl border-2 p-3.5 text-left transition-all cursor-pointer ${
+                  attFactureDraftOption === "standard"
+                    ? "border-orange-500 bg-orange-50 shadow-xs"
+                    : "border-slate-200 hover:border-orange-300 hover:bg-slate-50"
+                }`}
+              >
+                <span className="flex items-start gap-3">
+                  <input
+                    type="radio"
+                    name="attFactureOption"
+                    checked={attFactureDraftOption === "standard"}
+                    onChange={() => {
+                      setAttFactureDraftOption("standard");
+                      setAttFactureChoiceError(null);
+                    }}
+                    className="mt-0.5 text-orange-600 focus:ring-orange-500"
+                  />
+                  <span>
+                    <span className="block text-xs font-black text-orange-950">1. Att Facture</span>
+                    <span className="mt-0.5 block text-[11px] leading-snug text-slate-600">
+                      La facture est attendue ; aucun garant nominatif n’est ajouté au dossier.
+                    </span>
+                  </span>
+                </span>
+              </label>
+
+              <label
+                className={`w-full rounded-2xl border-2 p-3.5 text-left transition-all cursor-pointer ${
+                  attFactureDraftOption === "garant"
+                    ? "border-violet-500 bg-violet-50 shadow-xs"
+                    : "border-slate-200 hover:border-violet-300 hover:bg-slate-50"
+                }`}
+              >
+                <span className="flex items-start gap-3">
+                  <input
+                    type="radio"
+                    name="attFactureOption"
+                    checked={attFactureDraftOption === "garant"}
+                    onChange={() => {
+                      setAttFactureDraftOption("garant");
+                      setAttFactureChoiceError(null);
+                    }}
+                    className="mt-0.5 text-violet-600 focus:ring-violet-500"
+                  />
+                  <span>
+                    <span className="flex items-center gap-1.5 text-xs font-black text-violet-950">
+                      <ShieldCheck className="h-4 w-4 text-violet-700" />
+                      2. Garantie de règlement
+                    </span>
+                    <span className="mt-0.5 block text-[11px] leading-snug text-slate-600">
+                      Une personne est désignée comme garante du règlement de la facture.
+                    </span>
+                  </span>
+                </span>
+              </label>
+
+              {attFactureDraftOption === "garant" && (
+                <div className="space-y-3 rounded-2xl border border-violet-200 bg-violet-50/70 p-3.5">
+                  <div>
+                    <label htmlFor="nom-garant" className="mb-1 block text-xs font-bold text-violet-950">
+                      Nom du garant *
+                    </label>
+                    <input
+                      id="nom-garant"
+                      type="text"
+                      autoFocus
+                      placeholder="Ex. Untel"
+                      value={attFactureDraftNomGarant}
+                      onChange={(event) => handleGuaranteeNameChange(event.target.value)}
+                      className="w-full rounded-lg border border-violet-300 bg-white px-3 py-2 text-xs font-semibold text-violet-950 outline-none focus:ring-2 focus:ring-violet-400"
+                    />
+                  </div>
+                  <div>
+                    <label htmlFor="engagement-reglement" className="mb-1 block text-xs font-bold text-violet-950">
+                      Déclaration de garantie *
+                    </label>
+                    <textarea
+                      id="engagement-reglement"
+                      rows={3}
+                      value={attFactureDraftEngagement}
+                      onChange={(event) => setAttFactureDraftEngagement(event.target.value)}
+                      placeholder="M. Untel se porte garant du règlement de ladite facture."
+                      className="w-full resize-y rounded-lg border border-violet-300 bg-white px-3 py-2 text-xs font-medium leading-relaxed text-violet-950 outline-none focus:ring-2 focus:ring-violet-400"
+                    />
+                  </div>
+                </div>
+              )}
+
+              {attFactureChoiceError && (
+                <p role="alert" className="rounded-lg border border-rose-200 bg-rose-50 px-3 py-2 text-xs font-semibold text-rose-700">
+                  {attFactureChoiceError}
+                </p>
+              )}
+
+              <div className="flex items-center justify-end gap-2.5 pt-1">
+                <button
+                  type="button"
+                  onClick={handleCancelAttFactureChoice}
+                  disabled={isSubmitting}
+                  className="rounded-xl bg-slate-100 px-4 py-2 text-xs font-bold text-slate-600 transition-colors hover:bg-slate-200 disabled:opacity-50 cursor-pointer"
+                >
+                  Annuler
+                </button>
+                <button
+                  type="button"
+                  onClick={handleConfirmAttFactureChoice}
+                  disabled={isSubmitting}
+                  className="inline-flex items-center gap-2 rounded-xl bg-gradient-to-r from-violet-700 to-indigo-700 px-5 py-2 text-xs font-black text-white shadow-sm transition-all hover:from-violet-800 hover:to-indigo-800 disabled:opacity-50 cursor-pointer"
+                >
+                  <Check className="h-3.5 w-3.5" />
+                  Confirmer le choix
+                </button>
+              </div>
+            </div>
           </div>
         </div>
       )}
@@ -1299,6 +1801,301 @@ export default function FacturationView({
                 </button>
               </div>
             </form>
+          </div>
+        </div>
+      )}
+
+      {/* MODAL 3 : Modification / Réouverture Facturation — Réservé exclusivement à l'Administration */}
+      {isAdministration && adminEditItem && (
+        <div
+          className="fixed inset-0 z-[999] flex items-center justify-center p-4 overflow-y-auto"
+          style={{ backgroundColor: "rgba(0,0,0,0.65)", backdropFilter: "blur(4px)" }}
+          onClick={(e) => {
+            if (e.target === e.currentTarget && !isSubmitting) setAdminEditItem(null);
+          }}
+        >
+          <div className="bg-white rounded-3xl shadow-2xl w-full max-w-lg overflow-hidden animate-in fade-in zoom-in-95 duration-200 border border-slate-200 my-8">
+            {/* Modal Header */}
+            <div className="bg-gradient-to-r from-amber-600 via-orange-600 to-rose-600 px-6 py-4 flex items-center justify-between text-white">
+              <div className="flex items-center gap-3">
+                <div className="w-10 h-10 rounded-2xl bg-white/20 flex items-center justify-center text-white backdrop-blur-xs">
+                  <ShieldCheck className="w-6 h-6" />
+                </div>
+                <div>
+                  <div className="flex items-center gap-2">
+                    <h2 className="text-base font-black leading-tight">
+                      Modifier / Réouvrir le Règlement
+                    </h2>
+                    <span className="px-2 py-0.5 rounded-full text-[10px] font-black bg-white/25 text-white border border-white/30">
+                      🔒 Administration
+                    </span>
+                  </div>
+                  <p className="text-amber-100 text-xs font-medium">
+                    OR : <strong className="font-mono font-bold text-white">{adminEditItem.noOr}</strong> • Châssis : <strong className="font-mono text-white">{adminEditItem.chassis}</strong>
+                  </p>
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={() => setAdminEditItem(null)}
+                disabled={isSubmitting}
+                className="w-8 h-8 rounded-xl bg-white/20 hover:bg-white/30 flex items-center justify-center text-white font-bold transition-colors cursor-pointer"
+              >
+                ×
+              </button>
+            </div>
+
+            {/* Recap Card */}
+            <div className="px-6 pt-3 pb-2.5 bg-slate-50/90 border-b border-slate-200 flex items-center justify-between text-xs">
+              <div>
+                <span className="text-slate-500 font-medium">Client : </span>
+                <strong className="text-slate-800">{adminEditItem.client || "Client non renseigné"}</strong>
+                {adminEditItem.modele && (
+                  <span className="text-slate-500 ml-1.5">({adminEditItem.marque} {adminEditItem.modele})</span>
+                )}
+              </div>
+              <div className="text-right">
+                <span className="text-slate-500">Mode actuel : </span>
+                <span className="inline-block px-2 py-0.5 rounded-full text-[10px] font-extrabold bg-amber-100 text-amber-900 border border-amber-300">
+                  {adminEditItem.modePaiement || "Non défini"}
+                </span>
+              </div>
+            </div>
+
+            {/* Modal Body */}
+            <div className="p-6 space-y-5">
+              {/* Option 1 : Modifier le mode de paiement */}
+              <form onSubmit={handleAdminSubmitModify} className="space-y-4">
+                <div>
+                  <label className="block text-xs font-black text-slate-800 uppercase tracking-wider mb-1.5">
+                    1. Modifier le mode de paiement & références
+                  </label>
+                  <p className="text-[11px] text-slate-500 mb-3">
+                    Modifiez le mode de paiement validé ou mettez à jour le numéro de Facture / Bon de commande.
+                  </p>
+
+                  {/* Mode Selector */}
+                  <div className="grid grid-cols-3 gap-2">
+                    <button
+                      type="button"
+                      onClick={() => setAdminChosenMode("Facture")}
+                      className={`p-2.5 rounded-xl border text-center transition-all cursor-pointer ${
+                        adminChosenMode === "Facture"
+                          ? "bg-emerald-50 border-emerald-500 text-emerald-950 font-bold ring-2 ring-emerald-400/20 shadow-xs"
+                          : "bg-white border-slate-200 text-slate-600 hover:bg-slate-50"
+                      }`}
+                    >
+                      <div className="text-base mb-0.5">📄</div>
+                      <div className="text-xs font-bold leading-tight">Facture</div>
+                    </button>
+
+                    <button
+                      type="button"
+                      onClick={() => setAdminChosenMode("Bon de commande")}
+                      className={`p-2.5 rounded-xl border text-center transition-all cursor-pointer ${
+                        adminChosenMode === "Bon de commande"
+                          ? "bg-blue-50 border-blue-500 text-blue-950 font-bold ring-2 ring-blue-400/20 shadow-xs"
+                          : "bg-white border-slate-200 text-slate-600 hover:bg-slate-50"
+                      }`}
+                    >
+                      <div className="text-base mb-0.5">📋</div>
+                      <div className="text-xs font-bold leading-tight">Bon de commande</div>
+                    </button>
+
+                    <button
+                      type="button"
+                      onClick={() => setAdminChosenMode("Att Facture")}
+                      className={`p-2.5 rounded-xl border text-center transition-all cursor-pointer ${
+                        adminChosenMode === "Att Facture"
+                          ? "bg-orange-50 border-orange-500 text-orange-950 font-bold ring-2 ring-orange-400/20 shadow-xs"
+                          : "bg-white border-slate-200 text-slate-600 hover:bg-slate-50"
+                      }`}
+                    >
+                      <div className="text-base mb-0.5">📑</div>
+                      <div className="text-xs font-bold leading-tight">Att Facture</div>
+                    </button>
+                  </div>
+                </div>
+
+                {/* Conditional Inputs */}
+                {adminChosenMode === "Facture" && (
+                  <div>
+                    <label className="block text-xs font-bold text-slate-700 mb-1">
+                      N° Facture
+                    </label>
+                    <input
+                      type="text"
+                      placeholder="Ex. FAC-2026-00123"
+                      value={adminNumeroFacture}
+                      onChange={(e) => setAdminNumeroFacture(e.target.value)}
+                      className="w-full px-3 py-2 bg-slate-50 rounded-lg border border-slate-200 text-xs font-semibold text-slate-800 placeholder:text-slate-400 focus:outline-none focus:border-emerald-500 focus:bg-white"
+                    />
+                  </div>
+                )}
+
+                {adminChosenMode === "Bon de commande" && (
+                  <div>
+                    <label className="block text-xs font-bold text-slate-700 mb-1">
+                      N° Bon de commande
+                    </label>
+                    <input
+                      type="text"
+                      placeholder="Ex. BC-45892"
+                      value={adminNumeroBC}
+                      onChange={(e) => setAdminNumeroBC(e.target.value)}
+                      className="w-full px-3 py-2 bg-slate-50 rounded-lg border border-slate-200 text-xs font-semibold text-slate-800 placeholder:text-slate-400 focus:outline-none focus:border-blue-500 focus:bg-white"
+                    />
+                  </div>
+                )}
+
+                {adminChosenMode === "Att Facture" && (
+                  <div className="space-y-3 bg-orange-50/60 p-3.5 rounded-xl border border-orange-200/80">
+                    <div>
+                      <label className="block text-xs font-bold text-orange-950 mb-1">
+                        N° Édition fin de travaux / Devis (optionnel)
+                      </label>
+                      <input
+                        type="text"
+                        placeholder="Ex. EFT-2026-0098"
+                        value={adminNumeroEdition}
+                        onChange={(e) => setAdminNumeroEdition(e.target.value)}
+                        className="w-full px-3 py-2 bg-white rounded-lg border border-orange-200 text-xs font-semibold text-slate-800 placeholder:text-slate-400 focus:outline-none focus:border-orange-500"
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-xs font-bold text-orange-950 mb-1.5">
+                        Condition Att Facture
+                      </label>
+                      <div className="grid grid-cols-2 gap-2">
+                        <button
+                          type="button"
+                          onClick={() => setAdminAttFactureOption("standard")}
+                          className={`px-3 py-1.5 rounded-lg border text-xs font-bold text-center cursor-pointer transition-all ${
+                            adminAttFactureOption === "standard"
+                              ? "bg-orange-600 text-white border-orange-600 shadow-xs"
+                              : "bg-white text-slate-700 border-slate-200"
+                          }`}
+                        >
+                          Standard (Compte)
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => setAdminAttFactureOption("garant")}
+                          className={`px-3 py-1.5 rounded-lg border text-xs font-bold text-center cursor-pointer transition-all ${
+                            adminAttFactureOption === "garant"
+                              ? "bg-violet-700 text-white border-violet-700 shadow-xs"
+                              : "bg-white text-slate-700 border-slate-200"
+                          }`}
+                        >
+                          Garantie de règlement
+                        </button>
+                      </div>
+                    </div>
+                    {adminAttFactureOption === "garant" && (
+                      <div className="space-y-2 pt-2 border-t border-orange-200/60">
+                        <div>
+                          <label className="block text-[11px] font-bold text-violet-950 mb-1">
+                            Nom du garant *
+                          </label>
+                          <input
+                            type="text"
+                            placeholder="Ex. M. Untel"
+                            value={adminNomGarant}
+                            onChange={(e) => setAdminNomGarant(e.target.value)}
+                            className="w-full px-3 py-1.5 bg-white rounded-lg border border-violet-300 text-xs font-semibold text-slate-800 focus:outline-none focus:border-violet-500"
+                          />
+                        </div>
+                        <div>
+                          <label className="block text-[11px] font-bold text-violet-950 mb-1">
+                            Déclaration d'engagement
+                          </label>
+                          <textarea
+                            rows={2}
+                            value={adminEngagementReglement}
+                            onChange={(e) => setAdminEngagementReglement(e.target.value)}
+                            className="w-full px-3 py-1.5 bg-white rounded-lg border border-violet-300 text-xs font-medium text-slate-800 focus:outline-none focus:border-violet-500"
+                          />
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                )}
+
+                <div>
+                  <label className="block text-xs font-bold text-slate-700 mb-1">
+                    Motif / Commentaire de modification (optionnel)
+                  </label>
+                  <input
+                    type="text"
+                    placeholder="Ex. Correction du mode de règlement suite validation comptable..."
+                    value={adminCommentaire}
+                    onChange={(e) => setAdminCommentaire(e.target.value)}
+                    className="w-full px-3 py-2 bg-slate-50 rounded-lg border border-slate-200 text-xs font-medium text-slate-800 placeholder:text-slate-400 focus:outline-none focus:border-amber-500 focus:bg-white"
+                  />
+                </div>
+
+                <div className="flex justify-end pt-1">
+                  <button
+                    type="submit"
+                    disabled={isSubmitting}
+                    className="inline-flex items-center gap-1.5 px-5 py-2.5 rounded-xl text-xs font-black text-white bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-700 hover:to-teal-700 shadow-sm transition-all cursor-pointer disabled:opacity-50 active:scale-95"
+                  >
+                    <Check className="w-4 h-4" />
+                    <span>{isSubmitting ? "Enregistrement..." : "Enregistrer le nouveau mode"}</span>
+                  </button>
+                </div>
+              </form>
+
+              {/* Divider */}
+              <div className="relative my-4">
+                <div className="absolute inset-0 flex items-center">
+                  <div className="w-full border-t border-slate-200" />
+                </div>
+                <div className="relative flex justify-center text-[10px] uppercase font-bold">
+                  <span className="bg-white px-2 text-slate-400">OU BIEN</span>
+                </div>
+              </div>
+
+              {/* Option 2 : Réouvrir la facture */}
+              <div className="p-4 rounded-2xl bg-amber-50/80 border border-amber-300">
+                <div className="flex items-start gap-3">
+                  <div className="w-8 h-8 rounded-xl bg-amber-200/80 flex items-center justify-center text-amber-900 shrink-0 mt-0.5">
+                    <RotateCcw className="w-4 h-4" />
+                  </div>
+                  <div className="flex-1">
+                    <h3 className="text-xs font-black text-amber-950 uppercase tracking-wider">
+                      2. Réouvrir la facture (Remettre en attente)
+                    </h3>
+                    <p className="text-[11px] text-amber-800 mt-1 leading-snug">
+                      Cette action annule la validation actuelle et replace le dossier en statut <strong>« En attente de paiement »</strong> dans le premier onglet. Le service Facturation pourra alors rééditer le règlement.
+                    </p>
+                    <div className="mt-3">
+                      <button
+                        type="button"
+                        onClick={handleAdminSubmitReopen}
+                        disabled={isSubmitting}
+                        className="inline-flex items-center gap-1.5 px-4 py-2 rounded-xl text-xs font-black text-white bg-amber-600 hover:bg-amber-700 shadow-sm transition-all cursor-pointer disabled:opacity-50 active:scale-95"
+                      >
+                        <RotateCcw className="w-3.5 h-3.5" />
+                        <span>{isSubmitting ? "Réouverture..." : "Réouvrir & remettre en attente"}</span>
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            {/* Footer */}
+            <div className="px-6 py-3 bg-slate-50 border-t border-slate-200 flex justify-end">
+              <button
+                type="button"
+                onClick={() => setAdminEditItem(null)}
+                disabled={isSubmitting}
+                className="px-4 py-2 rounded-xl text-xs font-bold text-slate-600 bg-white hover:bg-slate-100 border border-slate-200 transition-colors cursor-pointer"
+              >
+                Fermer
+              </button>
+            </div>
           </div>
         </div>
       )}

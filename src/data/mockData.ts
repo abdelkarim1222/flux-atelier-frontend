@@ -78,6 +78,10 @@ export interface Flux {
   numeroFacture?: string;
   numeroBC?: string;
   numeroEdition?: string;
+  /** Détail du choix "Att Facture". Les anciens dossiers sont interprétés comme "standard". */
+  attFactureOption?: "standard" | "garant";
+  nomGarant?: string;
+  engagementReglement?: string;
   dateFacturationFinale?: string;
   facturePar?: string;
   dateAvancement?: string;

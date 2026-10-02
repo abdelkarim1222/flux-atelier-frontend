@@ -17,6 +17,17 @@ const SESSION_TTL_SECONDS = 60 * 60 * 12;
 const COOKIE_NAME = 'flux_atelier_session';
 const WORKSHOP_TIME_ZONE = process.env.WORKSHOP_TIME_ZONE || 'Africa/Tunis';
 const ROLE_VALUES = new Set(['administration', 'chef_atelier', 'reception', 'chef_equipe', 'facturation', 'garantie']);
+// Les libellés historiques restent tous valides afin que les dossiers déjà
+// créés puissent encore être régularisés ou livrés.
+const FACTURATION_PAYMENT_MODES = new Set([
+  'Facture',
+  'Bon de commande',
+  'Att Facture',
+  'Attente Facture',
+  'Édition fin de travaux',
+]);
+const ATT_FACTURE_PAYMENT_MODES = new Set(['Att Facture', 'Attente Facture', 'Édition fin de travaux']);
+const ATT_FACTURE_OPTIONS = new Set(['standard', 'garant']);
 const VEHICLE_COLLECTIONS = new Set(['flux', 'reception', 'vin']);
 const RECORD_COLLECTIONS = new Set([
   'teams', 'averages', 'purchases', 'quotes', 'essai_controls',
@@ -39,6 +50,29 @@ const schemaPath = fileURLToPath(new URL('./schema.sql', import.meta.url));
 function send(res, status, body, headers = {}) {
   res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8', ...headers });
   res.end(JSON.stringify(body));
+}
+
+function getPersistedFacturationPaymentMode(payload) {
+  const modePaiement = String(payload?.modePaiement || '').trim();
+  if (!FACTURATION_PAYMENT_MODES.has(modePaiement)) return '';
+
+  const statutFacturation = String(payload?.statutFacturation || '').trim();
+  const statutFacturationFinale = String(payload?.statutFacturationFinale || '').trim();
+  const expectedStatut = ATT_FACTURE_PAYMENT_MODES.has(modePaiement)
+    ? 'edition_fin_travaux'
+    : (modePaiement === 'Bon de commande' ? 'bon_commande' : 'facture');
+
+  // La présence du seul libellé de mode ne suffit pas : l'action Facturation
+  // inscrit aussi le statut, la date et l'auteur de la validation.
+  if (statutFacturation !== expectedStatut) return '';
+  if (!String(payload?.dateValidationFacturation || '').trim()) return '';
+  if (!String(payload?.facturationValideePar || '').trim()) return '';
+  if (ATT_FACTURE_PAYMENT_MODES.has(modePaiement)) {
+    if (!['non_facture', 'facture'].includes(statutFacturationFinale)) return '';
+  } else if (statutFacturationFinale !== 'facture') {
+    return '';
+  }
+  return modePaiement;
 }
 
 // Horloge métier commune : l'heure affichée ne dépend pas du fuseau réglé sur
@@ -632,7 +666,7 @@ async function updateVehicleBySelectors(query, updates, preferredType, allowedTe
                 ? ['E1', 'E2', 'E11', 'E12', 'E21', 'E22']
                 : team.includes('changan')
                   ? ['J11', 'J12', 'J21', 'J22', 'J31', 'J32', 'J41', 'J42', 'J51', 'J52', 'J61', 'J62']
-                  : ['D1', 'D2', 'D3', 'D4', 'D5', 'D6', 'D7', 'D8', 'D11', 'D12', 'D21', 'D22', 'D31', 'D32', 'D41', 'D42', 'D51', 'D52', 'D61', 'D62', 'D71', 'D72', 'D81', 'D82'];
+                  : ['D510', 'D520', 'D610', 'D620', 'D710', 'D720', 'D810', 'D820', 'D511', 'D512', 'D521', 'D522', 'D611', 'D612', 'D621', 'D622', 'D711', 'D712', 'D721', 'D722', 'D811', 'D812', 'D821', 'D822'];
         if (isStartingWork) {
           freePlace = teamPlaces.find((place) => !occupiedSet.has(place)) || freePlace;
         }
@@ -804,9 +838,9 @@ async function handleDatabaseAction(req, res, url) {
   const workshopActions = new Set(['updateEmplacement', 'updateEtat', 'updateTechnicien', 'updateAvancement', 'synchroniserEntrees', 'repararValidations', 'accepterEntreeChefEquipe']);
   const facturationActions = new Set(['validerFacturation', 'marquerFacture']);
   const managementOnlyActions = new Set(['ajouterVin', 'modifierVin', 'ajouterEntreeHistorique', 'updateStatutAchat', 'modifierEntree', 'supprimerEntree']);
-  // La réouverture d'un OR livré est volontairement plus restrictive que les
+  // La réouverture d'un OR livré ou d'une facture est volontairement plus restrictive que les
   // autres actions de direction : seule l'Administration peut la déclencher.
-  const administrationOnlyActions = new Set(['reouvrirOR']);
+  const administrationOnlyActions = new Set(['reouvrirOR', 'reouvrirFacturation']);
 
   const customPermissions = typeof account.custom_permissions === 'object' && account.custom_permissions !== null
     ? account.custom_permissions
@@ -869,8 +903,8 @@ async function handleDatabaseAction(req, res, url) {
   if (administrationOnlyActions.has(action) && account.role !== 'administration') {
     return sendActionResult(res, { ok: false, error: 'La réouverture d’un OR est réservée à l’Administration.' });
   }
-  const allowedTeam = ['chef_equipe', 'chef_atelier', 'facturation'].includes(account.role)
-    && (workshopActions.has(action) || facturationActions.has(action))
+  const allowedTeam = ['chef_equipe', 'chef_atelier'].includes(account.role)
+    && workshopActions.has(action)
     ? await resolveAccountTeam(account)
     : '';
   if (account.role === 'chef_equipe' && workshopActions.has(action) && !allowedTeam) {
@@ -974,6 +1008,157 @@ async function handleDatabaseAction(req, res, url) {
       client.release();
     }
     return sendActionResult(res, { ok: true, recordKey: returnKey, message: `OR ${effectiveOr} réouvert : intervention ${interventionNumero} envoyée à la Réception.` });
+  }
+
+  // ══ reouvrirFacturation : réservé exclusivement à l'Administration
+  // Permet de réouvrir une facture (remettre en attente de paiement) ou de modifier le mode de paiement (Facture / BC / Att Facture)
+  if (action === 'reouvrirFacturation') {
+    const actionType = text('actionType', 'reopen'); // 'reopen' | 'modify'
+    const noOr = text('noOr', text('or', text('no')));
+    const chassis = text('chassis', text('vin')).toUpperCase();
+    const modifiePar = text('modifiePar', account.name || account.email || 'Administration');
+    const nowFr = new Date().toLocaleString('fr-FR', {
+      day: '2-digit', month: '2-digit', year: 'numeric',
+      hour: '2-digit', minute: '2-digit', second: '2-digit'
+    });
+
+    if (actionType === 'reopen') {
+      const updateObj = {
+        modePaiement: null,
+        statutFacturation: 'en_attente',
+        statutFacturationFinale: 'non_facture',
+        dateValidationFacturation: null,
+        facturationValideePar: null,
+        numeroFacture: null,
+        numeroBC: null,
+        numeroEdition: null,
+        attFactureOption: null,
+        nomGarant: null,
+        engagementReglement: null,
+        commentaireFacturation: `Facture réouverte par ${modifiePar} le ${nowFr}`,
+      };
+
+      await updateVehicleBySelectors(query, updateObj);
+
+      // Mettre à jour app_records (facturation_notifications)
+      const notifs = await pool.query(
+        `SELECT collection, record_key, payload FROM app_records
+         WHERE collection = 'facturation_notifications'
+           AND (($1 <> '' AND (record_key LIKE '%' || $1 || '%' OR payload->>'noOr' = $1 OR payload->>'or' = $1))
+            OR ($1 = '' AND $2 <> '' AND (record_key LIKE '%' || $2 || '%' OR payload->>'chassis' = $2 OR payload->>'vin' = $2)))`,
+        [noOr, chassis]
+      );
+      for (const row of notifs.rows) {
+        const updatedNotif = {
+          ...row.payload,
+          statutPaiement: 'en_attente',
+          modePaiement: undefined,
+          statutFacturationFinale: 'non_facture',
+          numeroFacture: undefined,
+          numeroBC: undefined,
+          numeroEdition: undefined,
+          attFactureOption: undefined,
+          nomGarant: undefined,
+          engagementReglement: undefined,
+          dateDecision: undefined,
+          decisionPar: undefined,
+          dateReouverture: nowFr,
+          reouvertPar: modifiePar,
+        };
+        await pool.query(
+          `UPDATE app_records SET payload = $1::jsonb, updated_at = NOW() WHERE collection = $2 AND record_key = $3`,
+          [JSON.stringify(updatedNotif), row.collection, row.record_key]
+        );
+      }
+
+      return sendActionResult(res, {
+        ok: true,
+        message: `Facture du dossier ${noOr || chassis} réouverte avec succès par l'Administration (remise en attente de paiement).`
+      });
+    }
+
+    if (actionType === 'modify') {
+      const modePaiement = text('modePaiement');
+      if (!FACTURATION_PAYMENT_MODES.has(modePaiement)) {
+        return sendActionResult(res, { ok: false, error: 'Mode de paiement invalide.' });
+      }
+      const isAttFacture = ATT_FACTURE_PAYMENT_MODES.has(modePaiement);
+      const attFactureOption = text('attFactureOption', 'standard') || 'standard';
+      const nomGarant = text('nomGarant');
+      const engagementReglement = text('engagementReglement');
+      const numeroFacture = text('numeroFacture');
+      const numeroBC = text('numeroBC');
+      const numeroEdition = text('numeroEdition');
+      const commentaire = text('commentaire');
+
+      if (isAttFacture && !ATT_FACTURE_OPTIONS.has(attFactureOption)) {
+        return sendActionResult(res, { ok: false, error: 'Option Att Facture invalide.' });
+      }
+      if (isAttFacture && attFactureOption === 'garant') {
+        if (!nomGarant || !engagementReglement) {
+          return sendActionResult(res, { ok: false, error: 'Le nom du garant et son engagement de règlement sont requis.' });
+        }
+      }
+
+      const statutFacturation = isAttFacture
+        ? 'edition_fin_travaux'
+        : (modePaiement === 'Bon de commande' ? 'bon_commande' : 'facture');
+      const statutFacturationFinale = isAttFacture ? 'non_facture' : 'facture';
+
+      const updateObj = {
+        modePaiement,
+        statutFacturation,
+        statutFacturationFinale,
+        dateValidationFacturation: nowFr,
+        facturationValideePar: modifiePar,
+        numeroFacture: numeroFacture || null,
+        numeroBC: numeroBC || null,
+        numeroEdition: numeroEdition || null,
+        attFactureOption: isAttFacture ? attFactureOption : null,
+        nomGarant: isAttFacture && attFactureOption === 'garant' ? nomGarant : null,
+        engagementReglement: isAttFacture && attFactureOption === 'garant' ? engagementReglement : null,
+        ...(commentaire ? { commentaireFacturation: commentaire } : {}),
+      };
+
+      await updateVehicleBySelectors(query, updateObj);
+
+      // Mettre à jour app_records
+      const notifs = await pool.query(
+        `SELECT collection, record_key, payload FROM app_records
+         WHERE collection = 'facturation_notifications'
+           AND (($1 <> '' AND (record_key LIKE '%' || $1 || '%' OR payload->>'noOr' = $1 OR payload->>'or' = $1))
+            OR ($1 = '' AND $2 <> '' AND (record_key LIKE '%' || $2 || '%' OR payload->>'chassis' = $2 OR payload->>'vin' = $2)))`,
+        [noOr, chassis]
+      );
+      for (const row of notifs.rows) {
+        const updatedNotif = {
+          ...row.payload,
+          statutPaiement: statutFacturation,
+          modePaiement,
+          statutFacturationFinale,
+          dateDecision: nowFr,
+          decisionPar: modifiePar,
+          numeroFacture: numeroFacture || undefined,
+          numeroBC: numeroBC || undefined,
+          numeroEdition: numeroEdition || undefined,
+          attFactureOption: isAttFacture ? attFactureOption : undefined,
+          nomGarant: isAttFacture && attFactureOption === 'garant' ? nomGarant : undefined,
+          engagementReglement: isAttFacture && attFactureOption === 'garant' ? engagementReglement : undefined,
+          ...(commentaire ? { commentaireFacturation: commentaire } : {}),
+        };
+        await pool.query(
+          `UPDATE app_records SET payload = $1::jsonb, updated_at = NOW() WHERE collection = $2 AND record_key = $3`,
+          [JSON.stringify(updatedNotif), row.collection, row.record_key]
+        );
+      }
+
+      return sendActionResult(res, {
+        ok: true,
+        message: `Mode de paiement du dossier ${noOr || chassis} modifié vers [${modePaiement}] par l'Administration.`
+      });
+    }
+
+    return sendActionResult(res, { ok: false, error: 'Type d’action invalide.' });
   }
 
   // ══ traiterRetourReouvert : la Réception décrit le retour puis l'envoie à l'équipe.
@@ -1566,11 +1751,70 @@ async function handleDatabaseAction(req, res, url) {
       day: '2-digit', month: '2-digit', year: 'numeric',
       hour: '2-digit', minute: '2-digit', second: '2-digit'
     });
-    const modePaiement = text('modePaiement');
-    if (!['Facture', 'Bon de commande', 'Att Facture', 'Attente Facture', 'Édition fin de travaux'].includes(modePaiement)) {
-      return sendActionResult(res, { ok: false, error: 'La livraison nécessite une validation préalable de la Facturation.' });
+    const requestedModePaiement = text('modePaiement');
+    if (requestedModePaiement && !FACTURATION_PAYMENT_MODES.has(requestedModePaiement)) {
+      return sendActionResult(res, { ok: false, error: 'Mode de paiement invalide.' });
     }
-    const livrePar = text('livrePar', account.name || account.email || '');
+    const noOr = text('noOr', text('no'));
+    const chassis = text('chassis', text('vin')).toUpperCase();
+    if (!noOr && !chassis) {
+      return sendActionResult(res, { ok: false, error: 'N° OR ou châssis requis pour livrer le véhicule.' });
+    }
+
+    // Ne jamais autoriser la sortie sur la seule valeur envoyée par le
+    // navigateur : retrouver l'autorisation Facturation réellement enregistrée
+    // sur le véhicule ciblé. Quand l'OR est fourni, il reste l'identifiant
+    // strict, même si le châssis a été utilisé dans une intervention antérieure.
+    const persistedVehicles = await pool.query(
+      `SELECT id, record_type, record_key, no_or, chassis, payload
+       FROM vehicles
+       WHERE (
+         ($1 <> '' AND (
+           no_or = $1 OR UPPER(TRIM(no_or)) = UPPER(TRIM($1))
+           OR payload->>'numeroOR' = $1 OR payload->>'noOr' = $1
+           OR payload->>'no' = $1 OR payload->>'or' = $1
+           OR UPPER(TRIM(payload->>'noOr')) = UPPER(TRIM($1))
+           OR UPPER(TRIM(payload->>'or')) = UPPER(TRIM($1))
+         ))
+         OR ($1 = '' AND $2 <> '' AND (
+           UPPER(chassis) = UPPER($2) OR UPPER(payload->>'vin') = UPPER($2)
+           OR UPPER(payload->>'chassis') = UPPER($2)
+           OR REPLACE(UPPER(COALESCE(chassis, '')), ' ', '') = REPLACE(UPPER($2), ' ', '')
+           OR REPLACE(UPPER(COALESCE(payload->>'vin', '')), ' ', '') = REPLACE(UPPER($2), ' ', '')
+         ))
+       )
+       ORDER BY updated_at DESC, id DESC`,
+      [noOr, chassis],
+    );
+    if (!persistedVehicles.rowCount) {
+      return sendActionResult(res, { ok: false, error: 'Véhicule introuvable dans PostgreSQL.' });
+    }
+
+    // Le premier enregistrement est le dossier courant. Ne pas rechercher une
+    // validation plus ancienne avec le même OR : un OR réouvert conserve son
+    // numéro mais doit repasser par la Facturation pour sa nouvelle intervention.
+    const persistedModePaiement = getPersistedFacturationPaymentMode(persistedVehicles.rows[0].payload);
+
+    // Le modal de livraison directe est déjà utilisé par la Direction. Cette
+    // dérogation reste limitée à Administration/Chef d'Atelier, exige un mode
+    // explicite connu, et est inscrite dans l'historique du véhicule.
+    const isDirectionOverride = !persistedModePaiement && managementRoles.has(account.role);
+    if (!persistedModePaiement && !isDirectionOverride) {
+      return sendActionResult(res, {
+        ok: false,
+        error: 'La livraison nécessite une validation Facturation enregistrée.',
+      });
+    }
+    if (isDirectionOverride && !requestedModePaiement) {
+      return sendActionResult(res, {
+        ok: false,
+        error: 'La dérogation Direction exige de choisir un mode de paiement valide.',
+      });
+    }
+
+    const modePaiement = persistedModePaiement || requestedModePaiement;
+    const authenticatedActor = String(account.name || account.email || account.id || 'Direction').trim();
+    const livrePar = text('livrePar', authenticatedActor);
     const updateObj = {
       etat: 'Livré',
       etatIntervention: 'Livré',
@@ -1579,22 +1823,33 @@ async function handleDatabaseAction(req, res, url) {
       emplacement: 'Livraison au client',
       dateLivraisonClient: nowFr,
       livrePar,
+      modePaiement,
+      ...(isDirectionOverride ? {
+        livraisonOverrideFacturation: true,
+        livraisonOverrideFacturationPar: authenticatedActor,
+        livraisonOverrideFacturationRole: account.role,
+        dateLivraisonOverrideFacturation: nowFr,
+        modePaiementOverrideFacturation: modePaiement,
+        motifLivraisonOverrideFacturation: 'Dérogation Direction : aucune validation Facturation persistée au moment de la livraison.',
+      } : {}),
     };
-    if (modePaiement) updateObj.modePaiement = modePaiement;
     const updated = await updateVehicleBySelectors(query, updateObj, undefined, '');
     if (!updated) return sendActionResult(res, { ok: false, error: 'Véhicule introuvable dans PostgreSQL.' });
     // La livraison clôture le travail : la notification opérationnelle est
     // supprimée. Le dossier véhicule livré reste disponible dans l'archive
     // réservée à l'administration.
-    const noOr = text('noOr', text('no'));
-    const chassis = text('chassis').toUpperCase();
     await pool.query(
       `DELETE FROM app_records WHERE collection = 'facturation_notifications'
        AND (($1 <> '' AND (payload->>'noOr' = $1 OR payload->>'or' = $1))
          OR ($1 = '' AND $2 <> '' AND (UPPER(payload->>'chassis') = $2 OR UPPER(payload->>'vin') = $2)))`,
       [noOr, chassis],
     );
-    return sendActionResult(res, { ok: true, message: `Véhicule livré (${modePaiement || 'mode non précisé'}) enregistré dans PostgreSQL.` });
+    return sendActionResult(res, {
+      ok: true,
+      message: isDirectionOverride
+        ? `Véhicule livré par dérogation Direction (${modePaiement}) et journalisé dans PostgreSQL.`
+        : `Véhicule livré (${modePaiement}) après validation Facturation.`,
+    });
   }
 
   // ══ validerFacturation : action dédiée facturation pour valider le mode de paiement (Facture / Bon de commande / Édition fin de travaux)
@@ -1611,7 +1866,27 @@ async function handleDatabaseAction(req, res, url) {
     const validePar = text('validePar', account.name || account.email || '');
     const isRegularisation = text('regularisation') === 'true';
 
-    const isAttFacture = modePaiement === 'Att Facture' || modePaiement === 'Attente Facture' || modePaiement === 'Édition fin de travaux';
+    if (!FACTURATION_PAYMENT_MODES.has(modePaiement)) {
+      return sendActionResult(res, { ok: false, error: 'Mode de paiement invalide.' });
+    }
+
+    const isAttFacture = ATT_FACTURE_PAYMENT_MODES.has(modePaiement);
+    // Les appels et dossiers créés avant ce champ restent des attestations
+    // standard. Seul le choix "garant" nécessite un engagement explicite.
+    const attFactureOption = text('attFactureOption', 'standard') || 'standard';
+    const nomGarant = text('nomGarant');
+    const engagementReglement = text('engagementReglement');
+    if (isAttFacture && !ATT_FACTURE_OPTIONS.has(attFactureOption)) {
+      return sendActionResult(res, { ok: false, error: 'Option Att Facture invalide.' });
+    }
+    if (isAttFacture && attFactureOption === 'garant') {
+      if (!nomGarant || !engagementReglement) {
+        return sendActionResult(res, { ok: false, error: 'Le nom du garant et son engagement de règlement sont requis.' });
+      }
+      if (nomGarant.length > 160 || engagementReglement.length > 1500) {
+        return sendActionResult(res, { ok: false, error: 'Les informations du garant sont trop longues.' });
+      }
+    }
     const statutFacturation = isAttFacture
       ? 'edition_fin_travaux'
       : (modePaiement === 'Bon de commande' ? 'bon_commande' : 'facture');
@@ -1624,6 +1899,11 @@ async function handleDatabaseAction(req, res, url) {
       statutFacturationFinale,
       dateValidationFacturation: nowFr,
       facturationValideePar: validePar,
+      ...(isAttFacture ? {
+        attFactureOption,
+        nomGarant: attFactureOption === 'garant' ? nomGarant : '',
+        engagementReglement: attFactureOption === 'garant' ? engagementReglement : '',
+      } : {}),
       // Att Facture autorise la sortie du véhicule : le dossier reste dans la
       // liste Facturation jusqu'au règlement de fin de mois.
       // Une régularisation ne doit jamais ramener un véhicule livré à Réception.
@@ -1666,7 +1946,7 @@ async function handleDatabaseAction(req, res, url) {
       console.warn("Attribution emplacement Zone L ignorée:", e);
     }
 
-    let updated = await updateVehicleBySelectors(query, updateObj, undefined, allowedTeam);
+    let updated = await updateVehicleBySelectors(query, updateObj, undefined, '');
 
     // Synchroniser / mettre à jour dans app_records (facturation_notifications)
     const noOrVal = text('noOr', text('or', text('no')));
@@ -1696,6 +1976,11 @@ async function handleDatabaseAction(req, res, url) {
         ...(numeroFacture ? { numeroFacture } : {}),
         ...(numeroBC ? { numeroBC } : {}),
         ...(numeroEdition ? { numeroEdition } : {}),
+        ...(isAttFacture ? {
+          attFactureOption,
+          nomGarant: attFactureOption === 'garant' ? nomGarant : '',
+          engagementReglement: attFactureOption === 'garant' ? engagementReglement : '',
+        } : {}),
         ...(commentaire ? { commentaireFacturation: commentaire } : {}),
       };
       await pool.query(
@@ -1743,6 +2028,8 @@ async function handleDatabaseAction(req, res, url) {
         technicien: vPayload.nomTechnicien || vPayload.technicien || '',
         nomTechnicien: vPayload.nomTechnicien || vPayload.technicien || '',
         dateFinTravaux: vPayload.dateFinRep || nowFr,
+        dateEntree: vPayload.dateEntree || vPayload.dateEntreeHeure?.split(' ')[0] || '',
+        dateEntreeHeure: vPayload.dateEntreeHeure || vPayload.dateEntree || '',
         statutFin: 'Terminé',
         statutPaiement,
         modePaiement,
@@ -1752,6 +2039,11 @@ async function handleDatabaseAction(req, res, url) {
         ...(numeroFacture ? { numeroFacture } : {}),
         ...(numeroBC ? { numeroBC } : {}),
         ...(numeroEdition ? { numeroEdition } : {}),
+        ...(isAttFacture ? {
+          attFactureOption,
+          nomGarant: attFactureOption === 'garant' ? nomGarant : '',
+          engagementReglement: attFactureOption === 'garant' ? engagementReglement : '',
+        } : {}),
         ...(commentaire ? { commentaireFacturation: commentaire } : {}),
         createdAt: Date.now(),
       };
@@ -1762,11 +2054,34 @@ async function handleDatabaseAction(req, res, url) {
       );
     }
 
-    // Si le véhicule n'est pas trouvé dans la table vehicles, mais qu'il existe dans la notification, le recréer
+    // Si le véhicule n'a pas été mis à jour par les sélecteurs stricts, chercher dans PostgreSQL sans restriction d'équipe
+    if (!updated) {
+      const searchOr = noOrVal;
+      const searchChassis = chassisVal;
+      const existingRows = await pool.query(
+        `SELECT id, record_type, record_key, payload FROM vehicles
+         WHERE ($1 <> '' AND (no_or = $1 OR payload->>'noOr' = $1 OR payload->>'numeroOR' = $1 OR payload->>'or' = $1))
+            OR ($2 <> '' AND (chassis = $2 OR UPPER(chassis) = UPPER($2) OR UPPER(payload->>'chassis') = UPPER($2) OR UPPER(payload->>'vin') = UPPER($2)))
+         ORDER BY id ASC`,
+        [searchOr, searchChassis]
+      );
+      if (existingRows.rowCount > 0) {
+        for (const row of existingRows.rows) {
+          const currentPayload = row.payload || {};
+          const mergedPayload = { ...currentPayload, ...updateObj };
+          await saveVehicleRecord(pool, row.record_type, mergedPayload, row.record_key);
+        }
+        updated = true;
+      }
+    }
+
+    // Dernier recours : si le véhicule n'existe vraiment pas dans la table vehicles, mais qu'il existe dans la notification
     if (!updated && notifs.rowCount > 0) {
       const notifRow = notifs.rows[0];
       const notifPayload = notifRow?.payload || {};
       const newVehicleId = Number(notifPayload.vehicleId) || Date.now();
+      const genuineDateEntree = notifPayload.dateEntree || notifPayload.dateEntreeHeure?.split(' ')[0] || new Date().toLocaleDateString('fr-FR');
+      const genuineDateEntreeHeure = notifPayload.dateEntreeHeure || notifPayload.dateEntree || (notifPayload.dateFinTravaux ? '' : nowFr);
       const baseVehicle = {
         id: newVehicleId,
         noOr: notifPayload.noOr || notifPayload.or || noOrVal || 'OR-' + newVehicleId,
@@ -1780,13 +2095,13 @@ async function handleDatabaseAction(req, res, url) {
         equipe: notifPayload.equipe || 'Atelier',
         technicien: notifPayload.technicien || notifPayload.nomTechnicien || '-',
         nomTechnicien: notifPayload.nomTechnicien || notifPayload.technicien || '-',
-        dateEntree: notifPayload.dateFinTravaux?.split(' ')[0] || new Date().toLocaleDateString('fr-FR'),
-        dateEntreeHeure: notifPayload.dateFinTravaux || nowFr,
+        dateEntree: genuineDateEntree,
+        dateEntreeHeure: genuineDateEntreeHeure,
+        dateFinRep: notifPayload.dateFinTravaux || '',
         ...updateObj,
       };
-      const recordKeyFlux = String(newVehicleId);
       const recordKeyRec = `${baseVehicle.noOr}_${newVehicleId}`;
-      await saveVehicleRecord(pool, 'flux', baseVehicle, recordKeyFlux);
+      await saveVehicleRecord(pool, 'flux', baseVehicle, recordKeyRec);
       await saveVehicleRecord(pool, 'reception', baseVehicle, recordKeyRec);
       updated = true;
     }

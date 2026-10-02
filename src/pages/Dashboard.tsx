@@ -762,7 +762,7 @@ export default function Dashboard() {
     if (!saved) {
       if (role === "facturation") {
         setActiveTab("facturation");
-      } else if (role === "reception") {
+      } else if (role === "reception" || role === "garantie") {
         setActiveTab("suivi_entrees");
       } else if (role === "chef_equipe") {
         setActiveTab("chargement");
@@ -1955,8 +1955,9 @@ export default function Dashboard() {
         setDatabaseStatus("ready");
         recordVehicleModification(
           row,
-          "Technicien modifié",
+          isTransferInit ? "Prise en charge / affectation" : "Technicien modifié",
           `Équipe : ${finalTeam || "-"} • Technicien : ${technicien || "-"} ${nomTechnicien || ""}`.trim(),
+          currentDateTime,
         );
         setWriteNotice(
           `Technicien mis à jour pour ${row.serie || row.no} : [${technicien}] ${nomTechnicien}.`
@@ -2123,6 +2124,15 @@ export default function Dashboard() {
 
       // Terminer : clôturer l'essai si ouvert et enregistrer la date de fin effective de réparation
       if (nextAvancement === "Terminer" || parseAvancementPct(effectiveAvancement) === 100) {
+        const techStr = row.technicien && row.technicien !== "-"
+          ? ` • Technicien : ${row.technicien} ${row.nomTechnicien || ""}`.trim()
+          : (row.nomTechnicien && row.nomTechnicien !== "-" ? ` • Technicien : ${row.nomTechnicien}` : "");
+        recordVehicleModification(
+          row,
+          "Prise en charge / terminer",
+          `Équipe : ${row.equipe || "Atelier"}${techStr} • Travaux terminés`.trim(),
+          nowFormatted
+        );
         marquerFinEssai(row, { dateControle: nowFormatted, resultat: "CONFORME" });
         if (!isWarrantyVehicle(row)) {
           notifierFinTravauxTechnicien(row, currentUserName, nowFormatted);
@@ -2184,6 +2194,15 @@ export default function Dashboard() {
 
       // Transferts VR : enregistrer le début du transfert vers l'équipe cible horodaté à maintenant
       if (isVrTransfer) {
+        const techStr = row.technicien && row.technicien !== "-"
+          ? ` • Technicien : ${row.technicien} ${row.nomTechnicien || ""}`.trim()
+          : (row.nomTechnicien && row.nomTechnicien !== "-" ? ` • Technicien : ${row.nomTechnicien}` : "");
+        recordVehicleModification(
+          row,
+          "Prise en charge / terminer",
+          `Équipe : ${row.equipe || "Atelier"}${techStr} • Fin de prise en charge avant transfert ${nextAvancement}`.trim(),
+          nowFormatted
+        );
         marquerDebutTransfertVR(row, nextAvancement, targetEquipe, currentUserName);
         saveNouvelleEntreeNotification({
           id: `vr-${row.id}-${nextAvancement}-${Date.now()}`,
@@ -3998,7 +4017,7 @@ export default function Dashboard() {
             {/* ══════════════════════════════════════════════════════ */}
             {/* Suivi des Entrées & Avancement Atelier — EN TÊTE DE MENU */}
             {/* ══════════════════════════════════════════════════════ */}
-            {(permissions.canViewAll || role === "reception" || role === "chef_atelier" || role === "administration") && (
+            {(permissions.canViewAll || role === "reception" || role === "garantie" || role === "chef_atelier" || role === "administration" || permissions.canAddEntree) && (
               <button
                 type="button"
                 onClick={() => setActiveTab("suivi_entrees")}
@@ -4020,7 +4039,7 @@ export default function Dashboard() {
                     ? "bg-white/25 text-white"
                     : "bg-emerald-50 text-emerald-700 border border-emerald-200"
                   }`}>
-                  Réception
+                  {role === "garantie" ? (currentUser?.assignedTeam || "R10") : "Réception"}
                 </span>
               </button>
             )}
@@ -5894,7 +5913,7 @@ export default function Dashboard() {
                       return (
                         <div className="table-scroll">
                           <table
-                            className={`monitor-table vehicle-detail-table ${isChefEquipeChargement
+                            className={`zebra-table monitor-table vehicle-detail-table ${isChefEquipeChargement
                                 ? "table-chargement-chef"
                                 : isEnCoursTab
                                   ? "table-encours"
@@ -5908,6 +5927,7 @@ export default function Dashboard() {
                                 <col className="col-marque" />
                                 <col className="col-modele" />
                                 <col className="col-chassis" />
+                                <col className="col-immat" />
                                 <col className="col-state" />
                                 <col className="col-emplacement" />
                                 {role !== "chef_equipe" && <col className="col-action" />}
@@ -5937,6 +5957,7 @@ export default function Dashboard() {
                                 <col className="col-marque" />
                                 <col className="col-modele" />
                                 <col className="col-chassis" />
+                                <col className="col-immat" />
                                 <col className="col-categorie" />
                                 <col className="col-tech" />
                                 <col className="col-tech-name" />
@@ -5956,6 +5977,7 @@ export default function Dashboard() {
                                   <th>Marque</th>
                                   <th>Modèle</th>
                                   <th>N° Chassis</th>
+                                  <th>Immatriculation</th>
                                   <th>Etat</th>
                                   <th>Emplacement</th>
                                   {role !== "chef_equipe" && <th>Actions</th>}
@@ -5989,6 +6011,7 @@ export default function Dashboard() {
                                   <th>Marque</th>
                                   <th>Modèle</th>
                                   <th>N° Chassis</th>
+                                  <th>Immatriculation</th>
                                   <th>Catégorie</th>
                                   <th>N° Matricule</th>
                                   <th>NOM DE TECHNICIEN</th>
@@ -6788,6 +6811,7 @@ export default function Dashboard() {
                                         <td>{displayText(row.marque)}</td>
                                         <td title={row.modele || row.modelePowerBI}>{displayText(row.modele || row.modelePowerBI)}</td>
                                         <td title={row.chassis}>{displayText(row.chassis)}</td>
+                                        <td title={row.immatriculation || row.serie}>{displayText(row.immatriculation || row.serie)}</td>
                                         {renderCellEtat()}
                                         {renderCellEmplacement()}
                                         {role !== "chef_equipe" && renderCellFiche()}
@@ -6840,6 +6864,7 @@ export default function Dashboard() {
                                         <td>{displayText(row.marque)}</td>
                                         <td title={row.modele || row.modelePowerBI}>{displayText(row.modele || row.modelePowerBI)}</td>
                                         <td title={row.chassis}>{displayText(row.chassis)}</td>
+                                        <td title={row.immatriculation || row.serie}>{displayText(row.immatriculation || row.serie)}</td>
                                         <td>{displayText(row.categorie)}</td>
                                         {renderCellTech()}
                                         {renderCellNomTech()}
@@ -6859,12 +6884,12 @@ export default function Dashboard() {
                                   <td
                                     colSpan={
                                       isChefEquipeChargement
-                                        ? role === "chef_equipe" ? 7 : 8
+                                        ? role === "chef_equipe" ? 8 : 9
                                         : isEnCoursTab
                                           ? role === "chef_equipe"
                                             ? 11
                                             : 12
-                                          : role === "chef_equipe" ? 15 : 16
+                                          : role === "chef_equipe" ? 16 : 17
                                     }
                                   >
                                     <div className="table-empty">

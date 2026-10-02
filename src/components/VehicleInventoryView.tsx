@@ -151,7 +151,7 @@ export default function VehicleInventoryView() {
         )}
 
         <div className="min-h-0 flex-1 overflow-auto">
-          <table className="min-w-[1450px] w-full border-separate border-spacing-0 text-left text-xs">
+          <table className="zebra-table min-w-[1450px] w-full border-separate border-spacing-0 text-left text-xs">
             <thead className="sticky top-0 z-10 bg-slate-100 text-[10px] uppercase tracking-wide text-slate-600">
               <tr>
                 <th className="w-10 border-b border-slate-200 px-3 py-3" aria-label="Détails" />

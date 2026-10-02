@@ -1330,6 +1330,7 @@ export async function accepterEntreeParChefEquipe(params: {
 // NOTIFICATIONS & GESTION FACTURATION
 // ==========================================
 export type FacturationPaymentMode = "Facture" | "Bon de commande" | "Att Facture" | "Édition fin de travaux";
+export type AttFactureOption = "standard" | "garant";
 
 export interface FacturationNotification {
   id: string; // facturation_${noOr}_${chassis}
@@ -1346,12 +1347,18 @@ export interface FacturationNotification {
   technicien?: string;
   nomTechnicien?: string;
   dateFinTravaux: string;
+  dateEntree?: string;
+  dateEntreeHeure?: string;
   statutFin?: string;
   statutPaiement: "en_attente" | "facture" | "bon_commande" | "edition_fin_travaux";
   modePaiement?: FacturationPaymentMode;
   numeroFacture?: string;
   numeroBC?: string;
   numeroEdition?: string;
+  /** Absent dans les dossiers historiques : à interpréter comme "standard". */
+  attFactureOption?: AttFactureOption;
+  nomGarant?: string;
+  engagementReglement?: string;
   commentaire?: string;
   dateDecision?: string;
   decisionPar?: string;
@@ -1364,10 +1371,29 @@ export interface FacturationNotification {
 
 const STORAGE_KEY_FACTURATION_NOTIFS = "flux_atelier_facturation_notifications";
 
+function isAttFacturePaymentMode(modePaiement?: string): boolean {
+  return modePaiement === "Att Facture" ||
+    modePaiement === "Attente Facture" ||
+    modePaiement === "Édition fin de travaux";
+}
+
+function normalizeAttFactureNotification(notif: FacturationNotification): FacturationNotification {
+  if (!isAttFacturePaymentMode(notif.modePaiement)) return notif;
+  // Les dossiers créés avant l'ajout du sous-choix n'avaient pas de valeur :
+  // leur comportement historique est celui d'une attestation standard.
+  if (notif.attFactureOption === "garant") return notif;
+  return { ...notif, attFactureOption: "standard" };
+}
+
 export function getFacturationNotifications(): FacturationNotification[] {
   try {
     const raw = localStorage.getItem(STORAGE_KEY_FACTURATION_NOTIFS);
-    if (raw) return JSON.parse(raw);
+    if (raw) {
+      const parsed = JSON.parse(raw);
+      return Array.isArray(parsed)
+        ? parsed.map((notif) => normalizeAttFactureNotification(notif as FacturationNotification))
+        : [];
+    }
   } catch (e) {
     console.warn("Erreur lecture notifications facturation:", e);
   }
@@ -1442,6 +1468,8 @@ export function notifierFinTravauxTechnicien(
     technicien: vehicle.nomTechnicien || vehicle.technicien || authorName || existing?.technicien || "",
     nomTechnicien: vehicle.nomTechnicien || vehicle.technicien || authorName || existing?.technicien || "",
     dateFinTravaux,
+    dateEntree: (vehicle as any).dateEntree || (vehicle as any).dateEntreeHeure?.split(" ")[0] || existing?.dateEntree || "",
+    dateEntreeHeure: (vehicle as any).dateEntreeHeure || (vehicle as any).dateEntree || existing?.dateEntreeHeure || "",
     statutFin: vehicle.avancement || vehicle.etatIntervention || "Terminé",
     statutPaiement: "en_attente",
     createdAt: existing?.createdAt || Date.now(),
@@ -1456,6 +1484,9 @@ export async function validerPaiementFacturation(params: {
   noOr: string;
   chassis: string;
   modePaiement: FacturationPaymentMode;
+  attFactureOption?: AttFactureOption;
+  nomGarant?: string;
+  engagementReglement?: string;
   numeroFacture?: string;
   numeroBC?: string;
   numeroEdition?: string;
@@ -1474,10 +1505,20 @@ export async function validerPaiementFacturation(params: {
   const min = String(now.getMinutes()).padStart(2, "0");
   const nowFormatted = `${dd}/${mm}/${yyyy} ${hh}:${min}`;
 
+  const isAttFacture = isAttFacturePaymentMode(params.modePaiement);
+  // Les anciens appels n'envoyaient pas ce détail : ils restent des
+  // attestations standard, sans modifier leur workflow existant.
+  const attFactureOption: AttFactureOption = params.attFactureOption === "garant" ? "garant" : "standard";
+  const nomGarant = params.nomGarant?.trim() || "";
+  const engagementReglement = params.engagementReglement?.trim() || "";
+
   const res = await callDatabaseAction<{ ok: boolean; message?: string }>("validerFacturation", {
     noOr: params.noOr,
     chassis: params.chassis,
     modePaiement: params.modePaiement,
+    attFactureOption: isAttFacture ? attFactureOption : "",
+    nomGarant: isAttFacture && attFactureOption === "garant" ? nomGarant : "",
+    engagementReglement: isAttFacture && attFactureOption === "garant" ? engagementReglement : "",
     numeroFacture: params.numeroFacture || "",
     numeroBC: params.numeroBC || "",
     numeroEdition: params.numeroEdition || "",
@@ -1495,11 +1536,6 @@ export async function validerPaiementFacturation(params: {
     (n) => params.noOr ? n.noOr === params.noOr : Boolean(params.chassis && n.chassis === params.chassis)
   );
 
-  const isAttFacture =
-    params.modePaiement === "Att Facture" ||
-    params.modePaiement === "Édition fin de travaux" ||
-    (params.modePaiement as string) === "Attente Facture";
-
   const statutPaiement = isAttFacture
     ? "edition_fin_travaux"
     : params.modePaiement === "Bon de commande"
@@ -1512,6 +1548,11 @@ export async function validerPaiementFacturation(params: {
     notif.numeroFacture = params.numeroFacture;
     notif.numeroBC = params.numeroBC;
     notif.numeroEdition = params.numeroEdition;
+    if (isAttFacture) {
+      notif.attFactureOption = attFactureOption;
+      notif.nomGarant = attFactureOption === "garant" ? nomGarant : "";
+      notif.engagementReglement = attFactureOption === "garant" ? engagementReglement : "";
+    }
     notif.commentaire = params.commentaire;
     notif.dateDecision = nowFormatted;
     notif.decisionPar = params.validePar;
@@ -1533,6 +1574,11 @@ export async function validerPaiementFacturation(params: {
       numeroFacture: params.numeroFacture,
       numeroBC: params.numeroBC,
       numeroEdition: params.numeroEdition,
+      ...(isAttFacture ? {
+        attFactureOption,
+        nomGarant: attFactureOption === "garant" ? nomGarant : "",
+        engagementReglement: attFactureOption === "garant" ? engagementReglement : "",
+      } : {}),
       commentaire: params.commentaire,
       dateDecision: nowFormatted,
       decisionPar: params.validePar,
@@ -1583,6 +1629,90 @@ export async function marquerDossierFacture(params: {
     notif.facturePar = params.facturePar;
     if (params.numeroFacture) notif.numeroFacture = params.numeroFacture;
     if (params.commentaire) notif.commentaire = params.commentaire;
+    saveFacturationNotification(notif);
+  }
+
+  window.dispatchEvent(new CustomEvent("facturation_notifications_updated"));
+  window.dispatchEvent(new CustomEvent("flux_refresh_requested"));
+  return res;
+}
+
+export async function reouvrirFacturationAdmin(params: {
+  noOr: string;
+  chassis: string;
+  actionType: "reopen" | "modify";
+  modePaiement?: FacturationPaymentMode;
+  numeroFacture?: string;
+  numeroBC?: string;
+  numeroEdition?: string;
+  attFactureOption?: AttFactureOption;
+  nomGarant?: string;
+  engagementReglement?: string;
+  commentaire?: string;
+  modifiePar?: string;
+}): Promise<{ ok: boolean; message?: string }> {
+  const now = new Date();
+  const dd = String(now.getDate()).padStart(2, "0");
+  const mm = String(now.getMonth() + 1).padStart(2, "0");
+  const yyyy = now.getFullYear();
+  const hh = String(now.getHours()).padStart(2, "0");
+  const min = String(now.getMinutes()).padStart(2, "0");
+  const nowFormatted = `${dd}/${mm}/${yyyy} ${hh}:${min}`;
+
+  const res = await callDatabaseAction<{ ok: boolean; message?: string }>("reouvrirFacturation", {
+    noOr: params.noOr,
+    chassis: params.chassis,
+    actionType: params.actionType,
+    modePaiement: params.modePaiement || "",
+    attFactureOption: params.attFactureOption || "",
+    nomGarant: params.nomGarant || "",
+    engagementReglement: params.engagementReglement || "",
+    numeroFacture: params.numeroFacture || "",
+    numeroBC: params.numeroBC || "",
+    numeroEdition: params.numeroEdition || "",
+    commentaire: params.commentaire || "",
+    modifiePar: params.modifiePar || "",
+  });
+
+  const list = getFacturationNotifications();
+  const notif = list.find(
+    (n) => params.noOr ? n.noOr === params.noOr : Boolean(params.chassis && n.chassis === params.chassis)
+  );
+
+  if (notif) {
+    if (params.actionType === "reopen") {
+      notif.statutPaiement = "en_attente";
+      notif.modePaiement = undefined;
+      notif.statutFacturationFinale = "non_facture";
+      notif.numeroFacture = undefined;
+      notif.numeroBC = undefined;
+      notif.numeroEdition = undefined;
+      notif.attFactureOption = undefined;
+      notif.nomGarant = undefined;
+      notif.engagementReglement = undefined;
+      notif.dateDecision = undefined;
+      notif.decisionPar = undefined;
+    } else if (params.actionType === "modify" && params.modePaiement) {
+      const isAttFacture = isAttFacturePaymentMode(params.modePaiement);
+      notif.statutPaiement = isAttFacture
+        ? "edition_fin_travaux"
+        : params.modePaiement === "Bon de commande"
+        ? "bon_commande"
+        : "facture";
+      notif.modePaiement = params.modePaiement;
+      notif.numeroFacture = params.numeroFacture;
+      notif.numeroBC = params.numeroBC;
+      notif.numeroEdition = params.numeroEdition;
+      if (isAttFacture) {
+        notif.attFactureOption = params.attFactureOption;
+        notif.nomGarant = params.attFactureOption === "garant" ? params.nomGarant : "";
+        notif.engagementReglement = params.attFactureOption === "garant" ? params.engagementReglement : "";
+      }
+      notif.statutFacturationFinale = isAttFacture ? "non_facture" : "facture";
+      notif.dateDecision = nowFormatted;
+      notif.decisionPar = params.modifiePar;
+      if (params.commentaire) notif.commentaire = params.commentaire;
+    }
     saveFacturationNotification(notif);
   }
 

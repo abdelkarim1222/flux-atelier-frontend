@@ -3,11 +3,38 @@ import type { Flux } from "../data/mockData";
 export const DELIVERED_EMPLACEMENT = "Livraison au client";
 export const FULL_PARKING_EMPLACEMENT = "Place complet";
 
+export const LEGACY_DAILY_MAPPING: Record<string, string> = {
+  D1: "D510",
+  D11: "D511",
+  D12: "D512",
+  D2: "D520",
+  D21: "D521",
+  D22: "D522",
+  D3: "D610",
+  D31: "D611",
+  D32: "D612",
+  D4: "D620",
+  D41: "D621",
+  D42: "D622",
+  D5: "D710",
+  D51: "D711",
+  D52: "D712",
+  D6: "D720",
+  D61: "D721",
+  D62: "D722",
+  D7: "D810",
+  D71: "D811",
+  D72: "D812",
+  D8: "D820",
+  D81: "D821",
+  D82: "D822",
+};
+
 export const EMPLACEMENT_ZONES = {
   DAILY: [
-    "D1", "D2", "D3", "D4", "D5", "D6", "D7", "D8",
-    "D11", "D12", "D21", "D22", "D31", "D32", "D41", "D42",
-    "D51", "D52", "D61", "D62", "D71", "D72", "D81", "D82"
+    "D510", "D520", "D610", "D620", "D710", "D720", "D810", "D820",
+    "D511", "D512", "D521", "D522", "D611", "D612", "D621", "D622",
+    "D711", "D712", "D721", "D722", "D811", "D812", "D821", "D822"
   ],
   CHANGAN: [
     "J11", "J12", "J21", "J22", "J31", "J32", "J41", "J42", "J51", "J52", "J61", "J62"
@@ -47,6 +74,7 @@ export const ALL_EMPLACEMENTS: string[] = [
 
 export const VALID_EMPLACEMENTS_SET = new Set<string>([
   ...ALL_EMPLACEMENTS.map((e) => e.toUpperCase()),
+  ...Object.keys(LEGACY_DAILY_MAPPING),
   FULL_PARKING_EMPLACEMENT.toUpperCase(),
   "PARC COMPLET",
   "PARCCOMPLET",
@@ -82,6 +110,7 @@ export function normalizeEmplacementCode(val: string): string {
   if (clean === "LIVRAISONAUCLIENT" || clean.includes("LIVR")) return DELIVERED_EMPLACEMENT;
   if (clean.includes("COMPLET") || clean.includes("PLEIN")) return FULL_PARKING_EMPLACEMENT;
   const stripped = clean.replace(/^(ZONE|PARKING)/, "");
+  if (LEGACY_DAILY_MAPPING[stripped]) return LEGACY_DAILY_MAPPING[stripped];
   if (VALID_EMPLACEMENTS_SET.has(stripped)) return stripped;
   return clean;
 }

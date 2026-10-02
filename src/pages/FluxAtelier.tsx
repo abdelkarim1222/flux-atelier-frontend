@@ -48,7 +48,7 @@ export default function FluxAtelier() {
       </div>
 
       <div className="overflow-hidden rounded-xl border bg-white">
-        <table className="w-full text-left">
+        <table className="zebra-table w-full text-left">
           <thead className="bg-slate-50">
             <tr>
               <th className="px-5 py-4">Ordre</th>

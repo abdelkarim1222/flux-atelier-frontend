@@ -621,7 +621,7 @@ export default function GestionAccesView() {
       {/* Main Accounts Table */}
       <div className="bg-white/92 backdrop-blur-md rounded-2xl border border-white/60 shadow-lg flex-1 flex flex-col min-h-[400px] overflow-hidden">
         <div className="overflow-x-auto flex-1">
-          <table className="w-full text-left border-collapse text-xs">
+          <table className="zebra-table w-full text-left border-collapse text-xs">
             <thead>
               <tr className="bg-slate-50/90 border-b border-slate-200 text-slate-500 font-bold uppercase tracking-wider text-[11px]">
                 <th className="py-3 px-4">Collaborateur</th>

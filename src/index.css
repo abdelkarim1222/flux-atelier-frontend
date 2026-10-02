@@ -1,5 +1,17 @@
 @import "tailwindcss";
 
+/* Alternance neutre commune aux tableaux de données. La couche base permet
+   aux utilitaires Tailwind de statut et de survol de rester prioritaires. */
+@layer base {
+  .zebra-table > tbody > tr:nth-child(odd) {
+    background-color: #ffffff;
+  }
+
+  .zebra-table > tbody > tr:nth-child(even) {
+    background-color: #f8fafc;
+  }
+}
+
 :root {
   color: #1a1714;
   background: #f0ede8;
@@ -1439,6 +1451,16 @@ button {
     align-items: stretch;
   }
 
+  /* En colonne, le flex-basis desktop de 240px devenait une hauteur de
+     240px : la recherche occupait donc une grande zone vide sur mobile. */
+  .table-controls .search-shell {
+    flex: 0 0 36px;
+    min-height: 36px;
+    height: 36px;
+    min-width: 0;
+    width: 100%;
+  }
+
   .metric-grid {
     grid-template-columns: 1fr;
   }
@@ -2145,4 +2167,3 @@ button {
     display: none;
   }
 }
-

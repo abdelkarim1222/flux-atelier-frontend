@@ -403,7 +403,7 @@ export default function GestionEquipesView() {
 
         {/* Table Container */}
         <div className="overflow-x-auto">
-          <table className="w-full text-left border-collapse text-xs">
+          <table className="zebra-table w-full text-left border-collapse text-xs">
             <thead>
               <tr className="bg-[#e7edf6] text-slate-700 text-[11px] font-extrabold border-b border-slate-300 select-none">
                 <th className="py-2 px-3 border-r border-slate-300 w-[26%] text-center">

@@ -107,6 +107,7 @@ type SortField =
   | "dateEntreeHeure"
   | "noOr"
   | "immatriculation"
+  | "modele"
   | "nomClient"
   | "etat"
   | "equipe"
@@ -270,6 +271,7 @@ export default function SuiviEntreesTable({ onNavigateToMap, initialNotice }: Su
   const [search, setSearch] = useState("");
   const [selectedEquipe, setSelectedEquipe] = useState<string>("Toutes");
   const [selectedEtat, setSelectedEtat] = useState<string>("Tous");
+  const [selectedRowIds, setSelectedRowIds] = useState<Set<string>>(new Set());
   const [isModalOpen, setIsModalOpen] = useState(false);
   const [isHistoricalModalOpen, setIsHistoricalModalOpen] = useState(false);
   const [isVinModalOpen, setIsVinModalOpen] = useState(false);
@@ -288,6 +290,15 @@ export default function SuiviEntreesTable({ onNavigateToMap, initialNotice }: Su
     }
   }, [initialNotice]);
 
+  // A refresh may remove a dossier; do not keep it in the multi-selection.
+  useEffect(() => {
+    const availableIds = new Set(items.map((item) => item.id));
+    setSelectedRowIds((current) => {
+      const next = new Set([...current].filter((id) => availableIds.has(id)));
+      return next.size === current.size ? current : next;
+    });
+  }, [items]);
+
   // Modal Mode de paiement (affiché quand on clique « Livrer » en override Direction)
   const [paiementModal, setPaiementModal] = useState<{
     item: UnifiedReceptionRow;
@@ -298,16 +309,14 @@ export default function SuiviEntreesTable({ onNavigateToMap, initialNotice }: Su
   const [returnTeam, setReturnTeam] = useState("");
   const [returnSaving, setReturnSaving] = useState(false);
 
+  // Ces modes sont les seules autorisations de sortie reconnues par la
+  // Facturation. Les moyens d'encaissement (espèces, carte, chèque, etc.)
+  // restent des informations de règlement distinctes et ne doivent pas
+  // contourner la validation Facturation.
   const MODES_PAIEMENT = [
-    { value: "Facture",                 icon: "📄" },
-    { value: "Bon de commande",         icon: "📋" },
-    { value: "Att Facture",             icon: "📑" },
-    { value: "Édition fin de travaux",  icon: "📑" },
-    { value: "Espèces",                 icon: "💵" },
-    { value: "Chèque",                  icon: "📝" },
-    { value: "Virement",                icon: "🏦" },
-    { value: "Carte bancaire",          icon: "💳" },
-    { value: "Autre",                   icon: "⚙️" },
+    { value: "Facture", icon: "📄" },
+    { value: "Bon de commande", icon: "📋" },
+    { value: "Att Facture", icon: "📑" },
   ];
 
   const RETURN_TEAMS = ["Daily1", "Daily2", "Changan", "Lourd", "Service Rapide", "Électrique", "Carrosserie"];
@@ -566,6 +575,28 @@ export default function SuiviEntreesTable({ onNavigateToMap, initialNotice }: Su
         const immatriculation =
           s.immatriculation || f?.immatriculation || f?.serie || "-";
 
+        // Résolution de la date et heure d'entrée authentique :
+        // La date d'entrée d'un véhicule ne peut jamais être postérieure au début ou à la fin des travaux.
+        const fEntreeHeure = (f as any)?.dateEntreeHeure;
+        const sEntreeHeure = s.dateEntreeHeure;
+        const debutTravaux = f?.dateDebutRep || f?.dateDebutTravail || (s as any).dateDebutRep || (s as any).dateDebutTravail;
+        const finTravaux = f?.dateFinRep || (f as any)?.dateFin || (s as any).dateFinRep || (s as any).dateFin;
+
+        let dateEntreeHeure = sEntreeHeure || fEntreeHeure || f?.dateEntree;
+        if (fEntreeHeure) {
+          if (!sEntreeHeure) {
+            dateEntreeHeure = fEntreeHeure;
+          } else if (fEntreeHeure !== sEntreeHeure) {
+            if (finTravaux && sEntreeHeure >= finTravaux && fEntreeHeure < finTravaux) {
+              dateEntreeHeure = fEntreeHeure;
+            } else if (debutTravaux && sEntreeHeure > debutTravaux && fEntreeHeure <= debutTravaux) {
+              dateEntreeHeure = fEntreeHeure;
+            } else if (fEntreeHeure < sEntreeHeure) {
+              dateEntreeHeure = fEntreeHeure;
+            }
+          }
+        }
+
         return {
           id: String((s as any).recordKey || s.id || `suivi-${idx}`),
           recordKey: String((s as any).recordKey || (f as any)?.recordKey || ""),
@@ -588,7 +619,7 @@ export default function SuiviEntreesTable({ onNavigateToMap, initialNotice }: Su
           avancement,
           dateFinRep,
           emplacement,
-          dateEntreeHeure: s.dateEntreeHeure || f?.dateEntree,
+          dateEntreeHeure,
           marque: s.marque || f?.marque || "IVECO",
           modele: s.modele || f?.modele || "-",
           categorie: s.categorie || f?.categorie,
@@ -651,7 +682,7 @@ export default function SuiviEntreesTable({ onNavigateToMap, initialNotice }: Su
           avancement: f.avancement || "-",
           dateFinRep: f.dateFinRep || "-",
           emplacement,
-          dateEntreeHeure: f.dateEntree,
+          dateEntreeHeure: (f as any).dateEntreeHeure || f.dateEntree,
           marque: f.marque || "IVECO",
           modele: f.modele || "-",
           categorie: f.categorie,
@@ -1021,6 +1052,11 @@ export default function SuiviEntreesTable({ onNavigateToMap, initialNotice }: Su
         return sortDirection === "asc" ? comparison : -comparison;
       }
 
+      if (sortField === "modele") {
+        comparison = (a.modele || "").localeCompare(b.modele || "", undefined, { numeric: true });
+        return sortDirection === "asc" ? comparison : -comparison;
+      }
+
       if (sortField === "etat") {
         comparison = a.etat.localeCompare(b.etat);
         return sortDirection === "asc" ? comparison : -comparison;
@@ -1076,6 +1112,26 @@ export default function SuiviEntreesTable({ onNavigateToMap, initialNotice }: Su
     sortDirection,
     role,
   ]);
+
+  const allFilteredRowsSelected = filteredData.length > 0 && filteredData.every((item) => selectedRowIds.has(item.id));
+
+  const toggleRowSelection = (id: string) => {
+    setSelectedRowIds((current) => {
+      const next = new Set(current);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  };
+
+  const toggleAllFilteredRows = () => {
+    setSelectedRowIds((current) => {
+      const next = new Set(current);
+      if (allFilteredRowsSelected) filteredData.forEach((item) => next.delete(item.id));
+      else filteredData.forEach((item) => next.add(item.id));
+      return next;
+    });
+  };
 
   const getEtatBadge = (etat: string) => {
     const e = (etat || "").toLowerCase();
@@ -1500,10 +1556,32 @@ export default function SuiviEntreesTable({ onNavigateToMap, initialNotice }: Su
 
       {/* Main Unified Table */}
       <div className="bg-white/95 backdrop-blur-md rounded-2xl border border-white/60 shadow-lg flex-1 flex flex-col min-h-[460px] overflow-hidden">
+        {selectedRowIds.size > 0 && (
+          <div className="px-4 py-2 border-b border-emerald-200 bg-emerald-50 flex items-center justify-between gap-3 text-xs">
+            <span className="font-bold text-emerald-900">{selectedRowIds.size} véhicule(s) sélectionné(s)</span>
+            <button
+              type="button"
+              onClick={() => setSelectedRowIds(new Set())}
+              className="font-bold text-emerald-800 hover:text-emerald-950 underline cursor-pointer"
+            >
+              Désélectionner tout
+            </button>
+          </div>
+        )}
         <div className="overflow-x-auto flex-1">
-          <table className="w-full min-w-[1280px] text-left border-collapse text-xs">
+          <table className="zebra-table w-full min-w-[1440px] text-left border-collapse text-xs">
             <thead>
               <tr className="bg-slate-100/90 border-b border-slate-200 text-slate-600 font-bold uppercase tracking-wider text-[11px] select-none sticky top-0 z-10 backdrop-blur-md">
+                <th className="py-3 px-3 text-center w-10" title="Sélectionner les véhicules affichés">
+                  <input
+                    type="checkbox"
+                    checked={allFilteredRowsSelected}
+                    onChange={toggleAllFilteredRows}
+                    aria-label="Sélectionner tous les véhicules affichés"
+                    className="w-4 h-4 accent-emerald-600 cursor-pointer"
+                  />
+                </th>
+
                 {/* 1. N° OR */}
                 <th
                   onClick={() => handleSort("noOr")}
@@ -1546,7 +1624,19 @@ export default function SuiviEntreesTable({ onNavigateToMap, initialNotice }: Su
                   </div>
                 </th>
 
-                {/* 5. Client */}
+                {/* 5. Modèle */}
+                <th
+                  onClick={() => handleSort("modele")}
+                  className="py-3 px-3.5 whitespace-nowrap cursor-pointer hover:bg-slate-200/60 transition-colors group"
+                  title="Cliquez pour trier par Modèle"
+                >
+                  <div className="flex items-center gap-1.5">
+                    <span>Modèle</span>
+                    {renderSortIndicator("modele")}
+                  </div>
+                </th>
+
+                {/* 6. Client */}
                 <th
                   onClick={() => handleSort("nomClient")}
                   className="py-3 px-4 min-w-[190px] cursor-pointer hover:bg-slate-200/60 transition-colors group"
@@ -1558,7 +1648,7 @@ export default function SuiviEntreesTable({ onNavigateToMap, initialNotice }: Su
                   </div>
                 </th>
 
-                {/* 6. État (Modifiable si Avancement = Terminer) */}
+                {/* 7. État (Modifiable si Avancement = Terminer) */}
                 <th
                   onClick={() => handleSort("etat")}
                   className="py-3 px-3.5 whitespace-nowrap cursor-pointer hover:bg-slate-200/60 transition-colors group"
@@ -1570,7 +1660,7 @@ export default function SuiviEntreesTable({ onNavigateToMap, initialNotice }: Su
                   </div>
                 </th>
 
-                {/* 7. EQUIPE */}
+                {/* 8. EQUIPE */}
                 <th
                   onClick={() => handleSort("equipe")}
                   className="py-3 px-3.5 whitespace-nowrap cursor-pointer hover:bg-slate-200/60 transition-colors group"
@@ -1582,7 +1672,7 @@ export default function SuiviEntreesTable({ onNavigateToMap, initialNotice }: Su
                   </div>
                 </th>
 
-                {/* 8. N° Matricule */}
+                {/* 9. N° Matricule */}
                 <th
                   onClick={() => handleSort("matricule")}
                   className="py-3 px-3.5 whitespace-nowrap cursor-pointer hover:bg-slate-200/60 transition-colors group"
@@ -1594,7 +1684,7 @@ export default function SuiviEntreesTable({ onNavigateToMap, initialNotice }: Su
                   </div>
                 </th>
 
-                {/* 9. AVANCEMENT */}
+                {/* 10. AVANCEMENT */}
                 <th
                   onClick={() => handleSort("avancement")}
                   className="py-3 px-3.5 min-w-[140px] cursor-pointer hover:bg-slate-200/60 transition-colors group"
@@ -1606,7 +1696,7 @@ export default function SuiviEntreesTable({ onNavigateToMap, initialNotice }: Su
                   </div>
                 </th>
 
-                {/* 10. Date Fin Rép. */}
+                {/* 11. Date Fin Rép. */}
                 <th
                   onClick={() => handleSort("dateFinRep")}
                   className="py-3 px-3.5 whitespace-nowrap cursor-pointer hover:bg-slate-200/60 transition-colors group"
@@ -1618,7 +1708,7 @@ export default function SuiviEntreesTable({ onNavigateToMap, initialNotice }: Su
                   </div>
                 </th>
 
-                {/* 11. Emplacement (Modifiable si Avancement = Terminer) */}
+                {/* 12. Emplacement (Modifiable si Avancement = Terminer) */}
                 <th
                   onClick={() => handleSort("emplacement")}
                   className="py-3 px-3.5 whitespace-nowrap cursor-pointer hover:bg-slate-200/60 transition-colors group"
@@ -1630,7 +1720,7 @@ export default function SuiviEntreesTable({ onNavigateToMap, initialNotice }: Su
                   </div>
                 </th>
 
-                {/* 12. Actions (Modifier / Supprimer) - Réservé Direction */}
+                {/* 13. Actions (Modifier / Supprimer) - Réservé Direction */}
                 {canManageActions && (
                   <th className="py-3 px-3.5 whitespace-nowrap text-center sticky right-0 bg-slate-100/95 backdrop-blur-md shadow-[-4px_0_6px_-2px_rgba(0,0,0,0.05)] z-10">
                     Actions
@@ -1641,7 +1731,7 @@ export default function SuiviEntreesTable({ onNavigateToMap, initialNotice }: Su
             <tbody className="divide-y divide-slate-100">
               {loading && items.length === 0 ? (
                 <tr>
-                  <td colSpan={canManageActions ? 13 : 12} className="py-16 text-center text-slate-400">
+                  <td colSpan={canManageActions ? 15 : 14} className="py-16 text-center text-slate-400">
                     <div className="flex flex-col items-center justify-center gap-2.5">
                       <RefreshCcw className="w-7 h-7 animate-spin text-emerald-600" />
                       <p className="font-semibold text-slate-700 text-sm">
@@ -1655,7 +1745,7 @@ export default function SuiviEntreesTable({ onNavigateToMap, initialNotice }: Su
                 </tr>
               ) : filteredData.length === 0 ? (
                 <tr>
-                  <td colSpan={canManageActions ? 13 : 12} className="py-16 text-center text-slate-400">
+                  <td colSpan={canManageActions ? 15 : 14} className="py-16 text-center text-slate-400">
                     <div className="flex flex-col items-center justify-center gap-2">
                       <Car className="w-9 h-9 text-slate-300" />
                       <p className="font-bold text-slate-700 text-sm">
@@ -1717,6 +1807,19 @@ export default function SuiviEntreesTable({ onNavigateToMap, initialNotice }: Su
                       className={`hover:bg-blue-50/40 transition-colors group ${canViewDetails ? "cursor-pointer" : ""}`}
                       title={canViewDetails ? "Cliquer pour voir la fiche détaillée et la condition du véhicule" : undefined}
                     >
+                      <td
+                        className="py-3 px-3 text-center"
+                        onClick={(event) => event.stopPropagation()}
+                      >
+                        <input
+                          type="checkbox"
+                          checked={selectedRowIds.has(item.id)}
+                          onChange={() => toggleRowSelection(item.id)}
+                          aria-label={`Sélectionner le dossier ${item.noOr || item.id}`}
+                          className="w-4 h-4 accent-emerald-600 cursor-pointer"
+                        />
+                      </td>
+
                       {/* 1. N° OR */}
                       <td className="py-3 px-3.5 font-bold text-slate-900 whitespace-nowrap">
                         <div className="flex items-center gap-1.5">
@@ -1774,7 +1877,18 @@ export default function SuiviEntreesTable({ onNavigateToMap, initialNotice }: Su
                         )}
                       </td>
 
-                      {/* 5. Client */}
+                      {/* 5. Modèle */}
+                      <td className="py-3 px-3.5 whitespace-nowrap">
+                        {item.modele && item.modele !== "-" ? (
+                          <span className="inline-flex items-center px-2 py-0.5 rounded font-mono font-bold text-[11px] bg-violet-50 text-violet-800 border border-violet-200">
+                            {item.modele}
+                          </span>
+                        ) : (
+                          <span className="text-slate-300 italic text-[11px]">-</span>
+                        )}
+                      </td>
+
+                      {/* 6. Client */}
                       <td className="py-3 px-4">
                         <div className="font-bold text-slate-900 leading-snug">
                           {item.nomClient}
@@ -1887,19 +2001,6 @@ export default function SuiviEntreesTable({ onNavigateToMap, initialNotice }: Su
                                 </button>
                               )}
                             </div>
-
-                            {/* Ligne 2 : Boîte bleue Début : date/heure (affichée pour tous, Réception comprise, conforme à l'image) */}
-                            {(item.dateDebutRep || item.dateDebutTravail || item.dateEntreeHeure) && (
-                              <div
-                                className="text-[11px] font-medium text-blue-700 bg-blue-50/90 px-2 py-0.5 rounded-md border border-blue-200 flex items-center gap-1.5 w-fit mt-0.5"
-                                title={`Début des travaux : ${item.dateDebutRep || item.dateDebutTravail || item.dateEntreeHeure}`}
-                              >
-                                <Clock size={12} className="text-blue-600 shrink-0" />
-                                <span>
-                                  Début : {item.dateDebutRep || item.dateDebutTravail || formatDisplayDate(item.dateEntreeHeure)}
-                                </span>
-                              </div>
-                            )}
                           </div>
                         ) : (
                           <div
@@ -2429,7 +2530,7 @@ export default function SuiviEntreesTable({ onNavigateToMap, initialNotice }: Su
             {/* Body */}
             <div className="px-6 py-5">
               <p className="text-sm font-semibold text-slate-700 mb-4">
-                Sélectionnez le <span className="text-emerald-700">mode de paiement</span> avant de confirmer la livraison :
+                Sélectionnez le <span className="text-emerald-700">mode validé par la Facturation</span> avant de confirmer la livraison :
               </p>
 
               <div className="grid grid-cols-2 gap-3">
