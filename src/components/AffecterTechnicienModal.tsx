@@ -232,7 +232,8 @@ export function isVehicleActivelyOccupyingTech(
     normAv === "attends acheter" ||
     normAv.includes("achet") ||
     normAv === "atende devis" ||
-    normAv.includes("devis")
+    normAv.includes("devis") ||
+    normAv.includes("accord")
   ) {
     return false;
   }
@@ -305,6 +306,7 @@ interface AffecterTechnicienModalProps {
   allVehicles?: Flux[];
   reaffectationsMap?: Record<string, ReaffectationRecord>;
   assignedTeam: string;
+  allowedTeams?: string[];
   equipeMembers: EquipeMember[];
   isOnlyTechnicienChange?: boolean;
   isTransferAcceptance?: boolean;
@@ -326,6 +328,7 @@ export default function AffecterTechnicienModal({
   allVehicles = [],
   reaffectationsMap,
   assignedTeam,
+  allowedTeams,
   equipeMembers,
   isOnlyTechnicienChange = false,
   isTransferAcceptance = false,
@@ -334,7 +337,20 @@ export default function AffecterTechnicienModal({
   onConfirm,
   onConfirmWithoutTech,
 }: AffecterTechnicienModalProps) {
-  const [currentTeam, setCurrentTeam] = useState<string>(assignedTeam || "Daily1");
+  const initialResolvedTeam = useMemo(() => {
+    if (vehicle?.equipe && !vehicle.equipe.includes(",") && vehicle.equipe.trim() !== "-") {
+      return vehicle.equipe.trim();
+    }
+    if (assignedTeam && !assignedTeam.includes(",") && assignedTeam.trim() !== "-") {
+      return assignedTeam.trim();
+    }
+    if (assignedTeam && assignedTeam.includes(",")) {
+      return assignedTeam.split(",")[0].trim() || "Daily1";
+    }
+    return "Daily1";
+  }, [vehicle?.equipe, assignedTeam]);
+
+  const [currentTeam, setCurrentTeam] = useState<string>(initialResolvedTeam);
   const [selectedMatricule, setSelectedMatricule] = useState<string>("");
   const [selectedNom, setSelectedNom] = useState<string>("");
   const [selectedPoste, setSelectedPoste] = useState<string>("");
@@ -379,8 +395,14 @@ export default function AffecterTechnicienModal({
     openedVehicleKeyRef.current = currentKey;
 
     setLocalCustomMembers(getCustomEquipeMembers());
-    setLocalReaffMap(getReaffectationsLocal());
-    const targetTeam = assignedTeam && assignedTeam.trim() !== "-" ? assignedTeam.trim() : "Daily1";
+    let targetTeam = "Daily1";
+    if (vehicle.equipe && !vehicle.equipe.includes(",") && vehicle.equipe.trim() !== "-") {
+      targetTeam = vehicle.equipe.trim();
+    } else if (assignedTeam && !assignedTeam.includes(",") && assignedTeam.trim() !== "-") {
+      targetTeam = assignedTeam.trim();
+    } else if (assignedTeam && assignedTeam.includes(",")) {
+      targetTeam = assignedTeam.split(",")[0].trim() || "Daily1";
+    }
     setCurrentTeam(targetTeam);
     setShowOtherTeams(false);
     setOccupiedAlert(null);
@@ -576,6 +598,14 @@ export default function AffecterTechnicienModal({
     setSelectedMatricule(member.matricule);
     setSelectedNom(member.name);
     setSelectedPoste(member.poste);
+
+    // Si le collaborateur appartient à une équipe spécifique autorisée, synchroniser l'équipe du véhicule
+    const memberTeam = member.team && !member.team.includes(",") ? member.team.trim() : "";
+    if (memberTeam) {
+      if (!allowedTeams || allowedTeams.some((at) => normalizeTeamName(at) === normalizeTeamName(memberTeam))) {
+        setCurrentTeam(memberTeam);
+      }
+    }
   };
 
   const handleSubmit = async (e: React.FormEvent) => {
@@ -606,6 +636,8 @@ export default function AffecterTechnicienModal({
       }
     }
 
+    const safeTeam = (currentTeam || "Daily1").split(",")[0].trim() || "Daily1";
+
     setIsSubmitting(true);
     try {
       await onConfirm({
@@ -613,7 +645,7 @@ export default function AffecterTechnicienModal({
         technicien: selectedMatricule.trim() || "-",
         nomTechnicien: selectedNom.trim() || "-",
         poste: selectedPoste.trim() || "-",
-        equipe: currentTeam || assignedTeam || "Daily1",
+        equipe: safeTeam,
       });
       onClose();
     } finally {
@@ -623,9 +655,10 @@ export default function AffecterTechnicienModal({
 
   const handleSkipTech = async () => {
     if (!vehicle || !onConfirmWithoutTech) return;
+    const safeTeam = (currentTeam || "Daily1").split(",")[0].trim() || "Daily1";
     setIsSubmitting(true);
     try {
-      await onConfirmWithoutTech(vehicle, currentTeam || assignedTeam || "Daily1");
+      await onConfirmWithoutTech(vehicle, safeTeam);
       onClose();
     } finally {
       setIsSubmitting(false);
@@ -697,14 +730,14 @@ export default function AffecterTechnicienModal({
             ) : null}
           </div>
 
-          {/* Optional Team Selector for Chef Atelier / Admin */}
-          {canChangeTeam && (
+          {/* Optional Team Selector for Chef Atelier / Admin / Chef multi-équipes */}
+          {(canChangeTeam || (allowedTeams && allowedTeams.length > 1)) && (
             <div className="space-y-1.5 bg-slate-50 p-3 rounded-xl border border-slate-200">
               <span className="text-[11px] font-bold text-slate-600 block">
-                Changer d'équipe (Accès Responsable) :
+                {allowedTeams && allowedTeams.length > 1 ? "Changer d'équipe (Mes équipes) :" : "Changer d'équipe (Accès Responsable) :"}
               </span>
               <div className="flex flex-wrap gap-1.5">
-                {availableTeams.map((teamName) => {
+                {(allowedTeams && allowedTeams.length > 0 ? allowedTeams : availableTeams).map((teamName) => {
                   const isActive = normalizeTeamName(currentTeam) === normalizeTeamName(teamName);
                   return (
                     <button

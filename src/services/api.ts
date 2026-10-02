@@ -144,7 +144,7 @@ export async function hydrateSqlLocalCache(currentRole?: string): Promise<void> 
   if (typeof window === 'undefined') return;
   const role = currentRole || localStorage.getItem('flux_atelier_active_role') || '';
   const canEssai = !role || ['administration', 'chef_atelier', 'chef_equipe'].includes(role);
-  const canViewVehicleTimes = !role || ['administration', 'chef_atelier', 'chef_equipe'].includes(role);
+  const canViewVehicleTimes = !role || ['administration', 'chef_atelier', 'chef_equipe', 'garantie'].includes(role);
 
   for (const storageKey of [
     'flux_atelier_demandes_achat', 'flux_atelier_demandes_devis', 'flux_atelier_essais_controle',

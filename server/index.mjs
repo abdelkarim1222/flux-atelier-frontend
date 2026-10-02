@@ -16,7 +16,7 @@ const SESSION_SECRET = process.env.SESSION_SECRET || (process.env.NODE_ENV === '
 const SESSION_TTL_SECONDS = 60 * 60 * 12;
 const COOKIE_NAME = 'flux_atelier_session';
 const WORKSHOP_TIME_ZONE = process.env.WORKSHOP_TIME_ZONE || 'Africa/Tunis';
-const ROLE_VALUES = new Set(['administration', 'chef_atelier', 'reception', 'chef_equipe', 'facturation']);
+const ROLE_VALUES = new Set(['administration', 'chef_atelier', 'reception', 'chef_equipe', 'facturation', 'garantie']);
 const VEHICLE_COLLECTIONS = new Set(['flux', 'reception', 'vin']);
 const RECORD_COLLECTIONS = new Set([
   'teams', 'averages', 'purchases', 'quotes', 'essai_controls',
@@ -397,11 +397,24 @@ function getRecordKey(record) {
   ).trim();
 }
 
+function sanitizeSingleTeam(teamVal, fallback = 'Daily1') {
+  if (!teamVal || typeof teamVal !== 'string') return fallback;
+  const clean = teamVal.trim();
+  if (!clean || clean === '-' || clean === 'NA') return fallback;
+  if (!clean.includes(',')) return clean;
+  const parts = clean.split(',').map((t) => t.trim()).filter(Boolean);
+  return parts[0] || fallback;
+}
+
 function getVehicleColumns(record) {
+  let teamVal = record?.equipe ?? record?.atelier ?? null;
+  if (teamVal && typeof teamVal === 'string' && teamVal.includes(',')) {
+    teamVal = sanitizeSingleTeam(teamVal);
+  }
   return [
     record?.noOr ?? record?.no ?? record?.numeroOR ?? record?.or ?? record?.ordre ?? null,
     record?.chassis ?? record?.vin ?? null,
-    record?.equipe ?? record?.atelier ?? null,
+    teamVal,
     record?.etatIntervention ?? record?.etat ?? record?.statut ?? null,
     record?.avancement ?? null,
     record?.emplacement ?? null,
@@ -441,6 +454,11 @@ async function requireAdministrator(req, res) {
 }
 
 async function saveVehicleRecord(client, type, record, recordKey) {
+  if (record && typeof record === 'object') {
+    if (typeof record.equipe === 'string' && record.equipe.includes(',')) {
+      record.equipe = sanitizeSingleTeam(record.equipe);
+    }
+  }
   const [noOr, chassis, team, status, advancement, location] = getVehicleColumns(record);
   await client.query(
     `INSERT INTO vehicles (record_type, record_key, no_or, chassis, team, status, advancement, location, payload)
@@ -505,42 +523,61 @@ async function updateVehicleBySelectors(query, updates, preferredType, allowedTe
   }
   const accessClause = accessFilters.length ? `AND ${accessFilters.join(' AND ')}` : '';
   let found = await pool.query(
-    `SELECT id, record_type, record_key, payload FROM vehicles
-     WHERE (($1 <> '' AND (no_or = $1 OR UPPER(TRIM(no_or)) = UPPER(TRIM($1)) OR record_key = $1 OR payload->>'numeroOR' = $1 OR payload->>'noOr' = $1 OR payload->>'no' = $1 OR payload->>'or' = $1 OR UPPER(TRIM(payload->>'or')) = UPPER(TRIM($1)) OR UPPER(TRIM(payload->>'noOr')) = UPPER(TRIM($1))))
-        OR ($2 <> '' AND (chassis = $2 OR UPPER(chassis) = UPPER($2) OR UPPER(payload->>'vin') = UPPER($2) OR UPPER(payload->>'chassis') = UPPER($2) OR REPLACE(UPPER(COALESCE(chassis,'')), ' ', '') = REPLACE(UPPER($2), ' ', '') OR REPLACE(UPPER(COALESCE(payload->>'vin','')), ' ', '') = REPLACE(UPPER($2), ' ', '')))
-        OR ($3 <> '' AND (payload->>'sheetRowNumber' = $3 OR payload->>'rowNumber' = $3))
-        OR ($4 <> '' AND (record_key = $4 OR payload->>'id' = $4 OR id::text = $4))
-        OR ($5 <> '' AND (no_or = $5 OR UPPER(TRIM(no_or)) = UPPER(TRIM($5)) OR record_key = $5 OR payload->>'noOr' = $5 OR payload->>'numeroOR' = $5 OR payload->>'no' = $5 OR payload->>'or' = $5))
-        OR ($6 <> '' AND (chassis = $6 OR UPPER(chassis) = UPPER($6) OR UPPER(payload->>'vin') = UPPER($6) OR UPPER(payload->>'chassis') = UPPER($6) OR REPLACE(UPPER(COALESCE(chassis,'')), ' ', '') = REPLACE(UPPER($6), ' ', '')))
-        OR ($7 <> '' AND (id::text = $7 OR payload->>'id' = $7 OR record_key = $7)))
+    `SELECT id, record_type, record_key, team, status, location, payload FROM vehicles
+     WHERE (
+       ($1 <> '' AND (no_or = $1 OR UPPER(TRIM(no_or)) = UPPER(TRIM($1)) OR record_key = $1 OR payload->>'numeroOR' = $1 OR payload->>'noOr' = $1 OR payload->>'no' = $1 OR payload->>'or' = $1 OR UPPER(TRIM(payload->>'or')) = UPPER(TRIM($1)) OR UPPER(TRIM(payload->>'noOr')) = UPPER(TRIM($1))))
+       OR ($5 <> '' AND (no_or = $5 OR UPPER(TRIM(no_or)) = UPPER(TRIM($5)) OR record_key = $5 OR payload->>'noOr' = $5 OR payload->>'numeroOR' = $5 OR payload->>'no' = $5 OR payload->>'or' = $5))
+       OR ($4 <> '' AND (record_key = $4 OR payload->>'id' = $4 OR id::text = $4 OR payload->>'recordKey' = $4))
+       OR ($7 <> '' AND (id::text = $7 OR payload->>'id' = $7 OR record_key = $7))
+       OR ($3 <> '' AND (payload->>'sheetRowNumber' = $3 OR payload->>'rowNumber' = $3))
+       -- Le châssis seul ne sert de filtre QUE si aucun N° OR ni identifiant précis n'est spécifié
+       OR ($1 = '' AND $4 = '' AND $5 = '' AND $7 = '' AND $2 <> '' AND (chassis = $2 OR UPPER(chassis) = UPPER($2) OR UPPER(payload->>'vin') = UPPER($2) OR UPPER(payload->>'chassis') = UPPER($2) OR REPLACE(UPPER(COALESCE(chassis,'')), ' ', '') = REPLACE(UPPER($2), ' ', '') OR REPLACE(UPPER(COALESCE(payload->>'vin','')), ' ', '') = REPLACE(UPPER($2), ' ', '')))
+       OR ($1 = '' AND $4 = '' AND $5 = '' AND $7 = '' AND $6 <> '' AND (chassis = $6 OR UPPER(chassis) = UPPER($6) OR UPPER(payload->>'vin') = UPPER($6) OR UPPER(payload->>'chassis') = UPPER($6) OR REPLACE(UPPER(COALESCE(chassis,'')), ' ', '') = REPLACE(UPPER($6), ' ', '') OR REPLACE(UPPER(COALESCE(payload->>'vin','')), ' ', '') = REPLACE(UPPER($6), ' ', '')))
+     )
      ${accessClause}
      ORDER BY updated_at DESC, id DESC`,
     params,
   );
-  // Quand un OR est connu, il est l'identifiant du dossier. Un châssis peut
-  // légitimement apparaître dans plusieurs OR (retour ultérieur du même véhicule).
-  // Une intervention réouverte possède sa propre clé : les mises à jour
-  // ultérieures doivent viser cette intervention uniquement, jamais l'ancien
-  // dossier livré qui partage le même OR et le même châssis.
-  if (recordKey || targetId) {
-    const exactKey = recordKey || targetId;
-    const rows = found.rows.filter((row) =>
-      String(row.record_key || '') === exactKey || String(row.payload?.recordKey || row.payload?.id || '') === exactKey
-    );
-    found = { ...found, rows, rowCount: rows.length };
-  } else if (noOr) {
-    const normalizedOr = noOr.toUpperCase();
+  // Quand un OR est connu, il est l'identifiant strict du dossier. Un châssis peut
+  // légitimement apparaître dans plusieurs OR (retour ultérieur ou nouvelle entrée).
+  // La mise à jour doit mettre à jour les enregistrements (flux et réception) liés à cet OR.
+  const effectiveOr = noOr || origNo;
+  if (effectiveOr) {
+    const normalizedOr = effectiveOr.toUpperCase();
     const rows = found.rows.filter((row) => {
       const rowOr = String(
         row.no_or || row.payload?.noOr || row.payload?.numeroOR || row.payload?.no || row.payload?.or || ''
       ).trim().toUpperCase();
       return rowOr === normalizedOr;
     });
-    found = {
-      ...found,
-      rows,
-      rowCount: rows.length,
-    };
+    if (rows.length > 0) {
+      if (recordKey || targetId) {
+        const exactKey = recordKey || targetId;
+        const sub = rows.filter((row) => {
+          const rKey = String(row.record_key || '');
+          const pKey = String(row.payload?.recordKey || '');
+          const pId = String(row.payload?.id || '');
+          const rowId = String(row.id || '');
+          return rKey === exactKey || pKey === exactKey || pId === exactKey || rowId === exactKey
+            || (exactKey && (rKey.endsWith(`_${exactKey}`) || pKey.endsWith(`_${exactKey}`)))
+            || (exactKey.includes('_') && (rKey === exactKey.split('_').slice(1).join('_') || pId === exactKey.split('_').slice(1).join('_')));
+        });
+        found = { ...found, rows: sub.length > 0 ? sub : rows, rowCount: sub.length > 0 ? sub.length : rows.length };
+      } else {
+        found = { ...found, rows, rowCount: rows.length };
+      }
+    }
+  } else if (recordKey || targetId) {
+    const exactKey = recordKey || targetId;
+    const rows = found.rows.filter((row) => {
+      const rKey = String(row.record_key || '');
+      const pKey = String(row.payload?.recordKey || '');
+      const pId = String(row.payload?.id || '');
+      const rowId = String(row.id || '');
+      return rKey === exactKey || pKey === exactKey || pId === exactKey || rowId === exactKey
+        || (exactKey && (rKey.endsWith(`_${exactKey}`) || pKey.endsWith(`_${exactKey}`)));
+    });
+    found = { ...found, rows, rowCount: rows.length };
   }
   if (!found.rowCount) return false;
 
@@ -619,18 +656,34 @@ async function updateVehicleBySelectors(query, updates, preferredType, allowedTe
   }
   for (const current of found.rows) {
     const payload = { ...current.payload, ...updates };
+    const workState = String(updates.etat || updates.etatIntervention || updates.statut || updates.avancement || '').toLowerCase();
+    const startsWork = workState.includes('en cours') || /\d+\s*%/.test(workState);
+    const existingWorkStart = String(
+      current.payload?.dateDebutTravail || current.payload?.dateDebutRep || ''
+    ).trim();
+
+    // Le premier passage « En cours » définit le départ de la chronométrie.
+    // Les changements 20 %, 30 %… doivent garder cette référence, même si le
+    // navigateur ou une autre session transmet une nouvelle date.
+    if (startsWork && existingWorkStart) {
+      payload.dateDebutRep = current.payload?.dateDebutRep || existingWorkStart;
+      payload.dateDebutTravail = current.payload?.dateDebutTravail || existingWorkStart;
+      payload.heureDebutTravail = current.payload?.heureDebutTravail || String(existingWorkStart.split(' ')[1] || '');
+    }
     if (updates.etat !== undefined) {
+      payload.etat = updates.etat;
       payload.etatIntervention = updates.etat;
       payload.statut = updates.etat;
     }
     if (updates.etatIntervention !== undefined) {
       payload.etat = updates.etatIntervention;
+      payload.etatIntervention = updates.etatIntervention;
       payload.statut = updates.etatIntervention;
     }
     if (updates.emplacement !== undefined) payload.emplacement = updates.emplacement;
     if (updates.technicien !== undefined) payload.technicien = updates.technicien;
     if (updates.nomTechnicien !== undefined) payload.nomTechnicien = updates.nomTechnicien;
-    if (updates.equipe !== undefined) payload.equipe = updates.equipe;
+    if (updates.equipe !== undefined) payload.equipe = sanitizeSingleTeam(updates.equipe, current.payload?.equipe || current.team || 'Daily1');
     if (updates.avancement !== undefined) payload.avancement = updates.avancement;
     await saveVehicleRecord(pool, current.record_type, payload, current.record_key);
   }
@@ -743,11 +796,11 @@ async function handleDatabaseAction(req, res, url) {
   };
 
   const managementRoles = new Set(['administration', 'chef_atelier']);
-  const receptionRoles = new Set([...managementRoles, 'reception']);
+  const receptionRoles = new Set([...managementRoles, 'reception', 'garantie']);
   const workshopRoles = new Set([...managementRoles, 'chef_equipe']);
   const facturationRoles = new Set([...managementRoles, 'facturation']);
   const managementActions = new Set(['getComptes', 'sauvegarderEquipes', 'updateMoyennesPeriode']);
-  const receptionActions = new Set(['ajouterEntree', 'updateStatutDevis', 'livrerVehicule', 'traiterRetourReouvert']);
+  const receptionActions = new Set(['ajouterEntree', 'updateStatutDevis', 'livrerVehicule', 'traiterRetourReouvert', 'updateStatutGarantie', 'supprimerDossierGarantie']);
   const workshopActions = new Set(['updateEmplacement', 'updateEtat', 'updateTechnicien', 'updateAvancement', 'synchroniserEntrees', 'repararValidations', 'accepterEntreeChefEquipe']);
   const facturationActions = new Set(['validerFacturation', 'marquerFacture']);
   const managementOnlyActions = new Set(['ajouterVin', 'modifierVin', 'ajouterEntreeHistorique', 'updateStatutAchat', 'modifierEntree', 'supprimerEntree']);
@@ -775,13 +828,30 @@ async function handleDatabaseAction(req, res, url) {
     return sendActionResult(res, { ok: false, error: 'Action réservée à la réception et à la direction atelier.' });
   }
   if (workshopActions.has(action) && !workshopRoles.has(account.role) && !hasWorkshopPerm) {
-    if (action === 'updateEtat' && account.role === 'reception') {
+    if (action === 'updateEtat' && (account.role === 'reception' || account.role === 'garantie' || hasReceptionPerm)) {
       const targetEtat = String(query.get('etat') || query.get('etatIntervention') || '');
-      if (targetEtat === 'Livré') {
-        // Autorisé pour la réception afin de livrer le véhicule
+      if (targetEtat === 'Livré' || targetEtat === 'Attente Réparation' || targetEtat === 'Attente Client') {
+        // Autorisé pour la réception afin de livrer le véhicule ou appliquer une transition devis
       } else {
         return sendActionResult(res, { ok: false, error: 'Action réservée aux équipes atelier.' });
       }
+    } else if (action === 'updateAvancement' && (account.role === 'reception' || account.role === 'garantie' || hasReceptionPerm)) {
+      const targetAv = String(query.get('avancement') || query.get('nouveauStatut') || '');
+      const targetNorm = targetAv.toLowerCase().trim();
+      if (
+        targetNorm === 'accepter accord' ||
+        targetNorm === 'accord accepté' ||
+        targetNorm === 'accord accepte' ||
+        targetNorm === 'terminer' ||
+        targetNorm.includes('accord') ||
+        targetNorm.includes('devis')
+      ) {
+        // Autorisé pour la réception lors de la décision devis (accord client ou refus)
+      } else {
+        return sendActionResult(res, { ok: false, error: 'Action réservée aux équipes atelier.' });
+      }
+    } else if (action === 'updateTechnicien' && (account.role === 'reception' || account.role === 'garantie' || hasReceptionPerm)) {
+      // Autorisé pour la réception pour réaffecter ou confirmer le technicien lors de l'accord devis
     } else {
       return sendActionResult(res, { ok: false, error: 'Action réservée aux équipes atelier.' });
     }
@@ -980,9 +1050,10 @@ async function handleDatabaseAction(req, res, url) {
     const noOr = text('noOr', text('no', text('numeroOR', text('or'))));
     const chassis = text('chassis', text('vin')).toUpperCase();
     const immatriculation = text('immatriculation', text('immat', '-'));
-    const assignedReceptionCs = account.role === 'reception' ? String(account.assigned_team || '').trim().toUpperCase() : '';
-    if (account.role === 'reception' && !/^R\d+$/.test(assignedReceptionCs)) {
-      return sendActionResult(res, { ok: false, error: 'Votre compte Réception doit être lié à un Centre Service (ex. R18) avant de créer une entrée.' });
+    const isReceptionOrGarantie = account.role === 'reception' || account.role === 'garantie';
+    const assignedReceptionCs = isReceptionOrGarantie ? String(account.assigned_team || (account.role === 'garantie' ? 'R10' : '')).trim().toUpperCase() : '';
+    if (isReceptionOrGarantie && !/^R\d+$/.test(assignedReceptionCs)) {
+      return sendActionResult(res, { ok: false, error: 'Votre compte doit être lié à un Centre Service (ex. R10) avant de créer une entrée.' });
     }
 
     if (!noOr || noOr === '-') {
@@ -1055,44 +1126,122 @@ async function handleDatabaseAction(req, res, url) {
     const formClient = text('nomClient', text('client'));
     const resolvedClient = formClient && formClient !== 'Client non renseigné' ? formClient : defaultClient;
 
+    const resolvedEquipe = sanitizeSingleTeam(text('equipe', fallbackData.equipe || 'Daily'), 'Daily1');
+    const resolvedImmat = immatriculation !== '-' ? immatriculation : (invReg || fallbackData.immatriculation || fallbackData.serie || '-');
+    const resolvedMarque = isHistoricalEntry ? text('marque', invBrand || fallbackData.marque || 'IVECO') : (invBrand || fallbackData.marque || 'IVECO');
+    const resolvedModele = isHistoricalEntry ? text('modele', invModel || fallbackData.modele || '-') : (invModel || fallbackData.modele || '-');
+    const resolvedCategorie = isHistoricalEntry ? text('categorie', fallbackData.categorie || '-') : (fallbackData.categorie || '-');
+    const resolvedDate = isHistoricalEntry && text('dateEntreeHeure') ? text('dateEntreeHeure') : new Date().toLocaleString('fr-FR', {
+      day: '2-digit', month: '2-digit', year: 'numeric',
+      hour: '2-digit', minute: '2-digit', second: '2-digit'
+    });
+    const resolvedCodeClient = isHistoricalEntry ? text('codeClient', invRow?.customer_code || fallbackData.codeClient || '') : (invRow?.customer_code || fallbackData.codeClient || '');
+
     const reception = {
-      ...fallbackData,
       id: newId,
       recordKey: newRecordKey,
-      noOr, no: noOr, numeroOR: noOr, cs: assignedReceptionCs || text('cs', fallbackData.cs || 'R18'), chassis, vin: chassis,
-      immatriculation: immatriculation !== '-' ? immatriculation : (invReg || fallbackData.immatriculation || '-'),
-      codeClient: isHistoricalEntry ? text('codeClient', invRow?.customer_code || fallbackData.codeClient || '') : (invRow?.customer_code || fallbackData.codeClient || ''),
+      noOr,
+      no: noOr,
+      numeroOR: noOr,
+      or: noOr,
+      ordre: noOr,
+      cs: assignedReceptionCs || text('cs', fallbackData.cs || 'R18'),
+      chassis,
+      vin: chassis,
+      immatriculation: resolvedImmat,
+      serie: resolvedImmat,
+      codeClient: resolvedCodeClient,
       nomClient: resolvedClient,
-      dateEntreeHeure: isHistoricalEntry && text('dateEntreeHeure') ? text('dateEntreeHeure') : new Date().toLocaleString('fr-FR', {
-        day: '2-digit', month: '2-digit', year: 'numeric',
-        hour: '2-digit', minute: '2-digit', second: '2-digit'
-      }),
-      marque: isHistoricalEntry ? text('marque', invBrand || fallbackData.marque || 'IVECO') : (invBrand || fallbackData.marque || 'IVECO'),
-      modele: isHistoricalEntry ? text('modele', invModel || fallbackData.modele || '-') : (invModel || fallbackData.modele || '-'),
-      categorie: isHistoricalEntry ? text('categorie', fallbackData.categorie || '-') : (fallbackData.categorie || '-'),
-      equipe: text('equipe', fallbackData.equipe || 'Daily'),
+      client: resolvedClient,
+      dateEntreeHeure: resolvedDate,
+      dateEntree: resolvedDate.split(' ')[0] || '',
+      marque: resolvedMarque,
+      modele: resolvedModele,
+      modelePowerBI: resolvedModele,
+      categorie: resolvedCategorie,
+      equipe: resolvedEquipe,
       etat: 'Attente Réparation',
+      statut: 'Attente Réparation',
+      etatIntervention: 'Attente Réparation',
+      avancement: 'Attente Réparation',
       emplacement,
+      technicien: '-',
+      nomTechnicien: '-',
+      poste: '-',
+      bloc: 1,
       statutAcceptation: 'en_attente',
       dateAcceptation: '',
       dateMiseEnAttente: '',
+      dateDebutRep: '',
+      dateDebutTravail: '',
+      heureDebutTravail: '',
+      dateFin: '',
+      dateFinRep: '',
+      dateLivraisonClient: '',
+      livrePar: '',
+      modePaiement: '',
+      statutFacturation: '',
+      statutFacturationFinale: '',
+      facturationValideePar: '',
+      dateValidationFacturation: '',
+      numeroFacture: '',
+      numeroBC: '',
+      numeroEdition: '',
     };
     await saveVehicleRecord(pool, 'reception', reception, newRecordKey);
 
     const flux = {
-      id: newId, recordKey: newRecordKey, ordre: noOr, no: noOr, numeroOR: noOr, or: noOr, chassis, vin: chassis, cs: reception.cs,
-      date: reception.dateEntreeHeure.split(' ')[0] || '', dateEntree: reception.dateEntreeHeure.split(' ')[0] || '',
-      immatriculation: reception.immatriculation, marque: reception.marque, modele: reception.modele,
-      modelePowerBI: reception.modele, categorie: reception.categorie, atelier: reception.categorie,
-      operation: 'Entrée atelier', statut: 'Attente Réparation', etatIntervention: 'Attente Réparation',
-      montant: 0, temps: 0, nbIntervention: 1, client: reception.nomClient,
-      equipe: reception.equipe, avancement: '-', emplacement: reception.emplacement || '-',
-      technicien: '-', nomTechnicien: '-', serie: '-',
+      id: newId,
+      recordKey: newRecordKey,
+      ordre: noOr,
+      no: noOr,
+      numeroOR: noOr,
+      or: noOr,
+      chassis,
+      vin: chassis,
+      cs: reception.cs,
+      date: reception.dateEntreeHeure.split(' ')[0] || '',
+      dateEntree: reception.dateEntreeHeure.split(' ')[0] || '',
+      dateEntreeHeure: reception.dateEntreeHeure,
+      immatriculation: reception.immatriculation,
+      serie: reception.immatriculation,
+      marque: reception.marque,
+      modele: reception.modele,
+      modelePowerBI: reception.modele,
+      categorie: reception.categorie,
+      atelier: reception.categorie,
+      operation: 'Entrée atelier',
+      statut: 'Attente Réparation',
+      etat: 'Attente Réparation',
+      etatIntervention: 'Attente Réparation',
+      montant: 0,
+      temps: 0,
+      nbIntervention: 1,
+      client: reception.nomClient,
+      nomClient: reception.nomClient,
+      codeClient: reception.codeClient,
+      equipe: reception.equipe,
+      avancement: 'Attente Réparation',
+      emplacement: reception.emplacement || '-',
+      technicien: '-',
+      nomTechnicien: '-',
+      poste: '-',
+      bloc: 1,
       statutAcceptation: 'en_attente',
       dateAcceptation: '',
       dateMiseEnAttente: '',
+      dateDebutRep: '',
+      dateDebutTravail: '',
+      heureDebutTravail: '',
+      dateFin: '',
+      dateFinRep: '',
+      dateLivraisonClient: '',
+      livrePar: '',
+      modePaiement: '',
+      statutFacturation: '',
+      statutFacturationFinale: '',
     };
-    await saveVehicleRecord(pool, 'flux', flux, String(newId));
+    await saveVehicleRecord(pool, 'flux', flux, newRecordKey);
     return sendActionResult(res, { ok: true, message: 'Entrée enregistrée dans PostgreSQL.', recordKey: newRecordKey });
   }
   if (action === 'modifierEntree') {
@@ -1296,14 +1445,14 @@ async function handleDatabaseAction(req, res, url) {
         `DELETE FROM app_records
          WHERE collection = 'facturation_notifications'
            AND (($1 <> '' AND (record_key LIKE '%' || $1 || '%' OR payload->>'noOr' = $1 OR payload->>'or' = $1))
-             OR ($2 <> '' AND (record_key LIKE '%' || $2 || '%' OR payload->>'chassis' = $2 OR payload->>'vin' = $2)))`,
+             OR ($1 = '' AND $2 <> '' AND (record_key LIKE '%' || $2 || '%' OR payload->>'chassis' = $2 OR payload->>'vin' = $2)))`,
         [noOr, chassis],
       );
       await pool.query(
         `DELETE FROM app_records
          WHERE collection = 'transfers'
            AND (($1 <> '' AND (record_key LIKE '%' || $1 || '%' OR payload->>'or' = $1))
-             OR ($2 <> '' AND (payload->>'chassis' = $2)))`,
+             OR ($1 = '' AND $2 <> '' AND (payload->>'chassis' = $2)))`,
         [noOr, chassis],
       );
     } else {
@@ -1314,7 +1463,7 @@ async function handleDatabaseAction(req, res, url) {
              updated_at = NOW()
          WHERE collection = 'facturation_notifications'
            AND (($3 <> '' AND (record_key LIKE '%' || $3 || '%' OR payload->>'noOr' = $3 OR payload->>'or' = $3))
-             OR ($4 <> '' AND (record_key LIKE '%' || $4 || '%' OR payload->>'chassis' = $4 OR payload->>'vin' = $4)))`,
+             OR ($3 = '' AND $4 <> '' AND (record_key LIKE '%' || $4 || '%' OR payload->>'chassis' = $4 OR payload->>'vin' = $4)))`,
         [newTeam, newClient, noOr, chassis],
       );
     }
@@ -1326,7 +1475,7 @@ async function handleDatabaseAction(req, res, url) {
            updated_at = NOW()
        WHERE collection = 'entree_notifications'
          AND (($3 <> '' AND (record_key LIKE '%' || $3 || '%' OR payload->>'noOr' = $3 OR payload->>'or' = $3))
-           OR ($4 <> '' AND (record_key LIKE '%' || $4 || '%' OR payload->>'chassis' = $4 OR payload->>'vin' = $4)))`,
+           OR ($3 = '' AND $4 <> '' AND (record_key LIKE '%' || $4 || '%' OR payload->>'chassis' = $4 OR payload->>'vin' = $4)))`,
       [newTeam, newClient, noOr, chassis],
     );
 
@@ -1337,35 +1486,45 @@ async function handleDatabaseAction(req, res, url) {
            updated_at = NOW()
        WHERE collection = 'vehicle_times'
          AND (($3 <> '' AND (record_key LIKE '%' || $3 || '%' OR payload->>'noOr' = $3))
-           OR ($4 <> '' AND (record_key LIKE '%' || $4 || '%' OR payload->>'chassis' = $4)))`,
+           OR ($3 = '' AND $4 <> '' AND (record_key LIKE '%' || $4 || '%' OR payload->>'chassis' = $4)))`,
       [newTeam, newClient, noOr, chassis],
     );
 
     return sendActionResult(res, { ok: true, message: 'Dossier modifié dans PostgreSQL.' });
   }
-  if (action === 'supprimerEntree') {
+  if (action === 'supprimerEntree' || action === 'supprimerDossierGarantie') {
     const noOr = text('noOr', text('no', text('numeroOR', text('or'))));
     const chassis = text('chassis', text('vin')).toUpperCase();
     const id = text('id');
     const recordKey = text('recordKey');
     const immat = text('immatriculation', text('immat'));
+    const warrantyOnly = action === 'supprimerDossierGarantie';
     const result = await pool.query(
       `DELETE FROM vehicles WHERE record_type IN ('flux', 'reception')
-       AND (($1 <> '' AND (no_or = $1 OR record_key = $1 OR payload->>'numeroOR' = $1))
-         OR ($2 <> '' AND (UPPER(chassis) = $2 OR UPPER(payload->>'vin') = $2))
-         OR ($3 <> '' AND (record_key = $3 OR payload->>'id' = $3 OR id::text = $3))
-         OR ($4 <> '' AND (record_key = $4 OR payload->>'recordKey' = $4))
-         OR ($5 <> '' AND (payload->>'immatriculation' = $5 OR UPPER(payload->>'immat') = UPPER($5))))`,
-      [noOr, chassis, id, recordKey, immat],
+       AND (
+         ($1 <> '' AND (no_or = $1 OR record_key = $1 OR payload->>'numeroOR' = $1 OR payload->>'noOr' = $1 OR payload->>'no' = $1 OR payload->>'or' = $1))
+         OR ($1 = '' AND $3 <> '' AND (record_key = $3 OR payload->>'id' = $3 OR id::text = $3))
+         OR ($1 = '' AND $4 <> '' AND (record_key = $4 OR payload->>'recordKey' = $4))
+         OR ($1 = '' AND $3 = '' AND $4 = '' AND $2 <> '' AND (UPPER(chassis) = $2 OR UPPER(payload->>'vin') = $2))
+         OR ($1 = '' AND $3 = '' AND $4 = '' AND $2 = '' AND $5 <> '' AND (payload->>'immatriculation' = $5 OR UPPER(payload->>'immat') = UPPER($5)))
+       )
+       AND ($6 = false OR UPPER(COALESCE(payload->>'cs', payload->>'centreService', '')) = 'R10'
+         OR LOWER(COALESCE(payload->>'typeDossier', '')) LIKE '%garantie%'
+         OR LOWER(COALESCE(payload->>'isGarantie', 'false')) = 'true')`,
+      [noOr, chassis, id, recordKey, immat, warrantyOnly],
     );
 
-    await pool.query(
-      `DELETE FROM app_records
-       WHERE collection IN ('facturation_notifications', 'entree_notifications', 'devis_notifications')
-         AND (($1 <> '' AND (record_key LIKE '%' || $1 || '%' OR payload->>'noOr' = $1 OR payload->>'or' = $1))
-           OR ($2 <> '' AND (record_key LIKE '%' || $2 || '%' OR payload->>'chassis' = $2 OR payload->>'vin' = $2)))`,
-      [noOr, chassis],
-    );
+    if (result.rowCount > 0) {
+      await pool.query(
+        `DELETE FROM app_records
+         WHERE collection IN ('facturation_notifications', 'entree_notifications', 'devis_notifications')
+           AND (
+             ($1 <> '' AND (record_key LIKE '%' || $1 || '%' OR payload->>'noOr' = $1 OR payload->>'or' = $1))
+             OR ($1 = '' AND $2 <> '' AND (record_key LIKE '%' || $2 || '%' OR payload->>'chassis' = $2 OR payload->>'vin' = $2))
+           )`,
+        [noOr, chassis],
+      );
+    }
 
     return sendActionResult(res, { ok: true, message: `${result.rowCount} enregistrement(s) supprimé(s).` });
   }
@@ -1706,7 +1865,37 @@ async function handleDatabaseAction(req, res, url) {
     }
   }
   if (action === 'updateStatutAchat') updateFields.statutAchat = text('statutAchat', text('statut'));
-  if (action === 'updateStatutDevis') updateFields.statutDevis = text('statutDevis', text('statut'));
+  if (action === 'updateStatutDevis') {
+    const sDevis = text('statutDevis', text('statut'));
+    updateFields.statutDevis = sDevis;
+    const sDevisNorm = sDevis.toLowerCase().trim();
+    if (sDevisNorm === 'accepté' || sDevisNorm === 'accepte' || sDevisNorm === 'accord accepté' || sDevisNorm === 'accord accepte') {
+      updateFields.avancement = 'Accepter accord';
+      updateFields.etat = 'Attente Réparation';
+      updateFields.etatIntervention = 'Attente Réparation';
+      updateFields.statut = 'Attente Réparation';
+      if (text('technicien') && text('technicien') !== '-') updateFields.technicien = text('technicien');
+      if (text('nomTechnicien') && text('nomTechnicien') !== '-') updateFields.nomTechnicien = text('nomTechnicien');
+      if (text('equipe')) updateFields.equipe = sanitizeSingleTeam(text('equipe'));
+    } else if (sDevisNorm === 'refusé' || sDevisNorm === 'refuse') {
+      updateFields.avancement = 'Terminer';
+      updateFields.etat = 'Attente Client';
+      updateFields.etatIntervention = 'Attente Client';
+      updateFields.statut = 'Attente Client';
+      const now = workshopDateTime();
+      updateFields.dateFin = now.dateTime;
+      updateFields.dateFinRep = now.dateTime;
+    }
+  }
+  if (action === 'updateAvancement') {
+    const avNorm = String(updateFields.avancement || '').toLowerCase().trim();
+    if (avNorm === 'accepter accord' || avNorm === 'accord accepté' || avNorm === 'accord accepte') {
+      updateFields.statutDevis = 'Accepté';
+      updateFields.etat = 'Attente Réparation';
+      updateFields.etatIntervention = 'Attente Réparation';
+      updateFields.statut = 'Attente Réparation';
+    }
+  }
   if (
     ['updateTechnicien', 'updateAvancement'].includes(action) &&
     String(updateFields.etat || updateFields.etatIntervention || updateFields.statut || updateFields.avancement || '').toLowerCase().includes('en cours')
@@ -1718,7 +1907,7 @@ async function handleDatabaseAction(req, res, url) {
     updateFields.dateDebutTravail = now.dateTime;
     updateFields.heureDebutTravail = now.time;
   }
-  if (['updateEmplacement', 'updateEtat', 'updateTechnicien', 'updateAvancement', 'updateStatutAchat', 'updateStatutDevis'].includes(action)) {
+  if (['updateEmplacement', 'updateEtat', 'updateTechnicien', 'updateAvancement', 'updateStatutAchat', 'updateStatutDevis', 'updateStatutGarantie'].includes(action)) {
     const updated = await updateVehicleBySelectors(query, updateFields, undefined, allowedTeam);
     if (!updated) return sendActionResult(res, { ok: false, error: 'Véhicule introuvable dans PostgreSQL.' });
     return sendActionResult(res, { ok: true, message: 'Véhicule mis à jour dans PostgreSQL.' });
@@ -1751,6 +1940,18 @@ async function bootstrap() {
       ['acc_facturation', 'Service Facturation', 'facturation@italcar.com', passwordHash('facturation123')],
     );
     console.log('Compte facturation initial créé : facturation@italcar.com (mot de passe: facturation123)');
+  }
+
+  // Vérifier et créer un compte Garantie par défaut s'il n'en existe pas
+  const garantieCount = await pool.query("SELECT COUNT(*)::int AS count FROM accounts WHERE role = 'garantie' OR email = 'garantie@italcar.com'");
+  if (garantieCount.rows[0].count === 0) {
+    await pool.query(
+      `INSERT INTO accounts (id, name, email, password_hash, role, assigned_team)
+       VALUES ($1, $2, LOWER($3), $4, 'garantie', 'R10')
+       ON CONFLICT (email) DO NOTHING`,
+      ['acc_garantie', 'Service Garantie', 'garantie@italcar.com', passwordHash('garantie123')],
+    );
+    console.log('Compte garantie initial créé : garantie@italcar.com (mot de passe: garantie123, CS: R10)');
   }
 
   // Enrichir les véhicules et dossiers dont le client n'est pas renseigné avec le Parc véhicules & engins
@@ -2111,7 +2312,7 @@ async function handle(req, res) {
     if (parts.length === 3 && req.method === 'GET') {
       const account = await requireAccount(req, res);
       if (!account) return;
-      if (!['administration', 'chef_atelier', 'reception'].includes(account.role)) {
+      if (!['administration', 'chef_atelier', 'reception', 'garantie'].includes(account.role)) {
         return send(res, 403, { ok: false, error: 'Accès à l’inventaire réservé à l’administration, à la direction atelier et à la réception.' });
       }
 
@@ -2173,18 +2374,18 @@ async function handle(req, res) {
       purchases: ['administration', 'chef_atelier', 'chef_equipe'],
       // Une équipe peut créer un devis depuis l'atelier ; la réception le
       // traite ensuite. Les deux doivent donc pouvoir le synchroniser.
-      quotes: ['administration', 'chef_atelier', 'reception', 'chef_equipe'],
+      quotes: ['administration', 'chef_atelier', 'reception', 'chef_equipe', 'garantie'],
       essai_controls: ['administration', 'chef_atelier', 'chef_equipe'],
       // Les chefs d'équipe enregistrent les bascules horodatées (PDR, devis,
       // réaffectation, essai) : ils doivent pouvoir lire et écrire leur chronométrie.
-      vehicle_times: ['administration', 'chef_atelier', 'chef_equipe'],
+      vehicle_times: ['administration', 'chef_atelier', 'chef_equipe', 'garantie'],
       transfers: ['administration', 'chef_atelier', 'chef_equipe'],
       reassignments: ['administration', 'chef_atelier', 'chef_equipe'],
       essais: ['administration', 'chef_atelier', 'chef_equipe'],
       // La réception crée la notification, puis le chef d'équipe concerné la lit
       // et l'accepte : les deux rôles doivent pouvoir la synchroniser/supprimer.
-      devis_notifications: ['administration', 'chef_atelier', 'reception', 'chef_equipe'],
-      entree_notifications: ['administration', 'chef_atelier', 'reception', 'chef_equipe'],
+      devis_notifications: ['administration', 'chef_atelier', 'reception', 'chef_equipe', 'garantie'],
+      entree_notifications: ['administration', 'chef_atelier', 'reception', 'chef_equipe', 'garantie'],
       facturation_notifications: ['administration', 'chef_atelier', 'facturation', 'reception', 'chef_equipe'],
     };
     // Une fiche de contrôle contient le résultat final et les remarques d'un
@@ -2207,14 +2408,14 @@ async function handle(req, res) {
     if (parts.length === 3 && req.method === 'GET') {
       // Les rôles sans accès au chronométrage ne doivent pas générer de 403
       // lors de l'hydratation automatique du navigateur.
-      if (collection === 'vehicle_times' && !['administration', 'chef_atelier', 'chef_equipe'].includes(account.role)) {
+      if (collection === 'vehicle_times' && !['administration', 'chef_atelier', 'chef_equipe', 'garantie'].includes(account.role)) {
         return send(res, 200, []);
       }
       if (vehicleCollection) {
         let result;
-        if (account.role === 'reception' && collection !== 'vin') {
-          const cs = String(account.assigned_team || '').trim().toUpperCase();
-          if (!/^R\d+$/.test(cs)) return send(res, 403, { ok: false, error: 'Aucun Centre Service n’est affecté à ce compte Réception.' });
+        if ((account.role === 'reception' || account.role === 'garantie') && collection !== 'vin') {
+          const cs = String(account.assigned_team || (account.role === 'garantie' ? 'R10' : '')).trim().toUpperCase();
+          if (!/^R\d+$/.test(cs)) return send(res, 403, { ok: false, error: 'Aucun Centre Service n’est affecté à ce compte.' });
           result = await pool.query(
             `SELECT payload FROM vehicles WHERE record_type = $1
              AND UPPER(COALESCE(payload->>'cs', '')) = $2 ORDER BY id`, [collection, cs],
@@ -2285,6 +2486,16 @@ async function handle(req, res) {
       let records = result.rows.map((row) => row.payload);
       if (collection === 'facturation_notifications') {
         await enrichVehiclesWithInventory(records);
+      }
+      // La Réception ne consulte que les devis et alertes devis de son propre Centre Service (ex: R18)
+      if ((collection === 'quotes' || collection === 'devis_notifications') && account.role === 'reception' && account.assigned_team) {
+        const userCs = String(account.assigned_team).trim().toUpperCase();
+        if (userCs && userCs !== 'TOUTES' && userCs !== 'ALL') {
+          records = records.filter((record) => {
+            const rCs = String(record.cs || '').trim().toUpperCase();
+            return !rCs || rCs === userCs;
+          });
+        }
       }
       // Un agent Facturation ou Chef d'Équipe ne voit que les dossiers de ses
       // équipes affectées. L'Administration, le Chef d'Atelier et « Toutes »

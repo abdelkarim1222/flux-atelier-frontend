@@ -817,6 +817,8 @@ export interface DemandeDevis {
   client: string;      // Nom Client
   modele: string;      // Modèle
   immatriculation: string; // N° Immatriculation
+  marque?: string;     // Marque
+  cs?: string;         // Centre Service Réception (ex. R18, R10)
   date: string;
   pieces?: string;     // Pièces remplacées / demandées dans le devis
   equipe?: string;
@@ -862,6 +864,62 @@ export function saveDemandeDevisLocal(devis: DemandeDevis): void {
     window.dispatchEvent(new Event("demandes_devis_updated"));
   } catch (e) {
     console.warn("Erreur sauvegarde demande devis:", e);
+  }
+}
+
+export async function syncDemandesDevisFromSql(): Promise<Record<string, DemandeDevis>> {
+  try {
+    const res = await fetch("/api/data/quotes", { cache: "no-store", credentials: "same-origin" });
+    if (!res.ok) return getDemandesDevisLocal();
+    const rows = (await res.json()) as Array<DemandeDevis & { recordKey?: string }>;
+    if (!Array.isArray(rows) || rows.length === 0) return getDemandesDevisLocal();
+
+    const local = getDemandesDevisLocal();
+    let hasChanges = false;
+
+    for (const item of rows) {
+      const key = String(item.recordKey || item.vehicleId || item.or || item.chassis || item.id || "").trim();
+      if (!key) continue;
+      const existing = local[key];
+      if (
+        !existing ||
+        item.statutDevis !== existing.statutDevis ||
+        item.dateDecision !== existing.dateDecision ||
+        item.dateAppel !== existing.dateAppel
+      ) {
+        local[key] = {
+          ...(existing || {}),
+          ...item,
+        };
+        hasChanges = true;
+      }
+    }
+
+    if (hasChanges) {
+      localStorage.setItem(STORAGE_KEY_DEMANDES_DEVIS, JSON.stringify(local));
+      window.dispatchEvent(new Event("demandes_devis_updated"));
+    }
+    return local;
+  } catch (e) {
+    console.warn("Erreur synchronisation devis depuis SQL:", e);
+    return getDemandesDevisLocal();
+  }
+}
+
+export async function syncDevisNotificationsFromSql(): Promise<void> {
+  try {
+    const res = await fetch("/api/data/devis_notifications", { cache: "no-store", credentials: "same-origin" });
+    if (!res.ok) return;
+    const rows = (await res.json()) as DevisAccordNotification[];
+    if (Array.isArray(rows)) {
+      const current = getDevisAccordNotifications();
+      if (JSON.stringify(current) !== JSON.stringify(rows)) {
+        localStorage.setItem(STORAGE_KEY_DEVIS_ACCORD_NOTIFS, JSON.stringify(rows));
+        window.dispatchEvent(new Event("devis_accord_updated"));
+      }
+    }
+  } catch (e) {
+    console.warn("Erreur synchronisation devis_notifications depuis SQL:", e);
   }
 }
 
@@ -2158,9 +2216,16 @@ export async function updateDatabaseStatutDevis(
   devis: DemandeDevis,
   nouveauStatut: "Attente validation devis" | "En attente accord" | "Client appelé" | "Accepté" | "Refusé" | "Annulé"
 ) {
+  const isAccepte = nouveauStatut === "Accepté";
+  const isRefuse = nouveauStatut === "Refusé";
+  const avancement = isAccepte ? "Accepter accord" : isRefuse ? "Terminer" : undefined;
+  const etat = isAccepte ? "Attente Réparation" : isRefuse ? "Attente Client" : undefined;
+
   return callSheetWriteAction(row, "updateStatutDevis", {
     numeroDevis: devis.numeroDevis || "",
     statutDevis: nouveauStatut,
+    ...(avancement ? { avancement } : {}),
+    ...(etat ? { etat, etatIntervention: etat, statut: etat } : {}),
     dateAppel: devis.dateAppel || "",
     appelant: devis.appelant || "",
     dateDecision: devis.dateDecision || "",
@@ -2169,9 +2234,11 @@ export async function updateDatabaseStatutDevis(
     client: row.client || devis.client || "",
     modele: row.modele || devis.modele || "",
     immatriculation: row.serie || row.immatriculation || devis.immatriculation || "",
-    equipe: row.equipe || devis.equipe || "",
+    equipe: devis.equipeOrigine || devis.equipe || row.equipe || "",
     pieces: devis.pieces || "",
     dateDevis: devis.date || "",
+    technicien: devis.technicien || row.technicien || "",
+    nomTechnicien: devis.nomTechnicien || row.nomTechnicien || "",
   });
 }
 
@@ -2201,10 +2268,14 @@ export async function updateDatabaseAvancement(
   const cleanAv = avancement.trim();
   const nowFormatted = getNowFormatted();
   const dateModif = (extraParams?.dateModification || nowFormatted).trim();
+  const timeStr = dateModif.includes(" ") ? dateModif.split(" ")[1] : "";
 
   const values: Record<string, string> = {
     avancement: cleanAv,
     dateModification: dateModif,
+    dateAvancement: dateModif,
+    heureAvancement: timeStr,
+    dateHeureAvancement: dateModif,
   };
   if (equipe || row.equipe) {
     values.equipe = (equipe || row.equipe || "").trim();
@@ -2214,11 +2285,39 @@ export async function updateDatabaseAvancement(
     values.bloc = String(targetBloc);
   }
 
+  const isAccordAccepte =
+    cleanAv === "Accepter accord" ||
+    cleanAv === "Accord accepté" ||
+    cleanAv.toLowerCase() === "accepter accord";
+
+  // En cours (10% à 90%) : horodatage début travail
+  if (cleanAv.startsWith("En cours") || cleanAv.includes("%")) {
+    // Un pourcentage supplémentaire ne constitue pas un nouveau démarrage :
+    // on conserve le premier horodatage de prise en charge du véhicule.
+    values.dateDebutRep = extraParams?.dateDebutRep || row.dateDebutRep || row.dateDebutTravail || dateModif;
+    values.dateDebutTravail = extraParams?.dateDebutTravail || row.dateDebutTravail || row.dateDebutRep || dateModif;
+    values.heureDebutTravail = extraParams?.heureDebutTravail || row.heureDebutTravail || timeStr;
+  }
+
   // Horodatage systématique selon les 12 statuts demandés :
-  // 1. Lancement devis
-  if (cleanAv === "Lancement devis" || cleanAv === "ATENDE DEVIS" || cleanAv.toLowerCase().includes("devis")) {
+  // 1. Lancement devis & Attente accord devis
+  if (
+    !isAccordAccepte && (
+      cleanAv === "Lancement devis" ||
+      cleanAv === "Attente accord" ||
+      cleanAv === "Lancement attente accord" ||
+      cleanAv === "ATENDE DEVIS" ||
+      cleanAv.toLowerCase().includes("devis") ||
+      cleanAv.toLowerCase().includes("accord")
+    )
+  ) {
     values.emplacement = "P";
     values.dateDevis = extraParams?.dateDevis || dateModif;
+  }
+  else if (isAccordAccepte) {
+    if (!values.etat) {
+      values.etat = "Attente Réparation";
+    }
   }
   // 2. Attente PDR & 4. attends acheter
   else if (cleanAv === "Attente PDR" || cleanAv === "attends acheter") {
@@ -2236,6 +2335,7 @@ export async function updateDatabaseAvancement(
   // 6. Terminer
   else if (cleanAv === "Terminer") {
     values.dateFin = extraParams?.dateFin || dateModif;
+    values.dateFinRep = extraParams?.dateFinRep || dateModif;
   }
   // 7 à 12. Transferts VR ("vrElictrique", "vrService Rapide", "vrCarrosserie", "vrDaily", "vrLourd", "vrChangan")
   else if (cleanAv.startsWith("vr")) {
@@ -2261,6 +2361,9 @@ export async function updateDatabaseAvancement(
     values.noOr = demandeDevis.or;
     values.modele = demandeDevis.modele;
     values.immatriculation = demandeDevis.immatriculation;
+    if (demandeDevis.cs) {
+      values.cs = demandeDevis.cs;
+    }
     if (demandeDevis.pieces) {
       values.pieces = demandeDevis.pieces;
     }
@@ -2274,13 +2377,33 @@ export async function updateDatabaseAvancement(
   }
 
   if (
-    (cleanAv === "Attente réparation" || cleanAv === "Attente Réparation") &&
+    (cleanAv === "Attente réparation" || cleanAv === "Attente Réparation" || isAccordAccepte) &&
     !values.etat
   ) {
-    values.etat = "Attente réparation";
+    values.etat = "Attente Réparation";
   }
 
   return callSheetWriteAction(row, "updateAvancement", values);
+}
+
+export async function updateDatabaseStatutGarantie(
+  row: Flux,
+  statutGarantie: string,
+  extra?: { commentaire?: string; numeroAccord?: string }
+) {
+  const nowFormatted = getNowFormatted();
+  const values: Record<string, string> = {
+    statutGarantie,
+    dateValidationGarantie: nowFormatted,
+    dateModification: nowFormatted,
+  };
+  if (extra && "numeroAccord" in extra) {
+    values.numeroAccordGarantie = extra.numeroAccord || "";
+  }
+  if (extra && "commentaire" in extra) {
+    values.commentaireGarantie = extra.commentaire || "";
+  }
+  return callSheetWriteAction(row, "updateStatutGarantie", values);
 }
 
 
@@ -2792,6 +2915,25 @@ export async function supprimerDossierEntree(payload: SupprimerEntreePayload): P
     cs,
     chassis,
     immatriculation: immat,
+  });
+  if (typeof window !== "undefined") window.dispatchEvent(new CustomEvent("flux_refresh_requested"));
+  return { ok: true, message: result.message };
+}
+
+/** Suppression d'un dossier Garantie uniquement. L'API vérifie également que
+ * le véhicule est bien identifié comme Garantie avant de retirer ses lignes. */
+export async function supprimerDossierGarantie(payload: SupprimerEntreePayload): Promise<{ ok: boolean; message?: string }> {
+  assertSheetWriteConfigured();
+  const noOr = (payload.noOr || "").trim() === "-" ? "" : (payload.noOr || "").trim();
+  const chassis = (payload.chassis || "").trim().toUpperCase() === "-" ? "" : (payload.chassis || "").trim().toUpperCase();
+  const id = payload.id !== undefined && payload.id !== null ? String(payload.id).trim() : "";
+  const result = await callDatabaseAction<{ ok: boolean; message?: string }>("supprimerDossierGarantie", {
+    ...payload,
+    id,
+    recordKey: payload.recordKey || id,
+    noOr,
+    no: noOr,
+    chassis,
   });
   if (typeof window !== "undefined") window.dispatchEvent(new CustomEvent("flux_refresh_requested"));
   return { ok: true, message: result.message };

@@ -89,6 +89,7 @@ export default function DemandeDevisModal({
         client: client,
         modele: modele,
         immatriculation: immat,
+        cs: vehicle.cs || undefined,
         date: dateDevis || getNowFormatted(),
         pieces: pieces.trim() || undefined,
         equipe: vehicle.equipe || undefined,
@@ -161,7 +162,7 @@ export default function DemandeDevisModal({
             <div className="text-[11px] font-bold uppercase tracking-wider text-slate-500 flex items-center justify-between">
               <span>Informations Véhicule Récupérées Automatiquement</span>
               <span className="text-[10px] px-2 py-0.5 rounded-full bg-orange-100 text-orange-800 font-extrabold border border-orange-200">
-                Lancement devis
+                Attente accord
               </span>
             </div>
 
@@ -305,7 +306,7 @@ export default function DemandeDevisModal({
           <div className="p-3 bg-orange-50/80 border border-orange-200/80 rounded-xl text-orange-900 text-[11px] flex items-center gap-2">
             <Check size={14} className="text-orange-600 shrink-0" />
             <span>
-              À la validation, l'avancement sera défini sur <strong>Lancement devis</strong> et l'emplacement passera automatiquement en <strong>P (Parking)</strong>.
+              À la validation, l'avancement sera défini sur <strong>Attente accord</strong>, le technicien sera libéré et le véhicule retournera dans <strong>Tableaux de chargement complet (Tous les véhicules)</strong> en <strong>P (Parking)</strong> jusqu'à l'acceptation du client.
             </span>
           </div>
 
@@ -332,7 +333,7 @@ export default function DemandeDevisModal({
               ) : (
                 <>
                   <Check size={14} />
-                  <span>Valider et Transférer vers Page Devis</span>
+                  <span>Valider et Placer en Attente accord</span>
                 </>
               )}
             </button>

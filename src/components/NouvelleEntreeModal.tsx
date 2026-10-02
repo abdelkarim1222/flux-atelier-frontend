@@ -54,8 +54,10 @@ export default function NouvelleEntreeModal({
   onSuccess,
 }: NouvelleEntreeModalProps) {
   const { currentUser } = useAuth();
-  const assignedReceptionCs = currentUser?.role === "reception" && /^R\d+$/i.test(currentUser.assignedTeam || "")
-    ? currentUser.assignedTeam!.toUpperCase()
+  const isReceptionOrGarantie = currentUser?.role === "reception" || currentUser?.role === "garantie";
+  const defaultCs = currentUser?.role === "garantie" ? "R10" : "";
+  const assignedReceptionCs = isReceptionOrGarantie && /^R\d+$/i.test(currentUser?.assignedTeam || defaultCs)
+    ? (currentUser?.assignedTeam || defaultCs).toUpperCase()
     : "";
   const getNowFormatted = (withSeconds = false) => {
     const now = new Date();

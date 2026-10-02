@@ -30,6 +30,7 @@ import {
   type VehicleTimeCalculation,
 } from "../services/timeTracking";
 import ChronoTimelineModal from "./ChronoTimelineModal";
+import { isCompletedWarrantyVehicle } from "../services/warranty";
 
 interface SuiviTempsViewProps {
   userTeam?: string;
@@ -192,7 +193,9 @@ export default function SuiviTempsView({ userTeam }: SuiviTempsViewProps = {}) {
     });
 
     // Calculer les temps pour chaque véhicule
-    return unifiedList.map((v) => calculateVehicleTimes(v));
+    return unifiedList
+      .filter((v) => !isCompletedWarrantyVehicle(v))
+      .map((v) => calculateVehicleTimes(v));
   }, [vehicles, suiviList, clockMinute]);
 
   // Liste des équipes uniques pour le filtre

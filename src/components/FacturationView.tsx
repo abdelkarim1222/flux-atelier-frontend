@@ -108,6 +108,11 @@ export default function FacturationView({
       if (isRestrictedToAssignedTeams && (!v.equipe || !isVehicleMatchingTeam(v.equipe, currentUser?.assignedTeam || ""))) {
         return false;
       }
+      // Les dossiers Garantie (R10) sont traités exclusivement dans le Tableau Garantie
+      const cs = String(v.cs || "").trim().toUpperCase();
+      if (cs === "R10" || (v as any).isGarantie) {
+        return false;
+      }
       const av = (v.avancement || "").trim().toLowerCase();
       const etat = (v.etatIntervention || v.statut || "").trim().toLowerCase();
       const vAny = v as unknown as Record<string, unknown>;

@@ -3,7 +3,7 @@ CREATE TABLE IF NOT EXISTS accounts (
   name TEXT NOT NULL,
   email TEXT NOT NULL UNIQUE,
   password_hash TEXT NOT NULL,
-  role TEXT NOT NULL CHECK (role IN ('administration', 'chef_atelier', 'reception', 'chef_equipe', 'facturation')),
+  role TEXT NOT NULL CHECK (role IN ('administration', 'chef_atelier', 'reception', 'chef_equipe', 'facturation', 'garantie')),
   assigned_team TEXT,
   custom_permissions JSONB DEFAULT '{}'::jsonb,
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -106,5 +106,5 @@ ALTER TABLE app_records ADD CONSTRAINT app_records_collection_check CHECK (colle
 ));
 
 ALTER TABLE accounts DROP CONSTRAINT IF EXISTS accounts_role_check;
-ALTER TABLE accounts ADD CONSTRAINT accounts_role_check CHECK (role IN ('administration', 'chef_atelier', 'reception', 'chef_equipe', 'facturation'));
+ALTER TABLE accounts ADD CONSTRAINT accounts_role_check CHECK (role IN ('administration', 'chef_atelier', 'reception', 'chef_equipe', 'facturation', 'garantie'));
 

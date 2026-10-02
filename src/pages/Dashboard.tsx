@@ -37,6 +37,7 @@ import {
   XCircle,
   Receipt,
   FileText,
+  Award,
 } from "lucide-react";
 import type { CSSProperties, MouseEvent, ReactNode } from "react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
@@ -57,6 +58,7 @@ import GestionEquipesView from "../components/GestionEquipesView";
 import MoyennesView from "../components/MoyennesView";
 import EssaiView from "../components/EssaiView";
 import AcheterView from "../components/AcheterView";
+import GarantieView from "../components/GarantieView";
 import DetailVehiculeModal from "../components/DetailVehiculeModal";
 import DemandeAchatModal from "../components/DemandeAchatModal";
 import AffecterTechnicienModal, {
@@ -110,6 +112,8 @@ import {
   marquerDevisRefuse,
   marquerDevisRelance,
   updateDatabaseStatutDevis,
+  syncDemandesDevisFromSql,
+  syncDevisNotificationsFromSql,
   type DemandeDevis,
   type ReaffectationRecord,
   getReaffectationsLocal,
@@ -140,10 +144,10 @@ import {
 import {
   recordAvancementStatusChange,
   recordVehicleModification,
-  saveVehicleTimeLog,
 } from "../services/timeTracking";
+import { isCompletedWarrantyVehicle, isWarrantyVehicle } from "../services/warranty";
 import type { EssaiValidationPayload } from "../components/ValidationEssaiModal";
-import { normalizeTeamName, isVehicleMatchingTeam } from "../config/teams";
+import { isVehicleMatchingTeam } from "../config/teams";
 import {
   calculerEmplacementAutomatique,
   ALL_EMPLACEMENTS,
@@ -209,10 +213,10 @@ function removeDraft(
 function statusMatchesFilter(row: Flux, filter: StatusFilter) {
   if (filter === "Tous") return true;
   if (filter === "Attentes") {
-    return waitingStatuses.has(row.etatIntervention) || isAttenteReparation(row.etatIntervention);
+    return waitingStatuses.has(row.etatIntervention) || isAttenteReparation(row.etatIntervention, row.avancement);
   }
   if (filter === "Attente Réparation") {
-    return isAttenteReparation(row.etatIntervention);
+    return isAttenteReparation(row.etatIntervention, row.avancement);
   }
 
   return String(row.etatIntervention || "").trim().toLowerCase() === String(filter).trim().toLowerCase();
@@ -226,15 +230,23 @@ function formatStatusLabel(status: WorkshopStatus) {
   return status;
 }
 
-function isAttenteReparation(etat?: string) {
-  if (!etat) return false;
-  const normalized = etat.trim().toLowerCase();
+function isAttenteReparation(etat?: string, avancement?: string) {
+  if (!etat && !avancement) return false;
+  const normalized = (etat || "").trim().toLowerCase();
+  const normAv = (avancement || "").trim().toLowerCase();
   return (
     normalized === "attente réparation" ||
     normalized === "attente reparation" ||
     normalized === "attente pdr" ||
     normalized.includes("réparation") ||
-    normalized.includes("reparation")
+    normalized.includes("reparation") ||
+    normAv === "lancement devis" ||
+    normAv === "attente accord" ||
+    normAv === "lancement attente accord" ||
+    normAv === "atende devis" ||
+    normAv === "attente devis" ||
+    normAv.includes("devis") ||
+    normAv.includes("accord")
   );
 }
 
@@ -255,6 +267,15 @@ function isEnCours(
   if (normEtat === "terminer" || normAv === "terminer") return false;
   if (normEtat.includes("attente client") || normAv.includes("attente client")) return false;
 
+  // IMPORTANT : Lancement devis et attente accord devis ne sont PAS en cours
+  if (
+    normAv.includes("devis") ||
+    normAv.includes("accord") ||
+    normEtat.includes("devis")
+  ) {
+    return false;
+  }
+
   // Technicien réaffecté : reste OBLIGATOIREMENT dans le tableau Interventions En cours
   if (
     isReaffecteActive ||
@@ -265,11 +286,11 @@ function isEnCours(
   }
 
   // Inclusions : si l'avancement indique un travail en cours ou pourcentage
-  if (normAv.startsWith("en cours") || normAv.includes("%") || normAv.includes("devis")) return true;
+  if (normAv.startsWith("en cours") || normAv.includes("%")) return true;
   // Si l'état général est En cours
   if (normEtat === "en cours") return true;
-  // Si un technicien est affecté (intervention prise en charge par l'équipe) et non en attente de transfert sortant (vr)
-  if (hasTech && !normAv.startsWith("vr")) return true;
+  // Si un technicien est affecté (intervention prise en charge par l'équipe) et non en attente de transfert sortant (vr) et non en attente
+  if (hasTech && !normAv.startsWith("vr") && !normEtat.includes("attente")) return true;
 
   return false;
 }
@@ -295,15 +316,43 @@ function isAttenteAchat(row: Flux): boolean {
 function isAttenteDevis(row: Flux, demandesMap?: Record<string, DemandeDevis>): boolean {
   const etat = (row.etatIntervention || "").trim().toLowerCase();
   const avancement = (row.avancement || "").trim().toLowerCase();
-  const hasDevis = demandesMap ? Boolean(
+  if (
+    avancement === "accepter accord" ||
+    avancement === "accord accepté" ||
+    avancement === "accord accepte" ||
+    etat === "en cours" ||
+    avancement.startsWith("en cours")
+  ) {
+    return false;
+  }
+  const rowStatutDevis = String((row as any).statutDevis || "").trim().toLowerCase();
+  if (
+    rowStatutDevis === "accepté" ||
+    rowStatutDevis === "accepte" ||
+    rowStatutDevis === "accord accepté" ||
+    rowStatutDevis === "accord accepte" ||
+    rowStatutDevis === "refusé" ||
+    rowStatutDevis === "refuse"
+  ) {
+    return false;
+  }
+  const d = demandesMap ? (
     demandesMap[String(row.id)] ||
     (row.no && demandesMap[row.no.trim()]) ||
     (row.chassis && demandesMap[row.chassis.trim()])
-  ) : false;
+  ) : undefined;
+  if (d && (d.statutDevis === "Accepté" || d.statutDevis === "Refusé")) {
+    return false;
+  }
+  const hasDevis = Boolean(d);
   return (
     avancement === "atende devis" ||
     avancement === "attente devis" ||
+    avancement === "lancement devis" ||
+    avancement === "attente accord" ||
+    avancement === "lancement attente accord" ||
     avancement.includes("devis") ||
+    (avancement.includes("accord") && avancement !== "accepter accord" && avancement !== "accord accepté" && avancement !== "accord accepte") ||
     etat === "atende devis" ||
     etat === "attente devis" ||
     etat.includes("devis") ||
@@ -332,7 +381,15 @@ function getAvancementStyle(val?: string): CSSProperties {
     };
   }
   const lower = val.toLowerCase();
-  if (lower.includes("devis")) {
+  if (lower.includes("accepter") || lower.includes("accepté") || lower === "accepter accord") {
+    return {
+      backgroundColor: "#ecfdf5",
+      color: "#047857",
+      borderColor: "#6ee7b7",
+      fontWeight: 700,
+    };
+  }
+  if (lower.includes("devis") || lower.includes("accord")) {
     return {
       backgroundColor: "#fff7ed",
       color: "#c2410c",
@@ -544,8 +601,10 @@ function MetricCard({
 export default function Dashboard() {
   const { currentUser, logout } = useAuth();
   const { role, roleInfo, permissions } = useRole();
-  const assignedReceptionCs = role === "reception" ? (currentUser?.assignedTeam || "").trim().toUpperCase() : "";
-  type TabType = "chargement" | "en_cours" | "essai" | "attente_achat" | "devis" | "plan_atelier" | "suivi_entrees" | "suivi_temps" | "gestion_acces" | "gestion_equipes" | "moyennes" | "vehicle_inventory" | "facturation" | "att_facture";
+  const assignedReceptionCs = (role === "reception" || role === "garantie")
+    ? (currentUser?.assignedTeam || (role === "garantie" ? "R10" : "")).trim().toUpperCase()
+    : "";
+  type TabType = "chargement" | "en_cours" | "essai" | "attente_achat" | "devis" | "garantie" | "plan_atelier" | "suivi_entrees" | "suivi_temps" | "gestion_acces" | "gestion_equipes" | "moyennes" | "vehicle_inventory" | "facturation" | "att_facture";
 
   const [activeTab, setActiveTabState] = useState<TabType>(() => {
     try {
@@ -558,6 +617,7 @@ export default function Dashboard() {
         saved === "essai" ||
         saved === "attente_achat" ||
         saved === "devis" ||
+        saved === "garantie" ||
         saved === "plan_atelier" ||
         saved === "suivi_entrees" ||
         saved === "suivi_temps" ||
@@ -570,6 +630,9 @@ export default function Dashboard() {
       ) {
         // Sécurité sur les onglets restreints selon les permissions effectives
         if ((saved === "facturation" || saved === "att_facture") && !permissions.canViewFacturation) {
+          return permissions.defaultTab;
+        }
+        if (saved === "garantie" && !permissions.canViewGarantie) {
           return permissions.defaultTab;
         }
         if (saved === "attente_achat" && !permissions.canViewAttenteAchat) {
@@ -606,6 +669,10 @@ export default function Dashboard() {
     (tab: TabType) => {
       // Sécurité : vérification des autorisations selon permissions
       if (tab === "facturation" && !permissions.canViewFacturation) {
+        setActiveTabState(permissions.defaultTab);
+        return;
+      }
+      if (tab === "garantie" && !permissions.canViewGarantie) {
         setActiveTabState(permissions.defaultTab);
         return;
       }
@@ -798,6 +865,8 @@ export default function Dashboard() {
   const [receptionNotice, setReceptionNotice] = useState<string | null>(null);
 
   useEffect(() => {
+    void syncDemandesDevisFromSql();
+    void syncDevisNotificationsFromSql();
     const handleDevisUpdate = () => {
       setDemandesDevisMap(getDemandesDevisLocal());
     };
@@ -851,10 +920,11 @@ export default function Dashboard() {
     return facturationNotifications.filter((n) => {
       if (dismissedFacturationNotifIds.has(n.id)) return false;
       const v = vehicles.find((item) =>
-        item.id === n.vehicleId ||
+        (n.vehicleId && item.id === n.vehicleId) ||
         (n.or && (item.no === n.or || item.ordre === n.or)) ||
-        (n.chassis && item.chassis === n.chassis)
+        (!n.or && !n.vehicleId && n.chassis && item.chassis === n.chassis)
       );
+      if (v && isWarrantyVehicle(v)) return false;
       if (v?.modePaiement) return false;
 
       // Filtrer par équipes assignées pour l'utilisateur Facturation
@@ -881,6 +951,7 @@ export default function Dashboard() {
       (currentUser?.assignedTeam || "").trim().toLowerCase() !== "all";
 
     const fromVehicles = vehicles.filter((v) => {
+      if (isWarrantyVehicle(v)) return false;
       if (isRestrictedFacturation && (!v.equipe || !isVehicleMatchingTeam(v.equipe, currentUser?.assignedTeam || ""))) {
         return false;
       }
@@ -895,10 +966,11 @@ export default function Dashboard() {
     const fromNotifs = facturationNotifications.filter((n) => {
       if (isRestrictedFacturation) {
         const v = vehicles.find((item) =>
-          item.id === n.vehicleId ||
+          (n.vehicleId && item.id === n.vehicleId) ||
           (n.or && (item.no === n.or || item.ordre === n.or)) ||
-          (n.chassis && item.chassis === n.chassis)
+          (!n.or && !n.vehicleId && n.chassis && item.chassis === n.chassis)
         );
+        if (v && isWarrantyVehicle(v)) return false;
         const itemTeam = n.equipe || v?.equipe || "";
         if (!itemTeam || !isVehicleMatchingTeam(itemTeam, currentUser?.assignedTeam || "")) {
           return false;
@@ -919,7 +991,7 @@ export default function Dashboard() {
         const vehicle = vehicles.find((item) =>
           (demande.vehicleId && String(item.id) === String(demande.vehicleId)) ||
           (demande.or && [item.no, item.ordre].filter(Boolean).some((key) => key === demande.or)) ||
-          (demande.chassis && item.chassis === demande.chassis)
+          (!demande.or && !demande.vehicleId && demande.chassis && item.chassis === demande.chassis)
         );
         return vehicle && demande.dateLivraison
           ? { vehicle, demande, timestamp: demande.dateLivraison.split(" ").slice(-1)[0] || demande.dateLivraison }
@@ -1117,6 +1189,8 @@ export default function Dashboard() {
     setWriteNotice("");
 
     try {
+      void syncDemandesDevisFromSql();
+      void syncDevisNotificationsFromSql();
       const [rows, entrees] = await Promise.all([
         fetchDatabaseFluxData(),
         fetchSuiviEntreesData().catch(() => []),
@@ -1125,41 +1199,73 @@ export default function Dashboard() {
       // Une ligne du flux reste prioritaire pour l'état, le technicien et les
       // autres données de travail ; l'emplacement du suivi complète les lignes
       // historiques qui ne sont pas encore présentes dans le tableau Flux.
-      const rowsByKey = new Map<string, Flux>();
+      const rowsByOr = new Map<string, Flux>();
+      const rowsByChassis = new Map<string, Flux>();
       rows.forEach((row) => {
-        [row.ordre, row.no, row.chassis].filter(Boolean).forEach((key) =>
-          rowsByKey.set(String(key).trim().toUpperCase(), row)
-        );
+        const orKey = String(row.ordre || row.no || (row as any).numeroOR || "").trim().toUpperCase();
+        if (orKey && orKey !== "-") rowsByOr.set(orKey, row);
+        const chKey = String(row.chassis || (row as any).vin || "").trim().toUpperCase();
+        if (chKey && chKey !== "-") rowsByChassis.set(chKey, row);
       });
       const withReceptionLocations = [...rows];
       entrees.forEach((entree) => {
         const emplacement = normalizeSheetEmplacement(entree.emplacement || "");
-        const existing = [entree.noOr, entree.chassis]
-          .map((key) => rowsByKey.get(String(key || "").trim().toUpperCase()))
-          .find(Boolean);
+        const entreeOr = String(entree.noOr || (entree as any).no || "").trim().toUpperCase();
+        const entreeChassis = String(entree.chassis || (entree as any).vin || "").trim().toUpperCase();
+        // PRIORITÉ STRICTE : Si un N° OR est renseigné, correspondance UNIQUEMENT par N° OR
+        // Le châssis ne sert de fallback QUE si l'entrée n'a aucun N° OR.
+        const existing = (entreeOr && entreeOr !== "-")
+          ? rowsByOr.get(entreeOr)
+          : (entreeChassis && entreeChassis !== "-")
+            ? rowsByChassis.get(entreeChassis)
+            : undefined;
+
         if (existing) {
           if (!isSheetEmplacementOutsideMap(emplacement)) {
             existing.emplacement = emplacement;
           }
+          // L'état actif du flux (interventions atelier en cours) EST STRICTEMENT PRIORITAIRE :
+          // Le suivi d'entrée ne doit JAMAIS réinitialiser un travail en cours ou assigné en "Attente Réparation" !
+          const isExistingActiveInWorkshop =
+            existing.etatIntervention === "En cours" ||
+            existing.statut === "En cours" ||
+            String(existing.avancement || "").toLowerCase().startsWith("en cours") ||
+            String(existing.avancement || "").toLowerCase().includes("accord") ||
+            String(existing.avancement || "").toLowerCase().includes("devis") ||
+            (existing.technicien && existing.technicien !== "-" && existing.technicien !== "");
+
           if (entree.equipe && entree.equipe !== "-") {
             const teamChanged = existing.equipe && existing.equipe !== "-" && existing.equipe.trim().toLowerCase() !== entree.equipe.trim().toLowerCase();
-            existing.equipe = entree.equipe;
-            existing.atelier = entree.equipe;
-            existing.equipe1 = entree.equipe;
-            if (teamChanged) {
-              existing.technicien = "-";
-              existing.nomTechnicien = "-";
-              existing.avancement = "Attente Réparation";
-              existing.statutAcceptation = "en_attente";
+            if (!isExistingActiveInWorkshop || !existing.equipe || existing.equipe === "-") {
+              existing.equipe = entree.equipe;
+              existing.atelier = entree.equipe;
+              existing.equipe1 = entree.equipe;
+              if (teamChanged && !isExistingActiveInWorkshop) {
+                existing.technicien = "-";
+                existing.nomTechnicien = "-";
+                existing.avancement = "Attente Réparation";
+                existing.statutAcceptation = "en_attente";
+              }
             }
           }
           if (entree.etat) {
-            existing.statut = entree.etat as WorkshopStatus;
-            existing.etatIntervention = entree.etat as WorkshopStatus;
-            if (isAttenteReparation(entree.etat)) {
-              existing.avancement = "Attente Réparation";
-              existing.technicien = "-";
-              existing.nomTechnicien = "-";
+            const isEntreeLivre = String(entree.etat).toLowerCase().includes("livr");
+            if (isEntreeLivre) {
+              existing.statut = "Livré";
+              existing.etatIntervention = "Livré";
+              existing.avancement = "Livré";
+            } else if (!isExistingActiveInWorkshop) {
+              existing.statut = entree.etat as WorkshopStatus;
+              existing.etatIntervention = entree.etat as WorkshopStatus;
+              if (isAttenteReparation(entree.etat)) {
+                if (!existing.avancement || existing.avancement === "-" || existing.avancement === "NA") {
+                  existing.avancement = "Attente Réparation";
+                }
+                if (!existing.technicien || existing.technicien === "") {
+                  existing.technicien = "-";
+                  existing.nomTechnicien = "-";
+                }
+              }
             }
           }
           if (entree.nomClient && entree.nomClient !== "-" && !entree.nomClient.toLowerCase().includes("non renseign")) {
@@ -1188,8 +1294,8 @@ export default function Dashboard() {
           modelePowerBI: entree.modele || "-",
           atelier: entree.categorie || "-",
           operation: "Entrée atelier",
-          statut: (entree.etat || "En attente") as WorkshopStatus,
-          etatIntervention: (entree.etat || "En attente") as WorkshopStatus,
+          statut: (entree.etat || "Attente Réparation") as WorkshopStatus,
+          etatIntervention: (entree.etat || "Attente Réparation") as WorkshopStatus,
           montant: 0,
           temps: 0,
           nbIntervention: 0,
@@ -1200,7 +1306,7 @@ export default function Dashboard() {
           equipe: entree.equipe || "-",
           technicien: entree.technicien || "-",
           nomTechnicien: entree.nomTechnicien || "-",
-          avancement: entree.avancement || "-",
+          avancement: entree.avancement || "Attente Réparation",
           dateDebutRep: entree.dateDebutRep || "",
           dateFinRep: entree.dateFinRep || "",
           emplacement,
@@ -1413,15 +1519,18 @@ export default function Dashboard() {
       const isDelivered = formatStatusLabel(nextEtat) === "Livré";
 
       // Si passage à "En cours", on affecte l'équipe appropriée du Chef d'Équipe actif
+      // Si passage à "En cours", on conserve l'équipe réelle du véhicule ou de la sous-équipe active
       const isGoingToEnCours = nextEtat === "En cours";
       let assignedTeam = row.equipe;
       if (isGoingToEnCours) {
-        if (chefSubTeamFilter !== "all" && chefAssignedTeams.includes(chefSubTeamFilter)) {
+        if (assignedTeam && !assignedTeam.includes(",") && assignedTeam.trim() !== "-") {
+          // Conserver l'équipe réelle déjà affectée au véhicule
+        } else if (chefSubTeamFilter !== "all" && chefAssignedTeams.includes(chefSubTeamFilter)) {
           assignedTeam = chefSubTeamFilter;
-        } else if (row.equipe && chefAssignedTeams.some((t) => isVehicleMatchingTeam(row.equipe || "", t))) {
-          assignedTeam = row.equipe;
+        } else if (chefAssignedTeams.length > 0) {
+          assignedTeam = chefAssignedTeams[0];
         } else {
-          assignedTeam = chefAssignedTeams[0] || activeChefEquipeTeam || "Daily1";
+          assignedTeam = "Daily1";
         }
       }
 
@@ -1430,7 +1539,7 @@ export default function Dashboard() {
         ...row,
         etatIntervention: nextEtat,
         statut: nextEtat,
-        equipe: (isGoingToEnCours && assignedTeam ? assignedTeam : row.equipe) || "Daily",
+        equipe: (isGoingToEnCours && assignedTeam ? assignedTeam : row.equipe) || "Daily1",
       };
       const nextEmplacement = isDelivered
         ? DELIVERED_EMPLACEMENT
@@ -1482,7 +1591,7 @@ export default function Dashboard() {
           "État modifié",
           `${formatStatusLabel(previousEtat)} → ${formatStatusLabel(nextEtat)}${nextEmplacement !== previousEmplacement ? ` • Emplacement : ${previousEmplacement || "-"} → ${nextEmplacement}` : ""}`,
         );
-        if ((nextEtat as string) === "Attente Client" || (nextEtat as string) === "Prêt / Fini") {
+        if (!isWarrantyVehicle(row) && ((nextEtat as string) === "Attente Client" || (nextEtat as string) === "Prêt / Fini")) {
           notifierFinTravauxTechnicien(
             row,
             currentUser?.name || selectedChefEquipeName || "Chef d'équipe"
@@ -1542,7 +1651,7 @@ export default function Dashboard() {
 
       // Avancement initialisé à "En cours - 10%" dès le début de prise en charge
       const nextAvancement =
-        (!row.avancement || row.avancement === "-" || row.avancement === "NA" || row.avancement.toLowerCase().includes("attente"))
+        (!row.avancement || row.avancement === "-" || row.avancement === "NA" || row.avancement.toLowerCase().includes("attente") || row.avancement === "Accepter accord" || row.avancement.toLowerCase().includes("accord"))
           ? "En cours - 10%"
           : row.avancement;
 
@@ -1575,11 +1684,10 @@ export default function Dashboard() {
         let matched = false;
         const updated = current.map((item) => {
           const isTarget =
-            (row.id && item.id === row.id) ||
-            (row.id && String(item.id) === String(row.id)) ||
+            (row.id && (item.id === row.id || String(item.id) === String(row.id))) ||
             (row.no && (item.no === row.no || item.ordre === row.no)) ||
             (row.ordre && (item.no === row.ordre || item.ordre === row.ordre)) ||
-            (row.chassis && item.chassis && item.chassis.trim().toUpperCase() === row.chassis.trim().toUpperCase());
+            (!row.no && !row.ordre && row.chassis && item.chassis && item.chassis.trim().toUpperCase() === row.chassis.trim().toUpperCase());
 
           if (!isTarget) return item;
           matched = true;
@@ -1657,6 +1765,14 @@ export default function Dashboard() {
         setLastRefresh(formatRefreshDate());
         setDatabaseStatus("ready");
         setDatabaseError("");
+        if (nextAvancement !== row.avancement) {
+          recordAvancementStatusChange(
+            row,
+            nextAvancement,
+            currentDateTime,
+            currentUser?.name || selectedChefEquipeName || "Chef d'équipe",
+          );
+        }
         recordVehicleModification(
           row,
           "Prise en charge / affectation",
@@ -1737,10 +1853,10 @@ export default function Dashboard() {
           : "En cours - 10%";
       let finalTeam = assignedTeam || row.equipe;
       if (!finalTeam || finalTeam.includes(",")) {
-        if (chefSubTeamFilter !== "all" && chefAssignedTeams.includes(chefSubTeamFilter)) {
+        if (row.equipe && !row.equipe.includes(",") && row.equipe.trim() !== "-") {
+          finalTeam = row.equipe.trim();
+        } else if (chefSubTeamFilter !== "all" && chefAssignedTeams.includes(chefSubTeamFilter)) {
           finalTeam = chefSubTeamFilter;
-        } else if (row.equipe && chefAssignedTeams.some((t) => isVehicleMatchingTeam(row.equipe || "", t))) {
-          finalTeam = row.equipe;
         } else {
           finalTeam = chefAssignedTeams[0] || "Daily1";
         }
@@ -1764,11 +1880,10 @@ export default function Dashboard() {
       setVehicles((current) =>
         current.map((item) => {
           const isTarget =
-            (row.id && item.id === row.id) ||
-            (row.id && String(item.id) === String(row.id)) ||
+            (row.id && (item.id === row.id || String(item.id) === String(row.id))) ||
             (row.no && (item.no === row.no || item.ordre === row.no)) ||
             (row.ordre && (item.no === row.ordre || item.ordre === row.ordre)) ||
-            (row.chassis && item.chassis && item.chassis.trim().toUpperCase() === row.chassis.trim().toUpperCase());
+            (!row.no && !row.ordre && row.chassis && item.chassis && item.chassis.trim().toUpperCase() === row.chassis.trim().toUpperCase());
 
           if (!isTarget) return item;
 
@@ -1828,6 +1943,12 @@ export default function Dashboard() {
               heureDebutTravail: currentTime,
               emplacement: nextEmplacement,
             }
+          );
+          recordAvancementStatusChange(
+            row,
+            nextAvancement,
+            currentDateTime,
+            currentUser?.name || selectedChefEquipeName || "Chef d'équipe",
           );
         }
         setLastRefresh(formatRefreshDate());
@@ -1911,8 +2032,13 @@ export default function Dashboard() {
         return;
       }
 
-      // Si le chef d'équipe choisit « Lancement devis » sans formulaire, ouvrir le modal.
-      if (nextAvancement === "Lancement devis" && !demandeDevis) {
+      // Si le chef d'équipe choisit « Lancement devis » ou « Attente accord » sans formulaire, ouvrir le modal.
+      if (
+        (nextAvancement === "Lancement devis" ||
+          nextAvancement === "Attente accord" ||
+          nextAvancement === "Lancement attente accord") &&
+        !demandeDevis
+      ) {
         setPendingDevisVehicle(row);
         return;
       }
@@ -1943,6 +2069,7 @@ export default function Dashboard() {
       if (demandeDevis) {
         demandeDevis.date = demandeDevis.date || nowFormatted;
         saveDemandeDevisLocal(demandeDevis);
+        setDemandesDevisMap(getDemandesDevisLocal());
       }
 
       const previousAvancement = row.avancement;
@@ -1950,6 +2077,30 @@ export default function Dashboard() {
       const previousEmplacement = row.emplacement;
 
       let effectiveAvancement = nextAvancement;
+      if (
+        nextAvancement === "Lancement devis" ||
+        nextAvancement === "Attente accord" ||
+        nextAvancement === "Lancement attente accord"
+      ) {
+        effectiveAvancement = "Attente accord";
+      }
+
+      const isAccordAccepte =
+        nextAvancement === "Accepter accord" ||
+        nextAvancement === "Accord accepté" ||
+        nextAvancement.toLowerCase() === "accepter accord";
+
+      const isDevis =
+        !isAccordAccepte && (
+          nextAvancement === "Lancement devis" ||
+          nextAvancement === "Attente accord" ||
+          nextAvancement === "Lancement attente accord" ||
+          effectiveAvancement === "Attente accord" ||
+          nextAvancement === "ATENDE DEVIS" ||
+          nextAvancement.toLowerCase().includes("devis") ||
+          nextAvancement.toLowerCase().includes("accord")
+        );
+
       let shouldMarkReprise = false;
       if (nextAvancement === "Technicien réaffecté") {
         const record = marquerVehiculeReaffecte(row, currentUserName);
@@ -1973,16 +2124,9 @@ export default function Dashboard() {
       // Terminer : clôturer l'essai si ouvert et enregistrer la date de fin effective de réparation
       if (nextAvancement === "Terminer" || parseAvancementPct(effectiveAvancement) === 100) {
         marquerFinEssai(row, { dateControle: nowFormatted, resultat: "CONFORME" });
-        saveVehicleTimeLog({
-          vehicleKey: row.no || row.chassis || String(row.id),
-          noOr: row.no || row.ordre || "",
-          chassis: row.chassis || "",
-          immatriculation: row.serie || row.immatriculation || "",
-          client: row.client || "",
-          equipe: row.equipe || "",
-          dateFinReparation: nowFormatted,
-        });
-        notifierFinTravauxTechnicien(row, currentUserName, nowFormatted);
+        if (!isWarrantyVehicle(row)) {
+          notifierFinTravauxTechnicien(row, currentUserName, nowFormatted);
+        }
       }
 
       // Déduire l'état d'intervention selon la valeur d'avancement
@@ -1997,29 +2141,28 @@ export default function Dashboard() {
                 : effectiveAvancement.startsWith("vr")
                   ? "Attente Réparation"
                   // Une demande de devis suspend l'intervention : le véhicule
-                  // reste donc dans le tableau de chargement de son équipe.
-                  : (effectiveAvancement === "Lancement devis" || effectiveAvancement === "ATENDE DEVIS")
+                  // retourne au tableau de chargement de son équipe (Attente Réparation).
+                  : isDevis
                     ? "Attente Réparation"
                   : nextAvancement === "Technicien réaffecté"
                   ? "Attente Réparation"
                   : effectiveAvancement === "Attente réparation" || effectiveAvancement === "Attente Réparation"
                     ? ((extraParams?.etat as WorkshopStatus) || "Attente Réparation")
-                    : effectiveAvancement.startsWith("En cours") || effectiveAvancement.toLowerCase().includes("devis")
+                    : effectiveAvancement.startsWith("En cours")
                       ? "En cours"
                       : row.etatIntervention;
 
       // Emplacement automatique : calculé selon l'avancement, l'état et l'équipe active
-      const isDevis = nextAvancement === "Lancement devis" || nextAvancement === "ATENDE DEVIS" || nextAvancement.toLowerCase().includes("devis");
       const isVrTransfer = nextAvancement.startsWith("vr");
       const vrTargetTeam = isVrTransfer ? getTeamFromVr(nextAvancement) : "";
       const currentBloc = row.bloc || 1;
       const rawNextBloc = isVrTransfer ? currentBloc + 1 : currentBloc;
       const nextBloc = (Math.min(rawNextBloc, 3) as 1 | 2 | 3);
       const targetEquipe = (extraParams?.equipe || demandeDevis?.equipeOrigine || vrTargetTeam || row.equipe || "").trim() || row.equipe || "";
-      const targetTech = isVrTransfer
+      const targetTech = isVrTransfer || isDevis
         ? "-"
         : (extraParams?.technicien !== undefined ? extraParams.technicien : (demandeDevis?.technicien || row.technicien));
-      const targetNomTech = isVrTransfer
+      const targetNomTech = isVrTransfer || isDevis
         ? "-"
         : (extraParams?.nomTechnicien !== undefined ? extraParams.nomTechnicien : (demandeDevis?.nomTechnicien || row.nomTechnicien));
 
@@ -2092,7 +2235,6 @@ export default function Dashboard() {
         const rec = marquerVehiculeReprise(row, currentUserName);
         setWriteNotice(`✅ Travail repris sur ${row.serie || row.no} le ${rec.dateReprise} !`);
       }
-      recordAvancementStatusChange(row, nextAvancement, nowFormatted, currentUserName);
       setSavingVehicleId(row.id);
       setVehicles((current) =>
         current.map((item) =>
@@ -2106,10 +2248,16 @@ export default function Dashboard() {
               equipe: targetEquipe,
               bloc: nextBloc,
               ...(isVrTransfer ? { statutAcceptation: "en_attente" as const } : {}),
-              technicien: isVrTransfer ? "-" : (targetTech !== undefined ? targetTech : item.technicien),
-              nomTechnicien: isVrTransfer ? "-" : (targetNomTech !== undefined ? targetNomTech : item.nomTechnicien),
+              technicien: (isVrTransfer || isDevis) ? "-" : (targetTech !== undefined ? targetTech : item.technicien),
+              nomTechnicien: (isVrTransfer || isDevis) ? "-" : (targetNomTech !== undefined ? targetNomTech : item.nomTechnicien),
               dateModification: nowFormatted,
+              dateAvancement: nowFormatted,
+              heureAvancement: nowFormatted.split(" ")[1] || "",
+              dateHeureAvancement: nowFormatted,
               dateFinRep: (effectiveAvancement === "Terminer" || isVrTransfer) ? nowFormatted : item.dateFinRep,
+              ...(isWarrantyVehicle(row) && effectiveAvancement === "Terminer"
+                ? { statutGarantie: String((row as any).statutGarantie || "").trim() || "À traiter garantie" }
+                : {}),
               ...(isVrTransfer && currentBloc === 1
                 ? {
                     equipe1: row.equipe || "Atelier",
@@ -2142,15 +2290,22 @@ export default function Dashboard() {
         setActiveTab("essai");
       } else if (nextAvancement === "attends acheter" && permissions.canViewAttenteAchat) {
         setActiveTab("attente_achat");
-      } else if (nextAvancement === "Lancement devis") {
-        // Le chef reste dans son tableau « Attente Réparation ». La demande
-        // est toujours disponible dans Page Devis pour Réception/Admin.
-        if (role === "chef_equipe") {
-          setActiveTab("chargement");
-          setActiveFilter("Attente Réparation");
-        } else if (permissions.canViewDevis) {
+      } else if (isDevis) {
+        // Le chef d'équipe et l'atelier retournent au Tableau de chargement
+        // Si le rôle est réception, il va sur la page devis.
+        if (role === "reception" && permissions.canViewDevis) {
           setActiveTab("devis");
+        } else {
+          setActiveTab("chargement");
+          if (role === "chef_equipe") {
+            setActiveFilter("Attente Réparation");
+          } else {
+            setActiveFilter("Tous");
+          }
         }
+      } else if (isAccordAccepte) {
+        setActiveTab("chargement");
+        setActiveFilter("Attente Réparation");
       }
 
       if (!canWriteToDatabase) {
@@ -2161,16 +2316,37 @@ export default function Dashboard() {
         return;
       }
 
+      const timeStr = nowFormatted.split(" ")[1] || "";
       const extraPayload: Record<string, string> = {
         ...(extraParams || {}),
         etat: nextEtat,
+        statut: nextEtat,
         dateModification: nowFormatted,
+        dateAvancement: nowFormatted,
+        heureAvancement: timeStr,
+        dateHeureAvancement: nowFormatted,
       };
       if (nextEmplacement) {
         extraPayload.emplacement = nextEmplacement;
       }
       if (isDevis) {
         extraPayload.dateDevis = nowFormatted;
+        extraPayload.technicien = "-";
+        extraPayload.nomTechnicien = "-";
+        extraPayload.avancement = "Attente accord";
+        extraPayload.etat = "Attente Réparation";
+        extraPayload.statut = "Attente Réparation";
+      }
+      if (isAccordAccepte) {
+        extraPayload.avancement = "Accepter accord";
+        extraPayload.etat = "Attente Réparation";
+        extraPayload.statut = "Attente Réparation";
+        if (targetTech && targetTech !== "-") {
+          extraPayload.technicien = targetTech;
+        }
+        if (targetNomTech && targetNomTech !== "-") {
+          extraPayload.nomTechnicien = targetNomTech;
+        }
       }
       if (nextAvancement === "Attente PDR" || nextAvancement === "attends acheter") {
         extraPayload.dateDemande = nowFormatted;
@@ -2185,6 +2361,11 @@ export default function Dashboard() {
       if (nextAvancement === "Terminer") {
         extraPayload.dateFin = nowFormatted;
         extraPayload.dateFinRep = nowFormatted;
+        if (isWarrantyVehicle(row)) {
+          // À la fin des travaux R10, le dossier quitte les tableaux atelier
+          // et reste à traiter exclusivement dans le Tableau Garantie.
+          extraPayload.statutGarantie = String((row as any).statutGarantie || "").trim() || "À traiter garantie";
+        }
       }
       if (isVrTransfer) {
         extraPayload.dateTransfert = nowFormatted;
@@ -2237,18 +2418,21 @@ export default function Dashboard() {
         // L'emplacement P numéroté choisi ci-dessus est transmis dans
         // extraPayload et enregistré avec l'avancement.
         // Si un technicien est réaffecté ou spécifié, synchroniser aussi la colonne technicien
-        if (!isVrTransfer && (extraParams?.technicien || extraParams?.nomTechnicien)) {
+        if (!isVrTransfer && !isDevis && (extraParams?.technicien || extraParams?.nomTechnicien)) {
           updateDatabaseTechnicien(
             row,
             targetTech || "",
             targetNomTech || ""
           ).catch(() => {});
-        } else if (isVrTransfer) {
+        } else if (isVrTransfer || isDevis) {
           updateDatabaseTechnicien(row, "-", "-").catch(() => {});
         }
         setLastRefresh(formatRefreshDate());
         setDatabaseStatus("ready");
         setDatabaseError("");
+        // L'historique est créé uniquement après la validation PostgreSQL :
+        // un changement refusé ne peut donc jamais produire une fausse trace.
+        recordAvancementStatusChange(row, nextAvancement, nowFormatted, currentUserName);
         recordVehicleModification(
           row,
           "Avancement modifié",
@@ -2261,8 +2445,8 @@ export default function Dashboard() {
               ? `Véhicule ${row.serie || row.no} mis à jour : Essai (transféré vers la Page Essai).`
               : nextAvancement === "attends acheter"
                 ? `Véhicule ${row.serie || row.no} mis à jour : attends acheter (transféré vers la Page Acheter).`
-                : nextAvancement === "Lancement devis"
-                  ? `Véhicule ${row.serie || row.no} mis à jour : Lancement devis (emplacement basculé automatiquement en P).`
+                : isDevis
+                  ? `📋 Véhicule ${row.serie || row.no} : Lancement devis enregistré${demandeDevis?.numeroDevis ? ` (N° DV ${demandeDevis.numeroDevis})` : ""}. Le véhicule retourne dans Tableaux de chargement avec l'avancement "Attente accord" (emplacement ${nextEmplacement}). Technicien ${row.nomTechnicien || row.technicien || ""} libéré (🟢 Disponible).`
                   : nextAvancement === "Technicien réaffecté"
                     ? `🔄 Technicien réaffecté pour ${row.serie || row.no} : avancement passé en "Attente réparation" (reste dans Interventions En cours).`
                     : nextAvancement === "Terminer"
@@ -2302,6 +2486,12 @@ export default function Dashboard() {
               setLastRefresh(formatRefreshDate());
               setDatabaseStatus("ready");
               setWriteError("");
+              recordAvancementStatusChange(row, nextAvancement, nowFormatted, currentUserName);
+              recordVehicleModification(
+                row,
+                "Avancement modifié",
+                `${previousAvancement || "-"} → ${effectiveAvancement} • Emplacement : ${nextEmplacement} → ${alternativeEmplacement}`,
+              );
               setWriteNotice(
                 `La place ${nextEmplacement} était déjà occupée. Le véhicule ${row.serie || row.no} a été placé automatiquement en ${alternativeEmplacement}.`
               );
@@ -2316,7 +2506,9 @@ export default function Dashboard() {
           nextAvancement === "Essai" ||
           nextAvancement === "Terminer" ||
           nextAvancement === "Attente client" ||
-          nextAvancement === "Lancement devis"
+          nextAvancement === "Lancement devis" ||
+          nextAvancement === "Attente accord" ||
+          nextAvancement === "Lancement attente accord"
         ) {
           // Pour ces statuts, on conserve le véhicule dans l'état et la page cible
           setWriteNotice(
@@ -2324,8 +2516,8 @@ export default function Dashboard() {
               ? `Véhicule ${row.serie || row.no} enregistré dans l'application en attente d'achat.`
               : nextAvancement === "Essai"
                 ? `Véhicule ${row.serie || row.no} transféré en essai dans l'application.`
-                : nextAvancement === "Lancement devis"
-                  ? `Véhicule ${row.serie || row.no} enregistré en Lancement devis (emplacement P) dans l'application.`
+                : nextAvancement === "Lancement devis" || nextAvancement === "Attente accord" || nextAvancement === "Lancement attente accord"
+                  ? `Véhicule ${row.serie || row.no} enregistré en Attente accord (emplacement P) dans l'application.`
                   : nextAvancement === "Terminer"
                     ? `Contrôle conforme pour ${row.serie || row.no} enregistré dans l'application.`
                     : `Véhicule ${row.serie || row.no} placé en attente client dans l'application.`
@@ -2635,6 +2827,7 @@ export default function Dashboard() {
     const zones = new Map<string, Flux[]>();
 
     vehicles.forEach((row) => {
+      if (isCompletedWarrantyVehicle(row)) return;
       const zone = (row.emplacement || "").toUpperCase().trim();
       if (!zone || zone === "NA" || zone.startsWith("#") || isSheetEmplacementOutsideMap(zone)) {
         return;
@@ -2649,11 +2842,11 @@ export default function Dashboard() {
     if (role === "chef_equipe" && effectiveChefFilterTeam) {
       return vehicles.filter(
         (v) =>
-          isAttenteReparation(v.etatIntervention) &&
+          isAttenteReparation(v.etatIntervention, v.avancement) &&
           isVehicleMatchingTeam(v.equipe || v.equipe1 || "", effectiveChefFilterTeam)
       ).length;
     }
-    return vehicles.filter((v) => isAttenteReparation(v.etatIntervention)).length;
+    return vehicles.filter((v) => isAttenteReparation(v.etatIntervention, v.avancement)).length;
   }, [vehicles, role, effectiveChefFilterTeam]);
 
   const enCoursCount = useMemo(() => {
@@ -2713,11 +2906,15 @@ export default function Dashboard() {
         demandesDevisMap[String(v.id)] ||
         (v.no && demandesDevisMap[v.no.trim()]) ||
         (v.chassis && demandesDevisMap[v.chassis.trim()]);
+      if (role === "reception" && assignedReceptionCs) {
+        const vCs = String(v.cs || d?.cs || "").trim().toUpperCase();
+        if (vCs && vCs !== assignedReceptionCs) return false;
+      }
       const av = (v.avancement || "").toLowerCase();
       const isEnDevis = av.includes("devis") || (v.etatIntervention || "").toLowerCase().includes("devis");
       return isEnDevis && (!d || !d.statutDevis || d.statutDevis === "Attente validation devis" || d.statutDevis === "En attente accord");
     }).length;
-  }, [vehicles, demandesDevisMap]);
+  }, [vehicles, demandesDevisMap, role, assignedReceptionCs]);
 
   const devisRelanceCount = useMemo(() => {
     return vehicles.filter((v) => {
@@ -2725,11 +2922,15 @@ export default function Dashboard() {
         demandesDevisMap[String(v.id)] ||
         (v.no && demandesDevisMap[v.no.trim()]) ||
         (v.chassis && demandesDevisMap[v.chassis.trim()]);
+      if (role === "reception" && assignedReceptionCs) {
+        const vCs = String(v.cs || d?.cs || "").trim().toUpperCase();
+        if (vCs && vCs !== assignedReceptionCs) return false;
+      }
       const av = (v.avancement || "").toLowerCase();
       const isEnDevis = av.includes("devis") || (v.etatIntervention || "").toLowerCase().includes("devis");
       return isEnDevis && isDevisDepassee24h(d);
     }).length;
-  }, [vehicles, demandesDevisMap]);
+  }, [vehicles, demandesDevisMap, role, assignedReceptionCs]);
 
   const [dismissedDevisNotifIds, setDismissedDevisNotifIds] = useState<Set<string>>(new Set());
 
@@ -2752,11 +2953,15 @@ export default function Dashboard() {
         if (dismissedDevisNotifIds.has(notifId)) return false;
         if (!devis) return false;
         if (devis.statutDevis === "Accepté" || devis.statutDevis === "Refusé") return false;
+        if (assignedReceptionCs) {
+          const vCs = String(vehicle.cs || devis?.cs || "").trim().toUpperCase();
+          if (vCs && vCs !== assignedReceptionCs) return false;
+        }
         const av = (vehicle.avancement || "").toLowerCase();
         const isEnDevis = av.includes("devis") || (vehicle.etatIntervention || "").toLowerCase().includes("devis");
         return isEnDevis && (!devis.statutDevis || devis.statutDevis === "Attente validation devis" || devis.statutDevis === "En attente accord");
       });
-  }, [vehicles, demandesDevisMap, role, dismissedDevisNotifIds]);
+  }, [vehicles, demandesDevisMap, role, dismissedDevisNotifIds, assignedReceptionCs]);
 
   const activeDevisRelanceNotifications = useMemo(() => {
     if (role !== "reception") {
@@ -2775,11 +2980,15 @@ export default function Dashboard() {
         if (dismissedDevisNotifIds.has(notifId)) return false;
         if (!devis) return false;
         if (devis.statutDevis === "Accepté" || devis.statutDevis === "Refusé") return false;
+        if (assignedReceptionCs) {
+          const vCs = String(vehicle.cs || devis?.cs || "").trim().toUpperCase();
+          if (vCs && vCs !== assignedReceptionCs) return false;
+        }
         const av = (vehicle.avancement || "").toLowerCase();
         const isEnDevis = av.includes("devis") || (vehicle.etatIntervention || "").toLowerCase().includes("devis");
         return isEnDevis && isDevisDepassee24h(devis);
       });
-  }, [vehicles, demandesDevisMap, role, dismissedDevisNotifIds]);
+  }, [vehicles, demandesDevisMap, role, dismissedDevisNotifIds, assignedReceptionCs]);
 
   const handleAppelerClientFromNotif = useCallback((item: { vehicle: Flux; devis: DemandeDevis }) => {
     const key = (item.vehicle.no || item.vehicle.ordre || item.vehicle.chassis || String(item.vehicle.id)).trim();
@@ -2794,9 +3003,8 @@ export default function Dashboard() {
   const handleAccepterDevisFromNotif = useCallback(async (item: { vehicle: Flux; devis: DemandeDevis }) => {
     const key = (item.vehicle.no || item.vehicle.ordre || item.vehicle.chassis || String(item.vehicle.id)).trim();
     const updated = marquerDevisAccepte(key);
-    if (updated) {
-      void updateDatabaseStatutDevis(item.vehicle, updated, "Accepté");
-    }
+    const devisData: DemandeDevis = updated || item.devis;
+    void updateDatabaseStatutDevis(item.vehicle, devisData, "Accepté");
     const targetEquipe = item.devis.equipeOrigine || item.devis.equipe || item.vehicle.equipe || "Daily1";
     const targetTech =
       item.vehicle.technicien && item.vehicle.technicien !== "-"
@@ -2839,13 +3047,14 @@ export default function Dashboard() {
 
     await saveVehicleAvancement(
       item.vehicle,
-      "Attente réparation",
+      "Accepter accord",
       undefined,
       {
         equipe: targetEquipe,
         etat: "Attente Réparation",
         technicien: targetTech,
         nomTechnicien: targetNomTech,
+        avancement: "Accepter accord",
       },
       updated || item.devis
     );
@@ -2854,23 +3063,27 @@ export default function Dashboard() {
       : targetTech
       ? `👨‍🔧 Tech : ${targetTech}`
       : "";
-    setWriteNotice(`✅ Devis N° DV ${item.devis.numeroDevis} accepté ! Véhicule retourné à l'équipe ${targetEquipe} ${techDisplay ? `[${techDisplay}] ` : ""}dans "Tableaux de chargement (Attente Réparation)" (notification transmise au Chef d'Équipe).`);
+    setWriteNotice(`✅ Devis N° DV ${item.devis.numeroDevis} accepté ! Véhicule passé en avancement "Accepter accord" et retourné à l'équipe ${targetEquipe} ${techDisplay ? `[${techDisplay}] ` : ""}dans "Tableaux de chargement (Attente Réparation)".`);
   }, [saveVehicleAvancement]);
 
   const handleRefuserDevisFromNotif = useCallback(async (item: { vehicle: Flux; devis: DemandeDevis }) => {
     const key = (item.vehicle.no || item.vehicle.ordre || item.vehicle.chassis || String(item.vehicle.id)).trim();
     const updated = marquerDevisRefuse(key);
-    if (updated) {
-      void updateDatabaseStatutDevis(item.vehicle, updated, "Refusé");
-    }
+    const devisData: DemandeDevis = updated || item.devis;
+    void updateDatabaseStatutDevis(item.vehicle, devisData, "Refusé");
     await saveVehicleAvancement(
       item.vehicle,
       "Terminer",
       undefined,
-      { etatIntervention: "Attente Client" },
+      {
+        etatIntervention: "Attente Client",
+        avancement: "Terminer",
+        statut: "Attente Client",
+        etat: "Attente Client",
+      },
       updated || item.devis
     );
-    setWriteNotice(`❌ Devis N° DV ${item.devis.numeroDevis} refusé par le client : Véhicule passé automatiquement en "Terminer" (Attente Client).`);
+    setWriteNotice(`❌ Devis N° DV ${item.devis.numeroDevis} refusé par le client : Véhicule passé automatiquement en "Terminer" (Attente Client pour restitution).`);
   }, [saveVehicleAvancement]);
 
   const handleRelancerClientFromNotif = useCallback((item: { vehicle: Flux; devis: DemandeDevis }) => {
@@ -2955,6 +3168,9 @@ export default function Dashboard() {
       if (assignedReceptionCs && String(v.cs || "").trim().toUpperCase() !== assignedReceptionCs) {
         return false;
       }
+      if (String(v.cs || "").trim().toUpperCase() === "R10" || v.isGarantie) {
+        return false;
+      }
       // Att Facture autorise aussi le départ du client ; le règlement final
       // reste à traiter par la Facturation en fin de mois.
       const isPaymentValidated = ["Facture", "Bon de commande", "Att Facture", "Attente Facture", "Édition fin de travaux"].includes(v.modePaiement || "");
@@ -3002,14 +3218,17 @@ export default function Dashboard() {
       setActiveTab("en_cours");
       setActiveFilter("En cours");
 
-      const assignedTeam = activeChefEquipeTeam || item.equipe || "Daily1";
+      const assignedTeam =
+        item.equipe && !item.equipe.includes(",") && item.equipe.trim() !== "-"
+          ? item.equipe.trim()
+          : (chefAssignedTeams[0] || "Daily1");
 
       const normOr = (item.noOr || "").trim();
       const normChassis = (item.chassis || "").trim().toUpperCase();
       const resolvedVehicle = matchingVehicle || vehicles.find((v) => {
         const vOr = (v.no || v.ordre || "").trim();
         const vChassis = (v.chassis || "").trim().toUpperCase();
-        return (normOr && vOr === normOr) || (normChassis && vChassis === normChassis);
+        return (normOr && vOr === normOr) || (!normOr && normChassis && vChassis === normChassis);
       });
 
       // Préparer le véhicule pour passage direct en "En cours - 10%"
@@ -3098,12 +3317,12 @@ export default function Dashboard() {
       setVehicles((prev) => {
         const exists = prev.some((v) =>
           (normOr && (v.no === normOr || v.ordre === normOr)) ||
-          (normChassis && v.chassis && v.chassis.trim().toUpperCase() === normChassis)
+          (!normOr && normChassis && v.chassis && v.chassis.trim().toUpperCase() === normChassis)
         );
         if (exists) {
           return prev.map((v) =>
             ((normOr && (v.no === normOr || v.ordre === normOr)) ||
-             (normChassis && v.chassis && v.chassis.trim().toUpperCase() === normChassis))
+             (!normOr && normChassis && v.chassis && v.chassis.trim().toUpperCase() === normChassis))
               ? {
                   ...v,
                   equipe: assignedTeam,
@@ -3157,7 +3376,7 @@ export default function Dashboard() {
       setVehicles((prev) =>
         prev.map((v) =>
           ((item.noOr && (v.no === item.noOr || v.ordre === item.noOr)) ||
-           (item.chassis && v.chassis === item.chassis))
+           (!item.noOr && item.chassis && v.chassis === item.chassis))
             ? {
                 ...v,
                 etatIntervention: "Attente Réparation",
@@ -3186,6 +3405,11 @@ export default function Dashboard() {
 
     return vehicles
       .filter((row) => {
+        // Une intervention garantie terminée est sortie du flux opérationnel :
+        // elle reste accessible uniquement depuis le Tableau de Suivi Garantie.
+        if (isCompletedWarrantyVehicle(row)) {
+          return false;
+        }
         if (role !== "administration" && (
           row.etatIntervention === "Livré" || row.statut === "Livré" ||
           row.avancement === "Livré" || row.avancement === "Sorti"
@@ -3225,7 +3449,7 @@ export default function Dashboard() {
           if (isReaffActive) {
             return false;
           }
-          if (!isAttenteReparation(row.etatIntervention)) {
+          if (!isAttenteReparation(row.etatIntervention, row.avancement)) {
             return false;
           }
           if (effectiveChefFilterTeam && !isVehicleMatchingTeam(row.equipe || row.equipe1 || "", effectiveChefFilterTeam)) {
@@ -3295,16 +3519,21 @@ export default function Dashboard() {
       });
   }, [activeFilter, dateFilter, search, vehicles, role, assignedReceptionCs, activeTab, effectiveChefFilterTeam, enCoursTransferOnly]);
 
+  const workshopVehicles = useMemo(
+    () => vehicles.filter((vehicle) => !isCompletedWarrantyVehicle(vehicle)),
+    [vehicles]
+  );
+
   const dateOptions = useMemo(
     () =>
       Array.from(
         new Set(
-          vehicles
+          workshopVehicles
             .map((row) => normalizeDateLabel(row.dateEntree))
             .filter(Boolean)
         )
       ).sort((a, b) => parseStoredDate(b) - parseStoredDate(a)),
-    [vehicles]
+    [workshopVehicles]
   );
 
   const statusRows = useMemo(
@@ -3312,12 +3541,12 @@ export default function Dashboard() {
       statusMeta
         .map((status) => ({
           ...status,
-          count: vehicles.filter(
+          count: workshopVehicles.filter(
             (row) => row.etatIntervention === status.label
           ).length,
         }))
         .filter((status) => status.count > 0),
-    [vehicles]
+    [workshopVehicles]
   );
 
   const selectedVehicle = selectedZone
@@ -3344,7 +3573,7 @@ export default function Dashboard() {
     {
       label: "Véhicules en attente",
       helper: "Etat intervention",
-      value: vehicles.filter((row) =>
+      value: workshopVehicles.filter((row) =>
         waitingStatuses.has(row.etatIntervention)
       ).length,
       accent: "#d97706",
@@ -3354,7 +3583,7 @@ export default function Dashboard() {
     {
       label: "Attente Client",
       helper: "Client à confirmer",
-      value: vehicles.filter(
+      value: workshopVehicles.filter(
         (row) => row.etatIntervention === "Attente Client"
       ).length,
       accent: "#dc2626",
@@ -3364,7 +3593,7 @@ export default function Dashboard() {
     {
       label: "Véhicules en cours",
       helper: "Intervention active",
-      value: vehicles.filter((row) =>
+      value: workshopVehicles.filter((row) =>
         isEnCours(row.etatIntervention, row.avancement, row.technicien)
       ).length,
       accent: "#2563eb",
@@ -3374,7 +3603,7 @@ export default function Dashboard() {
     {
       label: "À livrer / prêts",
       helper: "Sortie atelier",
-      value: vehicles.filter(
+      value: workshopVehicles.filter(
         (row) => formatStatusLabel(row.etatIntervention) === "Livré"
       ).length,
       accent: "#16a34a",
@@ -3384,7 +3613,7 @@ export default function Dashboard() {
     {
       label: "Travaux Exterieurs",
       helper: "Hors atelier",
-      value: vehicles.filter(
+      value: workshopVehicles.filter(
         (row) => row.etatIntervention === "Travaux Exterieurs"
       ).length,
       accent: "#0891b2",
@@ -4183,6 +4412,33 @@ export default function Dashboard() {
                 </button>
               </>
             )}
+
+            {permissions.canViewGarantie && (
+              <button
+                type="button"
+                onClick={() => setActiveTab("garantie")}
+                className={`w-full flex items-center justify-between px-3.5 py-2.5 rounded-xl text-xs font-bold transition-all cursor-pointer text-left ${activeTab === "garantie"
+                    ? "bg-purple-700 text-white shadow-sm"
+                    : "text-slate-600 hover:text-purple-800 hover:bg-slate-100/90"
+                  }`}
+              >
+                <div className="flex items-center gap-2.5">
+                  <Award size={16} className={activeTab === "garantie" ? "text-white" : "text-purple-700"} />
+                  <div>
+                    <div className="leading-tight">Tableau Garantie</div>
+                    <div className={`text-[10px] font-medium ${activeTab === "garantie" ? "text-purple-100" : "text-slate-400"}`}>
+                      Centre R10 & Accords
+                    </div>
+                  </div>
+                </div>
+                <span className={`px-2 py-0.5 rounded-full text-[10px] font-bold shrink-0 ${activeTab === "garantie"
+                    ? "bg-white/25 text-white"
+                    : "bg-purple-50 text-purple-700 border border-purple-200"
+                  }`}>
+                  R10
+                </span>
+              </button>
+            )}
           </nav>
 
           {/* Sidebar Footer */}
@@ -4219,7 +4475,7 @@ export default function Dashboard() {
                 const matchingVehicle = vehicles.find(
                   (v) =>
                     (item.noOr && (v.no === item.noOr || v.ordre === item.noOr)) ||
-                    (item.chassis && v.chassis === item.chassis)
+                    (!item.noOr && item.chassis && v.chassis === item.chassis)
                 );
                 return (
                   <div
@@ -4454,9 +4710,9 @@ export default function Dashboard() {
               {activeDevisAccordNotificationsForUser.map((item) => {
                 const matchingVehicle = vehicles.find(
                   (v) =>
-                    v.id === item.vehicleId ||
+                    (item.vehicleId && v.id === item.vehicleId) ||
                     (item.or && (v.no === item.or || v.ordre === item.or)) ||
-                    (item.chassis && v.chassis === item.chassis)
+                    (!item.or && !item.vehicleId && item.chassis && v.chassis === item.chassis)
                 );
                 return (
                   <div
@@ -4790,7 +5046,7 @@ export default function Dashboard() {
           ) : activeTab === "essai" ? (
             permissions.canViewEssai ? (
               <EssaiView
-                vehicles={vehicles}
+                vehicles={workshopVehicles}
                 onUpdateAvancement={saveVehicleAvancement}
                 onValidateEssai={handleValidateEssai}
                 onSelectVehicle={(v) => {
@@ -4819,7 +5075,7 @@ export default function Dashboard() {
           ) : activeTab === "attente_achat" ? (
             permissions.canViewAttenteAchat ? (
               <AcheterView
-                vehicles={vehicles}
+                vehicles={workshopVehicles}
                 onUpdateAvancement={saveVehicleAvancement}
                 onSelectVehicle={(v) => {
                   setSelectedVehicleId(v.id);
@@ -4848,7 +5104,7 @@ export default function Dashboard() {
           ) : activeTab === "devis" ? (
             permissions.canViewDevis ? (
               <DevisView
-                vehicles={vehicles}
+                vehicles={workshopVehicles}
                 onUpdateAvancement={saveVehicleAvancement}
                 onSelectVehicle={(v) => {
                   setSelectedVehicleId(v.id);
@@ -4860,6 +5116,7 @@ export default function Dashboard() {
                 isChefEquipe={role === "chef_equipe"}
                 role={role}
                 currentUser={currentUser}
+                userCs={assignedReceptionCs}
                 onRefresh={() => void loadVehicles()}
                 isRefreshing={databaseStatus === "loading" || isInstantSyncing}
                 onNavigateToTab={(tab, filter, vehicleId) => {
@@ -4876,6 +5133,28 @@ export default function Dashboard() {
                 <h2 className="text-base font-bold text-slate-800">Accès Restreint</h2>
                 <p className="text-xs text-slate-500 mt-1 max-w-md mx-auto">
                   La page Devis est réservée à la Réception et à l'Administration.
+                </p>
+              </div>
+            )
+          ) : activeTab === "garantie" ? (
+            permissions.canViewGarantie ? (
+              <GarantieView
+                vehicles={vehicles}
+                currentUser={currentUser}
+                onRefresh={() => void loadVehicles()}
+                onSelectVehicle={(v) => {
+                  setSelectedVehicleId(v.id);
+                  setVehiculeModalData(v);
+                }}
+              />
+            ) : (
+              <div className="p-8 text-center bg-white rounded-2xl m-4 sm:m-6 border border-slate-200 shadow-sm">
+                <div className="w-12 h-12 rounded-xl bg-purple-100 text-purple-700 flex items-center justify-center mx-auto mb-3">
+                  <ShieldAlert className="w-6 h-6" />
+                </div>
+                <h2 className="text-base font-bold text-slate-800">Accès Restreint</h2>
+                <p className="text-xs text-slate-500 mt-1 max-w-md mx-auto">
+                  Le Tableau Garantie est réservé au Service Garantie (R10), à l'Administration et au Chef d'Atelier.
                 </p>
               </div>
             )
@@ -5442,32 +5721,63 @@ export default function Dashboard() {
 
                       {/* Sélecteur multi-équipes pour le Chef d'Équipe gérant plusieurs équipes */}
                       {role === "chef_equipe" && chefAssignedTeams.length > 1 && (
-                        <div className="flex items-center gap-1 bg-slate-100 p-0.5 rounded-xl border border-slate-300 shadow-2xs">
+                        <div className="flex flex-wrap items-center gap-1.5 bg-slate-100 p-1 rounded-xl border border-slate-300 shadow-2xs">
                           <button
                             type="button"
                             onClick={() => setChefSubTeamFilter("all")}
-                            className={`px-2.5 py-1 text-xs font-bold rounded-lg transition-all cursor-pointer ${
+                            className={`px-3 py-1.5 text-xs font-bold rounded-lg transition-all cursor-pointer whitespace-nowrap flex items-center gap-1.5 ${
                               chefSubTeamFilter === "all"
                                 ? "bg-blue-600 text-white shadow-xs"
-                                : "text-slate-600 hover:text-slate-900"
+                                : "text-slate-600 hover:text-slate-900 hover:bg-slate-200/60"
                             }`}
                           >
-                            Toutes mes équipes ({chefAssignedTeams.length})
+                            <span>Toutes mes équipes ({chefAssignedTeams.length})</span>
                           </button>
-                          {chefAssignedTeams.map((teamName) => (
-                            <button
-                              key={teamName}
-                              type="button"
-                              onClick={() => setChefSubTeamFilter(teamName)}
-                              className={`px-2.5 py-1 text-xs font-bold rounded-lg transition-all cursor-pointer ${
-                                chefSubTeamFilter === teamName
-                                  ? "bg-indigo-600 text-white shadow-xs"
-                                  : "text-slate-600 hover:text-indigo-800"
-                              }`}
-                            >
-                              {teamName}
-                            </button>
-                          ))}
+                          {chefAssignedTeams.map((teamName) => {
+                            const displayName =
+                              teamName.toLowerCase().includes("elect") || teamName.toLowerCase().includes("elict")
+                                ? "Électrique"
+                                : teamName;
+
+                            const subTeamCount = vehicles.filter((v) => {
+                              const matchesTab = activeTab === "chargement"
+                                ? isAttenteReparation(v.etatIntervention, v.avancement)
+                                : activeTab === "en_cours"
+                                  ? isEnCours(v.etatIntervention, v.avancement, v.technicien)
+                                  : activeTab === "essai"
+                                    ? isEssai(v)
+                                    : activeTab === "acheter"
+                                      ? isAttenteAchat(v)
+                                      : activeTab === "devis"
+                                        ? isAttenteDevis(v, demandesDevisMap)
+                                        : true;
+                              return matchesTab && isVehicleMatchingTeam(v.equipe || v.equipe1 || "", teamName);
+                            }).length;
+
+                            return (
+                              <button
+                                key={teamName}
+                                type="button"
+                                onClick={() => setChefSubTeamFilter(teamName)}
+                                className={`px-3 py-1.5 text-xs font-bold rounded-lg transition-all cursor-pointer whitespace-nowrap flex items-center gap-1.5 ${
+                                  chefSubTeamFilter === teamName
+                                    ? "bg-indigo-600 text-white shadow-xs"
+                                    : "text-slate-700 hover:text-indigo-800 hover:bg-slate-200/60"
+                                }`}
+                              >
+                                <span>{displayName}</span>
+                                <span
+                                  className={`text-[10px] px-1.5 py-0.5 rounded-full font-bold ${
+                                    chefSubTeamFilter === teamName
+                                      ? "bg-white/20 text-white"
+                                      : "bg-slate-200 text-slate-700"
+                                  }`}
+                                >
+                                  {subTeamCount}
+                                </span>
+                              </button>
+                            );
+                          })}
                         </div>
                       )}
 
@@ -5705,9 +6015,9 @@ export default function Dashboard() {
                                 );
 
                                 const teamForOptions =
-                                  row.equipe && row.equipe !== "-"
+                                  row.equipe && row.equipe !== "-" && !row.equipe.includes(",")
                                     ? row.equipe
-                                    : activeChefEquipeTeam || "Daily1";
+                                    : (chefAssignedTeams[0] || "Daily1");
                                 const allowedAvancementOptions =
                                   getAvancementOptionsForTeam(teamForOptions, row);
                                 const directTransferOptions = [
@@ -5725,132 +6035,228 @@ export default function Dashboard() {
                                 const isTransferPending =
                                   Boolean(row.bloc && row.bloc > 1) &&
                                   (!row.technicien || row.technicien === "-") &&
-                                  normalizeTeamName(row.equipe || "") === normalizeTeamName(activeChefEquipeTeam || "");
+                                  isVehicleMatchingTeam(row.equipe || "", activeChefEquipeTeam);
 
                                 // Sous-blocs réutilisables de cellules
-                                const renderCellEtat = () => (
-                                  <td>
-                                    <div className="flex items-center gap-1.5">
-                                      {role === "chef_equipe" && permissions.canEditAvancement ? (
-                                        <button
-                                          type="button"
-                                          aria-label={`Affecter un technicien au véhicule ${row.no} et passer En cours`}
-                                          disabled={isSaving}
-                                          onClick={() => {
-                                            if (isTransferPending) {
-                                              handleAcceptTransfer(row);
-                                            } else {
+                                const renderCellEtat = () => {
+                                  const devis =
+                                    demandesDevisMap[String(row.id)] ||
+                                    (row.no && demandesDevisMap[row.no.trim()]) ||
+                                    (row.chassis && demandesDevisMap[row.chassis.trim()]);
+
+                                  const rowStatutDevis = String((row as any).statutDevis || "").trim().toLowerCase();
+                                  const rowAvancement = String(row.avancement || "").trim().toLowerCase();
+
+                                  const isAccordAccepte =
+                                    rowAvancement === "accepter accord" ||
+                                    rowAvancement === "accord accepté" ||
+                                    rowAvancement === "accord accepte" ||
+                                    rowStatutDevis === "accepté" ||
+                                    rowStatutDevis === "accepte" ||
+                                    rowStatutDevis === "accord accepté" ||
+                                    rowStatutDevis === "accord accepte" ||
+                                    (devis?.statutDevis === "Accepté" && row.etatIntervention !== "En cours" && !row.avancement?.startsWith("En cours"));
+
+                                  const isAttenteAccord =
+                                    !isAccordAccepte && (
+                                      row.avancement === "Attente accord" ||
+                                      row.avancement === "Lancement attente accord" ||
+                                      row.avancement === "Lancement devis" ||
+                                      (row.avancement && row.avancement.toLowerCase().includes("accord")) ||
+                                      isAttenteDevis(row, demandesDevisMap)
+                                    );
+
+                                  if (isAttenteAccord) {
+                                    return (
+                                      <td>
+                                        <div className="flex flex-col gap-1.5 py-0.5">
+                                          <div className="flex items-center gap-1.5 flex-wrap">
+                                            <div
+                                              className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-[11px] font-extrabold bg-amber-100 text-amber-950 border border-amber-300 shadow-2xs whitespace-nowrap"
+                                              title={`En attente d'accord devis client${devis?.numeroDevis ? ` (N° DV: ${devis.numeroDevis})` : ""}. Traitement géré par la réception : modification verrouillée jusqu'à acceptation ou refus.`}
+                                            >
+                                              <FileSignature size={12} className="text-amber-800 shrink-0" />
+                                              <span>Attente accord{devis?.numeroDevis ? ` (DV: ${devis.numeroDevis})` : ""}</span>
+                                            </div>
+                                          </div>
+
+                                          {row.dateMiseEnAttente && (
+                                            <div
+                                              className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-semibold bg-amber-50 text-amber-800 border border-amber-200 w-fit"
+                                              title={`Mis en attente le ${row.dateMiseEnAttente}`}
+                                            >
+                                              <Clock size={10} className="text-amber-600 shrink-0" />
+                                              <span>En attente : {row.dateMiseEnAttente}</span>
+                                            </div>
+                                          )}
+                                        </div>
+                                      </td>
+                                    );
+                                  }
+
+                                  if (isAccordAccepte) {
+                                    return (
+                                      <td>
+                                        <div className="flex flex-col gap-1.5 py-0.5">
+                                          <div className="flex items-center gap-1.5">
+                                            <button
+                                              type="button"
+                                              aria-label={`Accord client accepté : affecter un technicien au véhicule ${row.no} et passer En cours`}
+                                              disabled={isSaving}
+                                              onClick={() => {
+                                                setPendingEnCoursVehicle(row);
+                                                setIsOnlyTechChange(false);
+                                                setIsTechModalOpen(true);
+                                              }}
+                                              onFocus={() => {
+                                                setSelectedVehicleId(row.id);
+                                                setSelectedZone(row.emplacement);
+                                              }}
+                                              className="inline-flex items-center justify-center gap-1.5 px-3.5 py-1.5 text-[11px] font-bold text-white bg-emerald-600 hover:bg-emerald-700 active:scale-95 rounded-full shadow-md transition-all cursor-pointer whitespace-nowrap shrink-0 disabled:opacity-50"
+                                              title="Accord accepté ! Cliquer pour Affecter un Technicien & Passer En cours"
+                                            >
+                                              <CheckCircle2 size={13} className="text-white shrink-0" />
+                                              <span>Accepter accord</span>
+                                            </button>
+                                          </div>
+                                          {row.dateAcceptation && (
+                                            <div
+                                              className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-semibold bg-emerald-50 text-emerald-800 border border-emerald-200 mt-1 w-fit"
+                                              title={`Accepté le ${row.dateAcceptation}`}
+                                            >
+                                              <CheckCircle2 size={10} className="text-emerald-600 shrink-0" />
+                                              <span>Accord validé : {row.dateAcceptation}</span>
+                                            </div>
+                                          )}
+                                        </div>
+                                      </td>
+                                    );
+                                  }
+
+                                  return (
+                                    <td>
+                                      <div className="flex items-center gap-1.5">
+                                        {role === "chef_equipe" && permissions.canEditAvancement ? (
+                                          <button
+                                            type="button"
+                                            aria-label={`Affecter un technicien au véhicule ${row.no} et passer En cours`}
+                                            disabled={isSaving}
+                                            onClick={() => {
+                                              if (isTransferPending) {
+                                                handleAcceptTransfer(row);
+                                              } else {
+                                                setPendingEnCoursVehicle(row);
+                                                setIsOnlyTechChange(false);
+                                                setIsTechModalOpen(true);
+                                              }
+                                            }}
+                                            onFocus={() => {
+                                              setSelectedVehicleId(row.id);
+                                              setSelectedZone(row.emplacement);
+                                            }}
+                                            className={`inline-flex items-center justify-center gap-1.5 px-3 py-1 text-[11px] font-bold text-white ${
+                                              isTransferPending
+                                                ? "bg-emerald-600 hover:bg-emerald-700"
+                                                : "bg-blue-600 hover:bg-blue-700"
+                                            } active:scale-95 rounded-full shadow-2xs transition-all cursor-pointer whitespace-nowrap shrink-0 disabled:opacity-50`}
+                                            title={isTransferPending ? "Accepter ce travail transféré et passer En cours" : "Affecter un Technicien & Passer En cours"}
+                                          >
+                                            <Play size={10} className="fill-white" />
+                                            <span>En cours</span>
+                                          </button>
+                                        ) : (
+                                        <select
+                                          aria-label={`Modifier Etat ${row.no}`}
+                                          className="state-editor"
+                                          disabled={isSaving || (!permissions.canEditEtat && !(role === "reception" && (row.etatIntervention === "Attente Client" || row.statut === "Attente Client")))}
+                                          title={!permissions.canEditEtat ? "Modification de l'état réservée au Chef Atelier ou Chef d'équipe" : undefined}
+                                          onChange={(event) => {
+                                            const nextEtat = event.target.value as WorkshopStatus;
+                                            if (nextEtat === "En cours") {
                                               setPendingEnCoursVehicle(row);
                                               setIsOnlyTechChange(false);
                                               setIsTechModalOpen(true);
+                                            } else {
+                                              void saveVehicleEtat(row, nextEtat);
                                             }
                                           }}
                                           onFocus={() => {
                                             setSelectedVehicleId(row.id);
                                             setSelectedZone(row.emplacement);
                                           }}
-                                          className={`inline-flex items-center justify-center gap-1.5 px-3 py-1 text-[11px] font-bold text-white ${
-                                            isTransferPending
-                                              ? "bg-emerald-600 hover:bg-emerald-700"
-                                              : "bg-blue-600 hover:bg-blue-700"
-                                          } active:scale-95 rounded-full shadow-2xs transition-all cursor-pointer whitespace-nowrap shrink-0 disabled:opacity-50`}
-                                          title={isTransferPending ? "Accepter ce travail transféré et passer En cours" : "Affecter un Technicien & Passer En cours"}
+                                          style={badgeStyle(row.etatIntervention)}
+                                          value={row.etatIntervention}
                                         >
-                                          <Play size={10} className="fill-white" />
-                                          <span>En cours</span>
-                                        </button>
-                                      ) : (
-                                      <select
-                                        aria-label={`Modifier Etat ${row.no}`}
-                                        className="state-editor"
-                                        disabled={isSaving || (!permissions.canEditEtat && !(role === "reception" && (row.etatIntervention === "Attente Client" || row.statut === "Attente Client")))}
-                                        title={!permissions.canEditEtat ? "Modification de l'état réservée au Chef Atelier ou Chef d'équipe" : undefined}
-                                        onChange={(event) => {
-                                          const nextEtat = event.target.value as WorkshopStatus;
-                                          if (nextEtat === "En cours") {
-                                            setPendingEnCoursVehicle(row);
-                                            setIsOnlyTechChange(false);
-                                            setIsTechModalOpen(true);
-                                          } else {
-                                            void saveVehicleEtat(row, nextEtat);
-                                          }
-                                        }}
-                                        onFocus={() => {
-                                          setSelectedVehicleId(row.id);
-                                          setSelectedZone(row.emplacement);
-                                        }}
-                                        style={badgeStyle(row.etatIntervention)}
-                                        value={row.etatIntervention}
-                                      >
-                                        {!hasEditableStatus && (
-                                          <option hidden value={row.etatIntervention}>
-                                            {formatStatusLabel(row.etatIntervention)}
-                                          </option>
-                                        )}
-
-                                        {role === "reception" && (row.etatIntervention === "Attente Client" || row.statut === "Attente Client") && !permissions.canEditEtat ? (
-                                          <>
-                                            <option value="Attente Client">Attente Client</option>
-                                            <option value="Livré">Livré</option>
-                                          </>
-                                        ) : (
-                                          editableStatusOptions.map((status) => (
-                                            <option key={status} value={status}>
-                                              {status}
+                                          {!hasEditableStatus && (
+                                            <option hidden value={row.etatIntervention}>
+                                              {formatStatusLabel(row.etatIntervention)}
                                             </option>
-                                          ))
-                                        )}
-                                      </select>
-                                      )}
+                                          )}
 
-                                      {permissions.canEditAvancement && (
-                                        <select
-                                          aria-label={`Transférer le véhicule ${row.no} vers une autre équipe`}
-                                          value=""
-                                          disabled={isSaving}
-                                          onChange={(event) => {
-                                            const transferCode = event.target.value;
-                                            if (transferCode) void saveVehicleAvancement(row, transferCode);
-                                          }}
-                                          className="max-w-[145px] px-2 py-1 rounded-lg border border-fuchsia-300 bg-fuchsia-50 text-[10px] font-bold text-fuchsia-900 cursor-pointer focus:outline-none focus:ring-2 focus:ring-fuchsia-400/30"
-                                          title="Transférer ce véhicule vers une autre équipe : il restera en Attente Réparation jusqu'à acceptation"
-                                        >
-                                          <option value="">↪ Envoyer équipe…</option>
-                                          {directTransferOptions.map((option) => (
-                                            <option key={option.code} value={option.code}>Vers {option.team}</option>
-                                          ))}
+                                          {role === "reception" && (row.etatIntervention === "Attente Client" || row.statut === "Attente Client") && !permissions.canEditEtat ? (
+                                            <>
+                                              <option value="Attente Client">Attente Client</option>
+                                              <option value="Livré">Livré</option>
+                                            </>
+                                          ) : (
+                                            editableStatusOptions.map((status) => (
+                                              <option key={status} value={status}>
+                                                {status}
+                                              </option>
+                                            ))
+                                          )}
                                         </select>
+                                        )}
+
+                                        {permissions.canEditAvancement && (
+                                          <select
+                                            aria-label={`Transférer le véhicule ${row.no} vers une autre équipe`}
+                                            value=""
+                                            disabled={isSaving}
+                                            onChange={(event) => {
+                                              const transferCode = event.target.value;
+                                              if (transferCode) void saveVehicleAvancement(row, transferCode);
+                                            }}
+                                            className="max-w-[145px] px-2 py-1 rounded-lg border border-fuchsia-300 bg-fuchsia-50 text-[10px] font-bold text-fuchsia-900 cursor-pointer focus:outline-none focus:ring-2 focus:ring-fuchsia-400/30"
+                                            title="Transférer ce véhicule vers une autre équipe : il restera en Attente Réparation jusqu'à acceptation"
+                                          >
+                                            <option value="">↪ Envoyer équipe…</option>
+                                            {directTransferOptions.map((option) => (
+                                              <option key={option.code} value={option.code}>Vers {option.team}</option>
+                                            ))}
+                                          </select>
+                                        )}
+                                      </div>
+                                      {row.dateAcceptation && (
+                                        <div
+                                          className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-semibold bg-emerald-50 text-emerald-800 border border-emerald-200 mt-1 w-fit"
+                                          title={`Accepté le ${row.dateAcceptation}${row.acceptePar ? ` par ${row.acceptePar}` : ""}`}
+                                        >
+                                          <CheckCircle2 size={10} className="text-emerald-600 shrink-0" />
+                                          <span>Accepté : {row.dateAcceptation}</span>
+                                        </div>
                                       )}
-                                    </div>
-                                    {row.dateAcceptation && (
-                                      <div
-                                        className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-semibold bg-emerald-50 text-emerald-800 border border-emerald-200 mt-1 w-fit"
-                                        title={`Accepté le ${row.dateAcceptation}${row.acceptePar ? ` par ${row.acceptePar}` : ""}`}
-                                      >
-                                        <CheckCircle2 size={10} className="text-emerald-600 shrink-0" />
-                                        <span>Accepté : {row.dateAcceptation}</span>
-                                      </div>
-                                    )}
-                                    {(row.dateDebutRep || row.dateDebutTravail) && (
-                                      <div
-                                        className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-semibold bg-blue-50 text-blue-800 border border-blue-200 mt-1 w-fit"
-                                        title={`Début des travaux : ${row.dateDebutRep || row.dateDebutTravail}`}
-                                      >
-                                        <Clock size={10} className="text-blue-600 shrink-0" />
-                                        <span>Début : {row.dateDebutRep || row.dateDebutTravail}</span>
-                                      </div>
-                                    )}
-                                    {row.dateMiseEnAttente && !row.dateAcceptation && (
-                                      <div
-                                        className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-semibold bg-amber-50 text-amber-800 border border-amber-200 mt-1 w-fit"
-                                        title={`Mis en attente le ${row.dateMiseEnAttente}${row.misEnAttentePar ? ` par ${row.misEnAttentePar}` : ""}`}
-                                      >
-                                        <Clock size={10} className="text-amber-600 shrink-0" />
-                                        <span>En attente : {row.dateMiseEnAttente}</span>
-                                      </div>
-                                    )}
-                                  </td>
-                                );
+                                      {(row.dateDebutRep || row.dateDebutTravail) && (
+                                        <div
+                                          className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-semibold bg-blue-50 text-blue-800 border border-blue-200 mt-1 w-fit"
+                                          title={`Début des travaux : ${row.dateDebutRep || row.dateDebutTravail}`}
+                                        >
+                                          <Clock size={10} className="text-blue-600 shrink-0" />
+                                          <span>Début : {row.dateDebutRep || row.dateDebutTravail}</span>
+                                        </div>
+                                      )}
+                                      {row.dateMiseEnAttente && !row.dateAcceptation && (
+                                        <div
+                                          className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-semibold bg-amber-50 text-amber-800 border border-amber-200 mt-1 w-fit"
+                                          title={`Mis en attente le ${row.dateMiseEnAttente}${row.misEnAttentePar ? ` par ${row.misEnAttentePar}` : ""}`}
+                                        >
+                                          <Clock size={10} className="text-amber-600 shrink-0" />
+                                          <span>En attente : {row.dateMiseEnAttente}</span>
+                                        </div>
+                                      )}
+                                    </td>
+                                  );
+                                };
 
                                 const renderCellTech = () => (
                                   <td
@@ -5988,9 +6394,36 @@ export default function Dashboard() {
                                   permissions.canEditAvancement;
 
                                 const renderCellAvancement = () => {
+                                  const devis =
+                                    demandesDevisMap[String(row.id)] ||
+                                    (row.no && demandesDevisMap[row.no.trim()]) ||
+                                    (row.chassis && demandesDevisMap[row.chassis.trim()]);
+
+                                  const rowStatutDevis = String((row as any).statutDevis || "").trim().toLowerCase();
+                                  const rowAvancement = String(row.avancement || "").trim().toLowerCase();
+
+                                  const isAccordAccepte =
+                                    rowAvancement === "accepter accord" ||
+                                    rowAvancement === "accord accepté" ||
+                                    rowAvancement === "accord accepte" ||
+                                    rowStatutDevis === "accepté" ||
+                                    rowStatutDevis === "accepte" ||
+                                    rowStatutDevis === "accord accepté" ||
+                                    rowStatutDevis === "accord accepte" ||
+                                    (devis?.statutDevis === "Accepté" && row.etatIntervention !== "En cours" && !row.avancement?.startsWith("En cours"));
+
+                                  const isAttenteAccord =
+                                    !isAccordAccepte && (
+                                      row.avancement === "Attente accord" ||
+                                      row.avancement === "Lancement attente accord" ||
+                                      row.avancement === "Lancement devis" ||
+                                      (row.avancement && row.avancement.toLowerCase().includes("accord")) ||
+                                      isAttenteDevis(row, demandesDevisMap)
+                                    );
                                   const techBusyCar = (row.technicien && row.technicien !== "-") || (row.nomTechnicien && row.nomTechnicien !== "-")
                                     ? getActiveVehicleForTech(row.technicien || "", row.nomTechnicien || "", vehicles, row.id, row.no, reaffectationsMap)
                                     : undefined;
+                                  const avancementDateHeure = row.dateHeureAvancement || row.dateAvancement || (row.dateModification && (row.avancement && row.avancement !== "-") ? row.dateModification : undefined);
 
                                   return (
                                     <td>
@@ -5999,11 +6432,11 @@ export default function Dashboard() {
                                           <select
                                             aria-label={`Modifier Avancement ${row.no}`}
                                             className="avancement-editor"
-                                            disabled={isSaving || !canModifyAvancement}
+                                            disabled={isSaving || !canModifyAvancement || isAttenteAccord}
                                             style={getAvancementStyle(row.avancement)}
                                             value={row.avancement && row.avancement !== "-" ? row.avancement : "-"}
                                             onChange={(e) => void saveVehicleAvancement(row, e.target.value)}
-                                            title="Avancement - Choisissez l'avancement"
+                                            title={isAttenteAccord ? "Devis en attente d'accord client : modification verrouillée jusqu'à acceptation ou refus" : "Avancement - Choisissez l'avancement"}
                                           >
                                             {(!row.avancement || row.avancement === "-") && (
                                               <option value="-">- Définir -</option>
@@ -6039,6 +6472,15 @@ export default function Dashboard() {
                                                   }`}
                                                 style={{ width: `${pct}%` }}
                                               />
+                                            </div>
+                                          )}
+                                          {avancementDateHeure && (
+                                            <div
+                                              className="mt-0.5 text-[9px] font-medium text-slate-600 bg-slate-100/90 px-1.5 py-0.5 rounded border border-slate-200/80 flex items-center gap-1 w-fit whitespace-nowrap"
+                                              title={`Avancement enregistré le : ${avancementDateHeure}`}
+                                            >
+                                              <Clock size={9} className="text-slate-500 shrink-0" />
+                                              <span>{avancementDateHeure}</span>
                                             </div>
                                           )}
                                           {isReaffActive && (
@@ -6134,6 +6576,15 @@ export default function Dashboard() {
                                                   }`}
                                                 style={{ width: `${pct}%` }}
                                               />
+                                            </div>
+                                          )}
+                                          {avancementDateHeure && (
+                                            <div
+                                              className="mt-0.5 text-[9px] font-medium text-slate-600 bg-slate-100/90 px-1.5 py-0.5 rounded border border-slate-200/80 flex items-center gap-1 w-fit whitespace-nowrap"
+                                              title={`Avancement enregistré le : ${avancementDateHeure}`}
+                                            >
+                                              <Clock size={9} className="text-slate-500 shrink-0" />
+                                              <span>{avancementDateHeure}</span>
                                             </div>
                                           )}
                                           {isReaffActive && (
@@ -6347,7 +6798,7 @@ export default function Dashboard() {
                                         <td>
                                           <div className="flex items-center gap-1.5 flex-wrap">
                                             <span>{displayText(row.l2n2500 || row.no)}</span>
-                                            {(Boolean(row.bloc && row.bloc > 1) || Boolean(row.equipe1 && row.equipe1 !== "-" && normalizeTeamName(row.equipe1) !== normalizeTeamName(activeChefEquipeTeam || ""))) && (
+                                            {(Boolean(row.bloc && row.bloc > 1) || Boolean(row.equipe1 && row.equipe1 !== "-" && !isVehicleMatchingTeam(row.equipe1, activeChefEquipeTeam))) && (
                                               <span
                                                 className="inline-flex items-center gap-0.5 px-1.5 py-0.5 rounded text-[10px] font-bold bg-amber-100 text-amber-900 border border-amber-300"
                                                 title={`Travail transféré depuis : ${getOriginTeam(row)}`}
@@ -6899,9 +7350,9 @@ export default function Dashboard() {
           {activeDevisAccordNotificationsForUser.slice(0, 2).map((item) => {
             const matchingVehicle = vehicles.find(
               (v) =>
-                v.id === item.vehicleId ||
+                (item.vehicleId && v.id === item.vehicleId) ||
                 (item.or && (v.no === item.or || v.ordre === item.or)) ||
-                (item.chassis && v.chassis === item.chassis)
+                (!item.or && !item.vehicleId && item.chassis && v.chassis === item.chassis)
             );
             return (
               <div
@@ -7125,16 +7576,17 @@ export default function Dashboard() {
         allVehicles={vehicles}
         reaffectationsMap={reaffectationsMap}
         assignedTeam={
-          role === "chef_equipe"
-            ? (activeChefEquipeTeam || "Daily1")
-            : (pendingEnCoursVehicle?.equipe && pendingEnCoursVehicle.equipe !== "-"
-              ? pendingEnCoursVehicle.equipe
-              : (activeChefEquipeTeam || "Daily1"))
+          pendingEnCoursVehicle?.equipe && !pendingEnCoursVehicle.equipe.includes(",") && pendingEnCoursVehicle.equipe !== "-"
+            ? pendingEnCoursVehicle.equipe
+            : chefSubTeamFilter !== "all"
+              ? chefSubTeamFilter
+              : (chefAssignedTeams[0] || "Daily1")
         }
+        allowedTeams={chefAssignedTeams.length > 1 ? chefAssignedTeams : undefined}
         equipeMembers={resolvedEquipeMembers}
         isOnlyTechnicienChange={isOnlyTechChange}
         isTransferAcceptance={isTransferAcceptanceModal}
-        canChangeTeam={role !== "chef_equipe"}
+        canChangeTeam={role !== "chef_equipe" || chefAssignedTeams.length > 1}
         onClose={() => {
           setIsTechModalOpen(false);
           setIsTransferAcceptanceModal(false);

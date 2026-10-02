@@ -48,6 +48,7 @@ import ModifierEntreeModal from "./ModifierEntreeModal";
 import ConfirmationSuppressionModal from "./ConfirmationSuppressionModal";
 import DetailVehiculeModal from "./DetailVehiculeModal";
 import { recordVehicleModification } from "../services/timeTracking";
+import { isCompletedWarrantyVehicle } from "../services/warranty";
 
 export interface SuiviEntreesTableProps {
   onNavigateToMap?: (emplacement: string) => void;
@@ -62,6 +63,8 @@ export interface UnifiedReceptionRow {
   orderIndex: number;
   noOr: string;
   cs: string;
+  isGarantie?: boolean;
+  typeDossier?: string;
   chassis: string;
   immatriculation?: string;
   nomClient: string;
@@ -555,9 +558,10 @@ export default function SuiviEntreesTable({ onNavigateToMap, initialNotice }: Su
               ? f.emplacement
               : (s as any).emplacement || "NA");
 
+        const rawEtat = f?.etatIntervention || f?.statut || s.etat;
         const etat = isLivre
           ? "Livré"
-          : (f?.etatIntervention || f?.statut || s.etat || "En attente");
+          : (rawEtat && rawEtat !== "En attente" ? rawEtat : "Attente Réparation");
 
         const immatriculation =
           s.immatriculation || f?.immatriculation || f?.serie || "-";
@@ -571,6 +575,8 @@ export default function SuiviEntreesTable({ onNavigateToMap, initialNotice }: Su
           orderIndex: idx,
           noOr: s.noOr || f?.ordre || f?.no || "-",
           cs: s.cs || f?.cs || "-",
+          isGarantie: f?.isGarantie || Boolean((s as any).isGarantie),
+          typeDossier: (f as any)?.typeDossier || (s as any).typeDossier,
           chassis: s.chassis || f?.chassis || "-",
           immatriculation,
           nomClient: s.nomClient || f?.client || "Client non spécifié",
@@ -633,6 +639,8 @@ export default function SuiviEntreesTable({ onNavigateToMap, initialNotice }: Su
           orderIndex: 1000 + idx,
           noOr: f.ordre || f.no || "-",
           cs: f.cs || "-",
+          isGarantie: f.isGarantie,
+          typeDossier: (f as any).typeDossier,
           chassis: f.chassis || "-",
           immatriculation: f.immatriculation || f.serie || "-",
           nomClient: f.client || "Client non spécifié",
@@ -670,7 +678,16 @@ export default function SuiviEntreesTable({ onNavigateToMap, initialNotice }: Su
         });
       });
 
-      setItems(merged);
+      // Les OR de garantie dont les travaux sont terminés poursuivent leur
+      // traitement uniquement dans le Tableau de Suivi Garantie.
+      setItems(merged.filter((item) => !isCompletedWarrantyVehicle({
+        cs: item.cs,
+        isGarantie: item.isGarantie,
+        typeDossier: item.typeDossier,
+        avancement: item.avancement,
+        etatIntervention: item.etat as any,
+        statut: item.etat as any,
+      })));
 
       const now = new Date();
       setLastRefreshed(
@@ -1894,7 +1911,7 @@ export default function SuiviEntreesTable({ onNavigateToMap, initialNotice }: Su
                                 item.etat
                               )}`}
                             >
-                              {item.etat || "En attente"}
+                              {item.etat && item.etat !== "En attente" ? item.etat : "Attente Réparation"}
                             </span>
                             <Lock className="w-3 h-3 text-slate-300" />
                           </div>

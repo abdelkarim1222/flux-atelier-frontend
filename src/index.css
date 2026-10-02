@@ -927,10 +927,22 @@ button {
 }
 
 .table-controls {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) 132px 148px;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
   gap: 8px;
   margin: 10px 12px 8px;
+}
+
+.table-controls .search-shell {
+  flex: 1 1 240px;
+  min-width: 200px;
+  margin: 0;
+}
+
+.table-controls .date-filter {
+  flex: 0 0 auto;
+  min-width: 120px;
 }
 
 .search-shell {
@@ -1423,7 +1435,8 @@ button {
   }
 
   .table-controls {
-    grid-template-columns: 1fr;
+    flex-direction: column;
+    align-items: stretch;
   }
 
   .metric-grid {

@@ -1,5 +1,5 @@
 import { useState, useRef, useEffect } from "react";
-import { ChevronDown, Check, Shield, ClipboardList, Users, ShieldCheck } from "lucide-react";
+import { ChevronDown, Check, Shield, ClipboardList, Users, ShieldCheck, Receipt, Award } from "lucide-react";
 import { useRole, ROLES_META, type RoleType } from "../context/RoleContext";
 
 export default function RoleSwitcher() {
@@ -30,6 +30,10 @@ export default function RoleSwitcher() {
         return <ClipboardList className="w-4 h-4 text-emerald-600" />;
       case "chef_equipe":
         return <Users className="w-4 h-4 text-blue-600" />;
+      case "facturation":
+        return <Receipt className="w-4 h-4 text-amber-600" />;
+      case "garantie":
+        return <Award className="w-4 h-4 text-teal-600" />;
     }
   };
 

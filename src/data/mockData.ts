@@ -80,6 +80,13 @@ export interface Flux {
   numeroEdition?: string;
   dateFacturationFinale?: string;
   facturePar?: string;
+  dateAvancement?: string;
+  heureAvancement?: string;
+  dateHeureAvancement?: string;
+  statutGarantie?: string;
+  dateValidationGarantie?: string;
+  numeroAccordGarantie?: string;
+  isGarantie?: boolean;
 }
 
 export const statusMeta: Array<{

@@ -380,13 +380,17 @@ export function saveVehicleTimeLog(log: VehicleTimeLog): void {
     };
     localStorage.setItem(STORAGE_KEY_TIME_LOGS, JSON.stringify(all));
     const role = typeof window !== 'undefined' ? localStorage.getItem('flux_atelier_active_role') : '';
-    const canSaveTimes = !role || ['administration', 'chef_atelier', 'chef_equipe'].includes(role);
+    const canSaveTimes = !role || ['administration', 'chef_atelier', 'chef_equipe', 'garantie'].includes(role);
     if (typeof window !== 'undefined' && canSaveTimes) {
       void fetch('/api/data/vehicle_times', {
         method: 'POST',
         credentials: 'same-origin',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ ...all[key], recordKey: key }),
+      }).then((response) => {
+        if (!response.ok) {
+          console.warn(`Enregistrement des temps dans PostgreSQL refusé (${response.status}).`);
+        }
       }).catch((error) => console.warn('Enregistrement des temps dans PostgreSQL impossible:', error));
     }
     window.dispatchEvent(new Event("vehicle_time_tracking_updated"));
@@ -438,6 +442,8 @@ export function recordVehicleModification(
     type: "modification",
     label,
     dateDebut: formatDateDisplay(timestamp),
+    dateFin: formatDateDisplay(timestamp),
+    dureeMinutes: 0,
     commentaire,
     automatique: true,
   };
@@ -1227,12 +1233,27 @@ export function recordAvancementStatusChange(
   let stepType: TimeStepType = "travail";
   let stepLabel = `Modification Avancement : ${cleanAv}`;
 
-  if (cleanAv === "Lancement devis" || cleanAv === "ATENDE DEVIS" || cleanAv.toLowerCase().includes("devis")) {
+  const isAccordAccepte =
+    cleanAv === "Accepter accord" ||
+    cleanAv === "Accord accepté" ||
+    cleanAv.toLowerCase() === "accepter accord";
+
+  if (isAccordAccepte) {
+    stepType = "attente_reparation";
+    stepLabel = `Accord devis accepté (${nowFormatted})`;
+  } else if (
+    cleanAv === "Lancement devis" ||
+    cleanAv === "Attente accord" ||
+    cleanAv === "Lancement attente accord" ||
+    cleanAv === "ATENDE DEVIS" ||
+    cleanAv.toLowerCase().includes("devis") ||
+    cleanAv.toLowerCase().includes("accord")
+  ) {
     stepType = "attente_devis";
-    stepLabel = `Attente accord devis (${nowFormatted})`;
+    stepLabel = `Attente accord devis : ${cleanAv} (${nowFormatted})`;
   } else if (cleanAv === "Attente PDR" || cleanAv === "attends acheter" || cleanAv.toLowerCase().includes("pdr")) {
     stepType = "attente_pieces";
-    stepLabel = `Attente pièces / achat (${nowFormatted})`;
+    stepLabel = `Attente pièces / achat : ${cleanAv} (${nowFormatted})`;
   } else if (cleanAv === "Technicien réaffecté") {
     stepType = "reaffectation";
     stepLabel = `Technicien réaffecté (${nowFormatted})`;
@@ -1243,21 +1264,29 @@ export function recordAvancementStatusChange(
     stepType = "fin";
     stepLabel = `Travaux terminés (${nowFormatted})`;
     existingLog.dateFinReparation = nowFormatted;
+  } else if (cleanAv.startsWith("En cours") || cleanAv.includes("%")) {
+    stepType = "travail";
+    stepLabel = `Travaux atelier : ${cleanAv} (${nowFormatted})`;
+    if (!existingLog.datePriseEnChargeEquipe) {
+      existingLog.datePriseEnChargeEquipe = nowFormatted;
+    }
   } else if (cleanAv.startsWith("vr")) {
     stepType = "travail";
-    stepLabel = `Transfert ${cleanAv} (${nowFormatted})`;
+    stepLabel = `Transfert d'équipe : ${cleanAv} (${nowFormatted})`;
   }
 
-  // Fermer la dernière étape ouverte si elle était en cours
-  if (steps.length > 0) {
-    const lastStep = steps[steps.length - 1];
-    if (!lastStep.dateFin || lastStep.dateFin === "En cours") {
-      lastStep.dateFin = nowFormatted;
-      const tsD = parseDateTimestamp(lastStep.dateDebut);
-      const tsF = parseDateTimestamp(nowFormatted);
-      if (tsD > 0 && tsF >= tsD) {
-        lastStep.dureeMinutes = getWorkshopWorkingMinutesBetween(tsD, tsF, vehicleWorksSaturday(vehicle as Partial<Flux> & Record<string, unknown>));
-      }
+  // Fermer la dernière étape métier ouverte. Les traces de modification sont
+  // instantanées : elles ne doivent jamais interrompre un temps de travail ou
+  // d'attente encore actif.
+  const lastOpenStep = [...steps].reverse().find((step) =>
+    step.type !== "modification" && (!step.dateFin || step.dateFin === "En cours")
+  );
+  if (lastOpenStep) {
+    lastOpenStep.dateFin = nowFormatted;
+    const tsD = parseDateTimestamp(lastOpenStep.dateDebut);
+    const tsF = parseDateTimestamp(nowFormatted);
+    if (tsD > 0 && tsF >= tsD) {
+      lastOpenStep.dureeMinutes = getWorkshopWorkingMinutesBetween(tsD, tsF, vehicleWorksSaturday(vehicle as Partial<Flux> & Record<string, unknown>));
     }
   }
 

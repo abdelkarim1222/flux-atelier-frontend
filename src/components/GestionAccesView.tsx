@@ -82,6 +82,12 @@ const VIEW_PERMISSIONS: { key: keyof RolePermissions; label: string; desc: strin
     desc: "Carte interactive des emplacements et stationnements",
     icon: MapPin,
   },
+  {
+    key: "canViewGarantie",
+    label: "Tableau Suivi Garantie (R10)",
+    desc: "Suivi des dossiers sous garantie après réalisation des travaux atelier",
+    icon: ShieldCheck,
+  },
 ];
 
 const ACTION_PERMISSIONS: { key: keyof RolePermissions; label: string; desc: string; icon: any }[] = [
@@ -928,24 +934,45 @@ export default function GestionAccesView() {
                       Validation paiement, facturation & sortie
                     </p>
                   </button>
+
+                  <button
+                    type="button"
+                    onClick={() => {
+                      handleRoleChange("garantie");
+                      setFormTeam("R10");
+                    }}
+                    className={`p-2.5 rounded-xl border text-left transition-all cursor-pointer ${
+                      formRole === "garantie"
+                        ? "bg-teal-50 border-teal-500 ring-2 ring-teal-500/20"
+                        : "bg-slate-50 border-slate-200 hover:bg-slate-100"
+                    }`}
+                  >
+                    <div className="flex items-center gap-1.5 mb-0.5">
+                      <ShieldCheck className="w-4 h-4 text-teal-600" />
+                      <span className="text-xs font-bold text-slate-900">Garantie</span>
+                    </div>
+                    <p className="text-[10px] text-slate-500 leading-tight">
+                      Dossiers garantie (R10) & Tableau Garantie
+                    </p>
+                  </button>
                 </div>
               </div>
 
-              {/* Équipe atelier ou centre Réception attribué */}
-              {(formRole === "chef_equipe" || formRole === "chef_atelier" || formRole === "facturation" || formRole === "reception") && (
+              {/* Équipe atelier ou centre Réception/Garantie attribué */}
+              {(formRole === "chef_equipe" || formRole === "chef_atelier" || formRole === "facturation" || formRole === "reception" || formRole === "garantie") && (
                 <div className="p-3 bg-blue-50/80 rounded-2xl border border-blue-200/80 space-y-3 animate-in fade-in duration-150">
                   <div className="flex items-center justify-between">
                     <label className="text-xs font-bold text-blue-950 flex items-center gap-1.5">
                       <Wrench className="w-3.5 h-3.5 text-blue-600" />
-                      <span>{formRole === "reception" ? "Centre de réception attribué *" : "Équipe d'Atelier Principale *"}</span>
+                      <span>{formRole === "reception" || formRole === "garantie" ? "Centre de service attribué *" : "Équipe d'Atelier Principale *"}</span>
                     </label>
                     <span className="text-[10px] font-extrabold px-2 py-0.5 rounded-full bg-blue-200/70 text-blue-800">
-                      {formRole === "reception" ? "Accès réception" : "Équipe principale"}
+                      {formRole === "garantie" ? "Centre Garantie" : formRole === "reception" ? "Accès réception" : "Équipe principale"}
                     </span>
                   </div>
 
                   <div className="grid grid-cols-2 sm:grid-cols-4 gap-1.5">
-                    {(formRole === "reception" ? ["R18", "R16"] : CANONICAL_TEAMS).map((teamName) => {
+                    {(formRole === "reception" || formRole === "garantie" ? ["R10", "R18", "R16"] : CANONICAL_TEAMS).map((teamName) => {
                       const isSelected = formTeam === teamName;
                       return (
                         <button
@@ -965,12 +992,12 @@ export default function GestionAccesView() {
                         </button>
                       );
                     })}
-                    {formRole === "reception" && (
+                    {(formRole === "reception" || formRole === "garantie") && (
                       <button
                         type="button"
                         onClick={() => setFormTeam("")}
                         className={`px-2 py-1.5 rounded-xl text-xs font-bold transition-all text-center border cursor-pointer ${
-                          formTeam !== "R18" && formTeam !== "R16"
+                          formTeam !== "R10" && formTeam !== "R18" && formTeam !== "R16"
                             ? "bg-indigo-600 text-white border-indigo-600 shadow-xs"
                             : "bg-white text-slate-700 hover:bg-indigo-100/50 border-indigo-200/60"
                         }`}
@@ -996,7 +1023,7 @@ export default function GestionAccesView() {
                     )}
                   </div>
 
-                  {formRole === "reception" && formTeam !== "R18" && formTeam !== "R16" && (
+                  {(formRole === "reception" || formRole === "garantie") && formTeam !== "R10" && formTeam !== "R18" && formTeam !== "R16" && (
                     <input
                       type="text"
                       autoFocus

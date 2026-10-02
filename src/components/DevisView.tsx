@@ -28,6 +28,7 @@ import {
   saveDevisAccordNotification,
   updateDatabaseStatutDevis,
   getAvancementOptionsForTeam,
+  getNowFormatted,
   type DemandeDevis,
 } from "../services/database";
 
@@ -48,6 +49,7 @@ interface DevisViewProps {
   isChefEquipe?: boolean;
   role?: string;
   currentUser?: { name?: string; role?: string } | null;
+  userCs?: string;
   onRefresh?: () => void;
   isRefreshing?: boolean;
   onNavigateToTab?: (tab: string, filter?: string, vehicleId?: number) => void;
@@ -62,7 +64,15 @@ function getAvancementBadgeStyle(val?: string): CSSProperties {
     };
   }
   const lower = val.toLowerCase();
-  if (lower.includes("devis")) {
+  if (lower.includes("accepter") || lower.includes("accepté") || lower === "accepter accord") {
+    return {
+      backgroundColor: "#ecfdf5",
+      color: "#047857",
+      borderColor: "#6ee7b7",
+      fontWeight: 700,
+    };
+  }
+  if (lower.includes("devis") || lower.includes("accord")) {
     return {
       backgroundColor: "#fff7ed",
       color: "#c2410c",
@@ -144,6 +154,7 @@ export default function DevisView({
   canEdit = true,
   role = "reception",
   currentUser,
+  userCs,
   onRefresh,
   isRefreshing = false,
   onNavigateToTab,
@@ -182,6 +193,7 @@ export default function DevisView({
 
   // Filtre les véhicules au statut « Lancement devis » ou ayant une fiche devis.
   const devisVehicles = useMemo(() => {
+    const targetCs = (userCs || "").trim().toUpperCase();
     return vehicles.filter((v) => {
       const av = (v.avancement || "").trim().toLowerCase();
       const etat = (v.etatIntervention || "").trim().toLowerCase();
@@ -195,6 +207,15 @@ export default function DevisView({
         (v.no && demandesDevisMap[v.no.trim()]) ||
         (v.chassis && demandesDevisMap[v.chassis.trim()]);
 
+      // Si l'utilisateur est de la réception ou garantie avec un CS assigné (ex: R18 ou R10),
+      // il ne voit que les devis de son centre de service.
+      if ((role === "reception" || role === "garantie") && targetCs) {
+        const vehicleCs = String(v.cs || devis?.cs || "").trim().toUpperCase();
+        if (vehicleCs && vehicleCs !== targetCs) {
+          return false;
+        }
+      }
+
       // Dès qu'une décision est prise, la Réception n'a plus à garder le
       // dossier dans sa liste de travail. L'administration conserve la trace.
       if (role === "reception" && (devis?.statutDevis === "Accepté" || devis?.statutDevis === "Refusé")) {
@@ -204,11 +225,15 @@ export default function DevisView({
         hasDevis ||
         av === "atende devis" ||
         av === "attente devis" ||
+        av === "lancement devis" ||
+        av === "attente accord" ||
+        av === "lancement attente accord" ||
         av.includes("devis") ||
+        av.includes("accord") ||
         etat.includes("devis")
       );
     });
-  }, [vehicles, demandesDevisMap, role]);
+  }, [vehicles, demandesDevisMap, role, userCs]);
 
   // Comptes statistiques
   const aAppelerCount = useMemo(() => {
@@ -412,11 +437,6 @@ export default function DevisView({
       (row.no && demandesDevisMap[row.no.trim()]) ||
       (row.chassis && demandesDevisMap[row.chassis.trim()]);
 
-    const updated = marquerDevisAccepte(key);
-    if (updated) {
-      void updateDatabaseStatutDevis(row, updated, "Accepté");
-    }
-
     // Récupérer l'équipe d'origine pour renvoyer le véhicule exactement à son équipe
     const targetEquipe = d?.equipeOrigine || d?.equipe || row.equipe || "Daily1";
 
@@ -442,6 +462,27 @@ export default function DevisView({
     const min = String(now.getMinutes()).padStart(2, "0");
     const dateAccord = `${dd}/${mm}/${yyyy} ${hh}:${min}`;
 
+    const numDevis = d?.numeroDevis || "-";
+    const updated = marquerDevisAccepte(key);
+    const devisData: DemandeDevis = updated || d || {
+      id: `dv-${row.id || row.no || row.chassis}`,
+      numeroDevis: numDevis,
+      date: dateAccord,
+      or: row.no || row.ordre || "-",
+      chassis: row.chassis || "-",
+      client: row.client || "Client",
+      marque: row.marque || "IVECO",
+      modele: row.modele || "-",
+      immatriculation: row.serie || row.immatriculation || "-",
+      equipe: targetEquipe,
+      equipeOrigine: targetEquipe,
+      statutDevis: "Accepté",
+      createdAtTimestamp: Date.now(),
+      technicien: targetTech,
+      nomTechnicien: targetNomTech,
+    };
+    void updateDatabaseStatutDevis(row, devisData, "Accepté");
+
     // Émettre la notification pour le chef d'équipe et le technicien de l'équipe concernée
     saveDevisAccordNotification({
       id: `devis-accord-${row.id || row.no || row.chassis}`,
@@ -461,18 +502,19 @@ export default function DevisView({
       nomTechnicien: targetNomTech,
     });
 
-    // Renvoyer au même technicien dans Tableaux de chargement avec l'état "Attente Réparation"
+    // Renvoyer au même technicien dans Tableaux de chargement avec l'avancement "Accepter accord"
     await onUpdateAvancement(
       row,
-      "Attente réparation",
+      "Accepter accord",
       undefined,
       {
         equipe: targetEquipe,
         etat: "Attente Réparation",
         technicien: targetTech,
         nomTechnicien: targetNomTech,
+        avancement: "Accepter accord",
       },
-      updated || d || undefined
+      devisData
     );
 
     const techDisplay = targetNomTech
@@ -480,9 +522,9 @@ export default function DevisView({
       : targetTech || "";
 
     setActionSuccessNotice({
-      message: `✅ Devis accepté par le client ! Le véhicule ${row.no || row.ordre} est retourné à l'équipe ${targetEquipe} dans "Tableaux de chargement (Attente Réparation)".`,
+      message: `✅ Devis accepté par le client ! Le véhicule ${row.no || row.ordre} est passé en avancement "Accepter accord" et retourné à l'équipe ${targetEquipe} dans "Tableaux de chargement (Attente Réparation)".`,
       vehicleId: row.id,
-      techInfo: techDisplay ? `Technicien réaffecté : ${techDisplay}` : undefined,
+      techInfo: techDisplay ? `Technicien : ${techDisplay}` : undefined,
     });
     setTimeout(() => setActionSuccessNotice(null), 8000);
   };
@@ -495,18 +537,37 @@ export default function DevisView({
       (row.no && demandesDevisMap[row.no.trim()]) ||
       (row.chassis && demandesDevisMap[row.chassis.trim()]);
 
+    const numDevis = d?.numeroDevis || "-";
     const updated = marquerDevisRefuse(key);
-    if (updated) {
-      void updateDatabaseStatutDevis(row, updated, "Refusé");
-    }
+    const devisData: DemandeDevis = updated || d || {
+      id: `dv-${row.id || row.no || row.chassis}`,
+      numeroDevis: numDevis,
+      date: getNowFormatted(),
+      or: row.no || row.ordre || "-",
+      chassis: row.chassis || "-",
+      client: row.client || "Client",
+      marque: row.marque || "IVECO",
+      modele: row.modele || "-",
+      immatriculation: row.serie || row.immatriculation || "-",
+      equipe: row.equipe || "Daily1",
+      equipeOrigine: row.equipe || "Daily1",
+      statutDevis: "Refusé",
+      createdAtTimestamp: Date.now(),
+    };
+    void updateDatabaseStatutDevis(row, devisData, "Refusé");
 
     // Passer automatiquement l'avancement à "Terminer" (Attente Client pour restitution)
     await onUpdateAvancement(
       row,
       "Terminer",
       undefined,
-      { etatIntervention: "Attente Client" },
-      updated || d || undefined
+      {
+        etatIntervention: "Attente Client",
+        avancement: "Terminer",
+        statut: "Attente Client",
+        etat: "Attente Client",
+      },
+      devisData
     );
 
     setActionSuccessNotice({
@@ -573,6 +634,11 @@ export default function DevisView({
                 <span className="px-2.5 py-0.5 rounded-full text-xs font-black bg-orange-500/30 text-orange-200 border border-orange-400/40">
                   {devisVehicles.length} dossiers
                 </span>
+                {userCs && (
+                  <span className="px-2.5 py-0.5 rounded-full text-xs font-black bg-blue-500/30 text-blue-200 border border-blue-400/40">
+                    Centre : {userCs}
+                  </span>
+                )}
               </div>
               <p className="text-[11px] leading-snug text-orange-200/80 mt-0.5 max-w-3xl">
                 Suivi des devis créés par les équipes d'atelier. La Réception appelle le client dès notification de création. Si le client ne répond pas sous 1 jour (24h), un rappel est déclenché. En cas d'acceptation, le véhicule retourne à son équipe ; en cas de refus, l'avancement passe automatiquement à <strong>Terminer</strong>.
@@ -981,7 +1047,7 @@ export default function DevisView({
                             <select
                               disabled={isSaving || !canEdit}
                               style={getAvancementBadgeStyle(row.avancement)}
-                              value={row.avancement || "Lancement devis"}
+                              value={row.avancement || "Attente accord"}
                               onChange={(e) => void onUpdateAvancement(row, e.target.value)}
                               className="px-2 py-1 text-xs rounded-lg border font-bold shadow-2xs outline-none cursor-pointer focus:ring-2 focus:ring-orange-500/20 disabled:opacity-60"
                               title="Avancement de l'intervention"

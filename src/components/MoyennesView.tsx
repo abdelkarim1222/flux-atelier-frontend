@@ -1,4 +1,5 @@
 import { useState, useEffect, useMemo } from "react";
+import { isWarrantyVehicle } from "../services/warranty";
 import {
   BarChart3,
   Calendar,
@@ -219,6 +220,9 @@ export default function MoyennesView({ vehicles: vehiclesProp }: MoyennesViewPro
     });
 
     vehicles.forEach((veh) => {
+      // Exclusion stricte des véhicules Garantie (Centre Service R10) du calcul des moyennes
+      if (isWarrantyVehicle(veh)) return;
+
       // Prioritize dateEntree (entry date from Suivi des Entrées). Strip time
       // component if present: "28/09/2026 08:30" → "28/09/2026"
       const rawDate = (veh.dateEntree || veh.date || "").trim().split(" ")[0];
@@ -231,11 +235,20 @@ export default function MoyennesView({ vehicles: vehiclesProp }: MoyennesViewPro
       if (y !== yr || m !== mo || d < 1 || d > daysInMonth) return;
 
       // ─── Tableau 1 : répartition par équipe ───────────────────────────────
-      const enteredTeamName = (veh.equipe || "Non affectée").trim() || "Non affectée";
+      const rawTeam = (veh.equipe || "").trim();
+      let enteredTeamName = rawTeam;
+      if (enteredTeamName.includes(",")) {
+        const parts = enteredTeamName.split(",").map((p) => p.trim());
+        const match = STANDARD_TEAMS.find((st) => parts.some((p) => p.toLowerCase() === st.toLowerCase()));
+        enteredTeamName = match || parts[0] || "Daily1";
+      }
+      if (!enteredTeamName || enteredTeamName === "-" || enteredTeamName.toLowerCase() === "non affectée") {
+        enteredTeamName = "Daily1";
+      }
       // Conserver un libellé cohérent pour les données saisies avec une casse différente.
       const teamName = STANDARD_TEAMS.find(
         (team) => team.toLowerCase() === enteredTeamName.toLowerCase()
-      ) || enteredTeamName;
+      ) || (enteredTeamName.toLowerCase().includes("daily") ? "Daily1" : enteredTeamName);
       ensureTeam(teamName);
       teamDays[teamName][d - 1] += 1;
 
@@ -289,7 +302,13 @@ export default function MoyennesView({ vehicles: vehiclesProp }: MoyennesViewPro
     // séparément : le tableau présente uniquement leur synthèse « Daily ».
     const equipesRows = [
       dailyRow,
-      ...baseEquipesRows.filter((row) => row.name !== "Daily1" && row.name !== "Daily2" && row.name !== "Daily"),
+      ...baseEquipesRows.filter(
+        (row) =>
+          row.name !== "Daily1" &&
+          row.name !== "Daily2" &&
+          row.name !== "Daily" &&
+          !row.name.includes(",")
+      ),
     ];
     const equipesTotalDays = Array.from({ length: daysInMonth }, (_, i) =>
       Object.values(teamDays).reduce((acc, days) => acc + days[i], 0)
@@ -404,6 +423,9 @@ export default function MoyennesView({ vehicles: vehiclesProp }: MoyennesViewPro
   // 1. Filtrer les véhicules pour le mois et l'année sélectionnés
   const periodVehicles = useMemo(() => {
     return vehicles.filter((veh) => {
+      // Exclusion stricte des véhicules Garantie (Centre Service R10) du calcul des moyennes
+      if (isWarrantyVehicle(veh)) return false;
+
       const dStr = veh.date || veh.dateEntree || veh.dateDebutRep || "";
       if (!dStr || dStr.includes("1899")) return false;
       const match = dStr.match(/^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{4})/);
