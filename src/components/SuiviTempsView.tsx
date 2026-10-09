@@ -23,14 +23,13 @@ import {
 } from "../services/database";
 import type { Flux } from "../data/mockData";
 import {
-  calculateVehicleTimes,
   formatMinutes,
   getWorkshopWorkingMillisecondsBetween,
   parseDateTimestamp,
   type VehicleTimeCalculation,
 } from "../services/timeTracking";
+import { buildChronoTimeCalculations } from "../services/chronoCalculations";
 import ChronoTimelineModal from "./ChronoTimelineModal";
-import { isCompletedWarrantyVehicle } from "../services/warranty";
 
 interface SuiviTempsViewProps {
   userTeam?: string;
@@ -121,81 +120,7 @@ export default function SuiviTempsView({ userTeam }: SuiviTempsViewProps = {}) {
 
   // Fusion et calcul unifié des temps par véhicule
   const timeCalculations = useMemo<VehicleTimeCalculation[]>(() => {
-    const mapByOr = new Map<string, any>();
-    const mapByChassis = new Map<string, any>();
-
-    // 1. Indexer les flux
-    vehicles.forEach((v) => {
-      const or = (v.ordre || v.no || "").trim().toUpperCase();
-      const ch = (v.chassis || "").trim().toUpperCase();
-      if (or) mapByOr.set(or, v);
-      if (ch) mapByChassis.set(ch, v);
-    });
-
-    const unifiedList: any[] = [];
-    const treatedKeys = new Set<string>();
-
-    // 2. Fusionner avec Suivi des entrées
-    suiviList.forEach((s) => {
-      const or = (s.noOr || "").trim().toUpperCase();
-      const ch = (s.chassis || "").trim().toUpperCase();
-      const f = mapByOr.get(or) || mapByChassis.get(ch);
-
-      if (or) treatedKeys.add(or);
-      if (ch) treatedKeys.add(ch);
-
-      unifiedList.push({
-        ...f,
-        ...s,
-        noOr: s.noOr || f?.ordre || f?.no || "-",
-        chassis: s.chassis || f?.chassis || "-",
-        immatriculation: s.immatriculation || f?.immatriculation || f?.serie || "-",
-        client: s.nomClient || f?.client || "Client non spécifié",
-        equipe: f?.equipe || s.equipe || "Daily",
-        etat: f?.etatIntervention || f?.statut || s.etat || "En attente",
-        avancement: f?.avancement || s.avancement || "0%",
-        dateEntreeHeure: s.dateEntreeHeure || f?.dateEntree,
-        dateDebutRep: s.dateDebutRep,
-        dateFinRep: f?.dateFinRep || s.dateFinRep,
-        dateModification: f?.dateModification,
-        dateDevis: f?.dateDevis,
-        dateDemande: f?.dateDemande,
-        dateReaffectation: f?.dateReaffectation,
-        dateDebutEssai: f?.dateDebutEssai,
-      });
-    });
-
-    // 3. Ajouter les flux restants non trouvés dans Suivi
-    vehicles.forEach((f) => {
-      const or = (f.ordre || f.no || "").trim().toUpperCase();
-      const ch = (f.chassis || "").trim().toUpperCase();
-      if ((or && treatedKeys.has(or)) || (ch && treatedKeys.has(ch))) {
-        return;
-      }
-      unifiedList.push({
-        ...f,
-        noOr: f.ordre || f.no || "-",
-        chassis: f.chassis || "-",
-        immatriculation: f.immatriculation || f.serie || "-",
-        client: f.client || "Client non spécifié",
-        equipe: f.equipe || "Daily",
-        etat: f.etatIntervention || f.statut || "En cours",
-        avancement: f.avancement || "0%",
-        dateEntreeHeure: f.dateEntree,
-        dateDebutRep: undefined,
-        dateFinRep: f.dateFinRep,
-        dateModification: f.dateModification,
-        dateDevis: f.dateDevis,
-        dateDemande: f.dateDemande,
-        dateReaffectation: f.dateReaffectation,
-        dateDebutEssai: f.dateDebutEssai,
-      });
-    });
-
-    // Calculer les temps pour chaque véhicule
-    return unifiedList
-      .filter((v) => !isCompletedWarrantyVehicle(v))
-      .map((v) => calculateVehicleTimes(v));
+    return buildChronoTimeCalculations(vehicles, suiviList);
   }, [vehicles, suiviList, clockMinute]);
 
   // Liste des équipes uniques pour le filtre

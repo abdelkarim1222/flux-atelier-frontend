@@ -87,7 +87,9 @@ const pool = new Pool({ connectionString: process.env.DATABASE_URL, max: 1 });
 const client = await pool.connect();
 const batch = [];
 let added = 0;
-let duplicates = 0;
+let updated = 0;
+let unchanged = 0;
+let duplicatesInFile = 0;
 let missingVin = 0;
 const seenInFile = new Set();
 
@@ -120,15 +122,37 @@ async function flushBatch() {
     return `(${columns.map((_, columnIndex) => `$${start + columnIndex + 1}${columnIndex === width - 1 ? '::jsonb' : ''}`).join(', ')})`;
   });
 
-  const inserted = await client.query(
+  const synchronized = await client.query(
     `INSERT INTO vehicle_inventory (${columns.join(', ')})
      VALUES ${valueGroups.join(', ')}
-     ON CONFLICT (vin_key) WHERE vin_key IS NOT NULL DO NOTHING
-     RETURNING source_row`,
+     ON CONFLICT (vin_key) WHERE vin_key IS NOT NULL DO UPDATE SET
+       serial_no = EXCLUDED.serial_no,
+       vin = EXCLUDED.vin,
+       brand_code = EXCLUDED.brand_code,
+       model_code = EXCLUDED.model_code,
+       model_description = EXCLUDED.model_description,
+       registration = EXCLUDED.registration,
+       stock_status = EXCLUDED.stock_status,
+       warehouse_code = EXCLUDED.warehouse_code,
+       location_code = EXCLUDED.location_code,
+       customer_code = EXCLUDED.customer_code,
+       customer_name = EXCLUDED.customer_name,
+       raw_data = EXCLUDED.raw_data
+     WHERE (vehicle_inventory.serial_no, vehicle_inventory.vin, vehicle_inventory.brand_code,
+            vehicle_inventory.model_code, vehicle_inventory.model_description, vehicle_inventory.registration,
+            vehicle_inventory.stock_status, vehicle_inventory.warehouse_code, vehicle_inventory.location_code,
+            vehicle_inventory.customer_code, vehicle_inventory.customer_name, vehicle_inventory.raw_data)
+       IS DISTINCT FROM
+           (EXCLUDED.serial_no, EXCLUDED.vin, EXCLUDED.brand_code, EXCLUDED.model_code,
+            EXCLUDED.model_description, EXCLUDED.registration, EXCLUDED.stock_status, EXCLUDED.warehouse_code,
+            EXCLUDED.location_code, EXCLUDED.customer_code, EXCLUDED.customer_name, EXCLUDED.raw_data)
+     RETURNING (xmax = 0) AS inserted`,
     values,
   );
-  added += inserted.rowCount;
-  duplicates += (batch.length - inserted.rowCount);
+  const insertedRows = synchronized.rows.filter((row) => row.inserted).length;
+  added += insertedRows;
+  updated += synchronized.rowCount - insertedRows;
+  unchanged += batch.length - synchronized.rowCount;
   batch.length = 0;
 }
 
@@ -171,7 +195,7 @@ try {
 
     const vinKey = rawVin.toUpperCase().replace(/\s+/g, '');
     if (seenInFile.has(vinKey)) {
-      duplicates += 1;
+      duplicatesInFile += 1;
       continue;
     }
     seenInFile.add(vinKey);
@@ -204,7 +228,9 @@ try {
   const count = await client.query('SELECT COUNT(*)::int AS total FROM vehicle_inventory');
   console.log(`\nImportation terminée avec succès depuis ${path.basename(source)} :`);
   console.log(`- Nouveaux véhicules ajoutés : ${added.toLocaleString('fr-FR')}`);
-  console.log(`- Doublons VIN ignorés (déjà en base ou dans le fichier) : ${duplicates.toLocaleString('fr-FR')}`);
+  console.log(`- Véhicules mis à jour : ${updated.toLocaleString('fr-FR')}`);
+  console.log(`- Véhicules déjà identiques : ${unchanged.toLocaleString('fr-FR')}`);
+  console.log(`- Doublons VIN dans le fichier ignorés : ${duplicatesInFile.toLocaleString('fr-FR')}`);
   console.log(`- Lignes sans VIN ignorées : ${missingVin.toLocaleString('fr-FR')}`);
   console.log(`- Total des véhicules dans le parc : ${count.rows[0].total.toLocaleString('fr-FR')}\n`);
 } catch (error) {
@@ -214,4 +240,3 @@ try {
   client.release();
   await pool.end();
 }
-

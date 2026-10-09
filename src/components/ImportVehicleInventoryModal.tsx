@@ -131,7 +131,7 @@ export default function ImportVehicleInventoryModal({
             </div>
             <div>
               <h3 id="import-modal-title" className="text-base font-black text-slate-900">
-                Importer de nouveaux véhicules
+                Synchroniser les véhicules du parc
               </h3>
               <p className="text-xs text-slate-500">
                 Comparaison par VIN avec la base PostgreSQL
@@ -162,7 +162,7 @@ export default function ImportVehicleInventoryModal({
                 <span className="font-semibold text-emerald-700">VIN non trouvé dans la base</span> : le véhicule est <strong>ajouté</strong> à votre parc.
               </li>
               <li>
-                <span className="font-semibold text-amber-700">VIN déjà trouvé dans la base</span> : la ligne est <strong>ignorée</strong> (aucun doublon créé).
+                <span className="font-semibold text-amber-700">VIN déjà trouvé dans la base</span> : si les données sont différentes, le véhicule est <strong>mis à jour</strong> ; sinon il reste inchangé.
               </li>
               <li>
                 Les doublons internes au fichier et les lignes sans VIN sont également ignorés.
@@ -184,13 +184,11 @@ export default function ImportVehicleInventoryModal({
               <div className="flex items-center gap-2">
                 <CheckCircle2 size={20} className="text-emerald-600 shrink-0" />
                 <h4 className="text-sm font-black text-slate-900">
-                  {result.addedRows > 0
-                    ? `${result.addedRows} nouveau(x) véhicule(s) ajouté(s) avec succès !`
-                    : 'Comparaison terminée : aucun nouveau véhicule à ajouter.'}
+                  Synchronisation terminée avec succès.
                 </h4>
               </div>
 
-              <div className="grid grid-cols-2 gap-2 sm:grid-cols-4 text-center">
+              <div className="grid grid-cols-2 gap-2 sm:grid-cols-5 text-center">
                 <div className="rounded-lg border border-slate-200 bg-white p-2.5">
                   <div className="text-[10px] font-bold uppercase tracking-wider text-slate-500">Lignes lues</div>
                   <div className="mt-1 text-base font-black text-slate-900">{result.inputRows}</div>
@@ -199,9 +197,13 @@ export default function ImportVehicleInventoryModal({
                   <div className="text-[10px] font-bold uppercase tracking-wider text-emerald-700">Ajoutés</div>
                   <div className="mt-1 text-base font-black text-emerald-700">+{result.addedRows}</div>
                 </div>
+                <div className="rounded-lg border border-cyan-200 bg-cyan-50/60 p-2.5">
+                  <div className="text-[10px] font-bold uppercase tracking-wider text-cyan-700">Mis à jour</div>
+                  <div className="mt-1 text-base font-black text-cyan-700">↻{result.updatedRows}</div>
+                </div>
                 <div className="rounded-lg border border-amber-200 bg-amber-50/60 p-2.5">
-                  <div className="text-[10px] font-bold uppercase tracking-wider text-amber-700">Déjà en base</div>
-                  <div className="mt-1 text-base font-black text-amber-700">{result.duplicateVinRows}</div>
+                  <div className="text-[10px] font-bold uppercase tracking-wider text-amber-700">Inchangés</div>
+                  <div className="mt-1 text-base font-black text-amber-700">{result.unchangedRows}</div>
                 </div>
                 <div className="rounded-lg border border-slate-200 bg-white p-2.5">
                   <div className="text-[10px] font-bold uppercase tracking-wider text-slate-400">Sans VIN</div>

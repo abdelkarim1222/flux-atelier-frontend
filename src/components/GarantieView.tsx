@@ -58,7 +58,9 @@ export default function GarantieView({
 }: GarantieViewProps) {
   const triggerDetail = onViewDetail || onSelectVehicle;
   const [search, setSearch] = useState("");
-  const [filterState, setFilterState] = useState<"tous" | "termines" | "en_cours" | "accordes" | "clos">("termines");
+  // Le tableau Garantie doit afficher tous les dossiers R10 dès son ouverture,
+  // y compris ceux dont les travaux sont toujours en cours.
+  const [filterState, setFilterState] = useState<"tous" | "termines" | "en_cours" | "accordes" | "clos">("tous");
   const [savingId, setSavingId] = useState<number | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [chronoVehicle, setChronoVehicle] = useState<Flux | null>(null);

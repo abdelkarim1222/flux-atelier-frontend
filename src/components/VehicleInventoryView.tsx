@@ -6,6 +6,7 @@ import {
   Database,
   FileSpreadsheet,
   LoaderCircle,
+  Pencil,
   Plus,
   RefreshCw,
   Search,
@@ -13,6 +14,7 @@ import {
 import { listVehicleInventory, type VehicleInventoryRow } from '../services/api';
 import ImportVehicleInventoryModal from './ImportVehicleInventoryModal';
 import AddVehicleInventoryModal from './AddVehicleInventoryModal';
+import EditVehicleInventoryModal from './EditVehicleInventoryModal';
 import { useAuth } from '../context/AuthContext';
 
 const PAGE_SIZE = 50;
@@ -35,6 +37,7 @@ function isAllowedBrand(row: VehicleInventoryRow): boolean {
 export default function VehicleInventoryView() {
   const { currentUser } = useAuth();
   const canImport = currentUser?.role === 'administration' || currentUser?.role === 'chef_atelier';
+  const canEdit = canImport;
   const [rows, setRows] = useState<VehicleInventoryRow[]>([]);
   const [total, setTotal] = useState(0);
   const [page, setPage] = useState(1);
@@ -46,6 +49,7 @@ export default function VehicleInventoryView() {
   const [refreshKey, setRefreshKey] = useState(0);
   const [isImportModalOpen, setIsImportModalOpen] = useState(false);
   const [isAddModalOpen, setIsAddModalOpen] = useState(false);
+  const [editingRow, setEditingRow] = useState<VehicleInventoryRow | null>(null);
 
   useEffect(() => {
     const timeout = window.setTimeout(() => {
@@ -151,10 +155,11 @@ export default function VehicleInventoryView() {
         )}
 
         <div className="min-h-0 flex-1 overflow-auto">
-          <table className="zebra-table min-w-[1450px] w-full border-separate border-spacing-0 text-left text-xs">
+          <table className="zebra-table min-w-[1510px] w-full border-separate border-spacing-0 text-left text-xs">
             <thead className="sticky top-0 z-10 bg-slate-100 text-[10px] uppercase tracking-wide text-slate-600">
               <tr>
                 <th className="w-10 border-b border-slate-200 px-3 py-3" aria-label="Détails" />
+                {canEdit && <th className="w-12 border-b border-slate-200 px-3 py-3" aria-label="Modifier" />}
                 {['N° de série', 'VIN', 'Code marque', 'Code modèle', 'Description', 'Immatriculation', 'Stocks', 'Magasin', 'Emplacement', 'N° client', 'Nom du client'].map((label) => (
                   <th key={label} className="whitespace-nowrap border-b border-slate-200 px-3 py-3 font-extrabold">{label}</th>
                 ))}
@@ -162,15 +167,17 @@ export default function VehicleInventoryView() {
             </thead>
             <tbody className="divide-y divide-slate-100">
               {loading && rows.length === 0 ? (
-                <tr><td colSpan={12} className="px-4 py-16 text-center text-slate-500"><LoaderCircle className="mx-auto mb-2 animate-spin" size={22} />Chargement des véhicules…</td></tr>
+                <tr><td colSpan={canEdit ? 13 : 12} className="px-4 py-16 text-center text-slate-500"><LoaderCircle className="mx-auto mb-2 animate-spin" size={22} />Chargement des véhicules…</td></tr>
               ) : visibleRows.length === 0 ? (
-                <tr><td colSpan={12} className="px-4 py-16 text-center text-slate-500">{error ? 'La liste ne peut pas être chargée.' : 'Aucun véhicule ne correspond à la recherche.'}</td></tr>
+                <tr><td colSpan={canEdit ? 13 : 12} className="px-4 py-16 text-center text-slate-500">{error ? 'La liste ne peut pas être chargée.' : 'Aucun véhicule ne correspond à la recherche.'}</td></tr>
               ) : visibleRows.map((row) => (
                 <InventoryTableRows
                   key={row.sourceRow}
                   row={row}
                   expanded={expandedRow === row.sourceRow}
                   onToggle={() => setExpandedRow((current) => current === row.sourceRow ? null : row.sourceRow)}
+                  canEdit={canEdit}
+                  onEdit={() => setEditingRow(row)}
                 />
               ))}
             </tbody>
@@ -207,15 +214,24 @@ export default function VehicleInventoryView() {
           setPage(1);
         }}
       />
+      <EditVehicleInventoryModal
+        row={editingRow}
+        onClose={() => setEditingRow(null)}
+        onSuccess={() => {
+          setEditingRow(null);
+          setRefreshKey((value) => value + 1);
+        }}
+      />
     </main>
   );
 }
 
-function InventoryTableRows({ row, expanded, onToggle }: { row: VehicleInventoryRow; expanded: boolean; onToggle: () => void }) {
+function InventoryTableRows({ row, expanded, onToggle, canEdit, onEdit }: { row: VehicleInventoryRow; expanded: boolean; onToggle: () => void; canEdit: boolean; onEdit: () => void }) {
   return (
     <>
       <tr className="cursor-pointer text-slate-700 transition hover:bg-cyan-50/60" onClick={onToggle} aria-expanded={expanded}>
         <td className="border-b border-slate-100 px-3 py-3 text-cyan-800"><ChevronDown size={15} className={`transition-transform ${expanded ? 'rotate-180' : ''}`} /></td>
+        {canEdit && <td className="border-b border-slate-100 px-3 py-3"><button type="button" onClick={(event) => { event.stopPropagation(); onEdit(); }} className="rounded-lg p-1.5 text-cyan-800 transition hover:bg-cyan-100" title="Modifier ce véhicule" aria-label={`Modifier le véhicule ${row.vin || row.serialNo || ''}`}><Pencil size={15} /></button></td>}
         <td className="border-b border-slate-100 px-3 py-3 font-bold text-slate-900"><InventoryCell value={row.serialNo} mono /></td>
         <td className="border-b border-slate-100 px-3 py-3"><InventoryCell value={row.vin} mono /></td>
         <td className="border-b border-slate-100 px-3 py-3"><InventoryCell value={row.brandCode} /></td>
@@ -230,7 +246,7 @@ function InventoryTableRows({ row, expanded, onToggle }: { row: VehicleInventory
       </tr>
       {expanded && (
         <tr>
-          <td colSpan={12} className="border-b border-cyan-100 bg-cyan-50/40 px-5 py-4">
+          <td colSpan={canEdit ? 13 : 12} className="border-b border-cyan-100 bg-cyan-50/40 px-5 py-4">
             <dl className="grid grid-cols-1 gap-x-5 gap-y-3 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
               {Object.entries(row.data).map(([label, value]) => (
                 <div key={label} className="min-w-0 rounded-lg border border-slate-200/80 bg-white px-3 py-2">

@@ -145,11 +145,10 @@ import {
   recordAvancementStatusChange,
   recordVehicleModification,
 } from "../services/timeTracking";
-import { isCompletedWarrantyVehicle, isWarrantyVehicle } from "../services/warranty";
+import { isWarrantyVehicle } from "../services/warranty";
 import type { EssaiValidationPayload } from "../components/ValidationEssaiModal";
 import { isVehicleMatchingTeam } from "../config/teams";
 import {
-  calculerEmplacementAutomatique,
   ALL_EMPLACEMENTS,
   DELIVERED_EMPLACEMENT as AUTO_DELIVERED_EMPLACEMENT,
   FULL_PARKING_EMPLACEMENT,
@@ -160,7 +159,118 @@ import {
 type StatusFilter = "Tous" | "Attentes" | WorkshopStatus;
 type DatabaseStatus = "loading" | "ready" | "fallback";
 const ALL_DATES = "Toutes";
-const atelierMapDisplaySvg = atelierMapSvg;
+
+/** P1–P10 sont regroupées dans le parking vertical de droite. */
+function renameElectricStations(svgMarkup: string) {
+  const stations: Record<string, string> = {
+    E22: "E422",
+    E21: "E421",
+    E12: "E412",
+    E11: "E411",
+    E2: "E420",
+    E1: "E410",
+  };
+
+  return Object.entries(stations).reduce(
+    (result, [previousCode, nextCode]) => result.replaceAll(previousCode, nextCode),
+    svgMarkup
+  );
+}
+
+/** Étend le cadre du banc T pour inclure la nouvelle colonne T5–T7. */
+function extendLourdZoneFrame(svgMarkup: string) {
+  return svgMarkup
+    .replace(
+      '<rect x="880" y="370" width="380" height="540" rx="14" fill="#f0f9ff" stroke="#0284c7" stroke-width="3"/>',
+      '<rect x="880" y="370" width="510" height="540" rx="14" fill="#f0f9ff" stroke="#0284c7" stroke-width="3"/>'
+    )
+    .replace(
+      '<rect x="880" y="370" width="380" height="40" rx="10" fill="#e0f2fe" stroke="#7dd3fc" stroke-width="1.5"/>',
+      '<rect x="880" y="370" width="510" height="40" rx="10" fill="#e0f2fe" stroke="#7dd3fc" stroke-width="1.5"/>'
+    );
+}
+
+/** Trois postes supplémentaires dans la zone bleue Freinage / Géométrie. */
+function addAdditionalLourdStations(svgMarkup: string) {
+  const slots = ["T5", "T6", "T7"].map((code, index) => {
+    // Colonne libre à droite du rectangle bleu, comme indiqué sur le plan.
+    const x = 1226;
+    const y = [416, 618, 746][index];
+    return `
+    <g class="additional-lourd-slot" opacity="0.98">
+      <rect x="${x}" y="${y}" width="76" height="118" rx="5" fill="#ffffff" stroke="#38bdf8" stroke-width="2" pointer-events="none"/>
+      <rect id="${code}" x="${x}" y="${y}" width="76" height="118" rx="5" fill="#ffffff" stroke="#38bdf8" stroke-width="2"/>
+      <rect x="${x + 7}" y="${y + 12}" width="62" height="27" rx="4" fill="#ffffff" stroke="#38bdf8" stroke-width="1.5" pointer-events="none"/>
+      <text x="${x + 38}" y="${y + 31}" font-family="Arial, Helvetica, sans-serif" font-size="14" font-weight="900" fill="#0f172a" text-anchor="middle" pointer-events="none">${code}</text>
+      <rect x="${x + 7}" y="${y + 79}" width="62" height="25" rx="3" fill="#ffffff" stroke="#38bdf8" stroke-width="1.5" pointer-events="none"/>
+    </g>`;
+  }).join("");
+
+  return svgMarkup.replace("</svg>", `${slots}\n  </svg>`);
+}
+
+function makeRightParkingTenSlots(svgMarkup: string) {
+  let result = svgMarkup;
+
+  // Les anciens P9–P76 gardent leur place physique mais sont décalés de cinq
+  // numéros : P9 devient P14 et P76 devient P81. Cela réserve P1–P10 pour
+  // la colonne de droite et P11–P13 pour les trois petites places du haut.
+  for (let number = 76; number >= 9; number -= 1) {
+    result = result.replaceAll(`P${number}`, `P${number + 5}`);
+  }
+
+  // Masquer les huit anciennes cases à droite et libérer leurs identifiants.
+  for (let number = 1; number <= 8; number += 1) {
+    const code = `P${number}`;
+    result = result.replace(
+      new RegExp(`(<!-- Bay ${code} -->\\n\\s*<g)([^>]*)>`),
+      '$1 display="none"$2>'
+    );
+    result = result.replace(`id="${code}"`, `id="LEGACY_${code}"`);
+  }
+
+  // Dix emplacements P1–P10 plus compacts dans la zone verticale existante.
+  const mainSlots = Array.from({ length: 10 }, (_, index) => {
+    const number = index + 1;
+    const code = `P${number}`;
+    const width = 96;
+    const x = 2434;
+    const y = 1056 - (number - 1) * 55;
+    const height = 48;
+    const badgeWidth = 38;
+    const badgeX = x + (width - badgeWidth) / 2;
+    const slotFontSize = 13;
+
+    return `\n    <g class="right-parking-slot" opacity="0.98">\n      <rect id="${code}" x="${x}" y="${y}" width="${width}" height="${height}" rx="5" fill="#ffffff" stroke="#64748b" stroke-width="2"/>\n      <line x1="${x + 5}" y1="${y + 6}" x2="${x + width - 5}" y2="${y + 6}" stroke="#64748b" stroke-width="2.5" pointer-events="none"/>\n      <rect x="${badgeX}" y="${y + 10}" width="${badgeWidth}" height="26" rx="5" fill="#ffffff" stroke="#475569" stroke-width="2" filter="url(#badgeGlow)" pointer-events="none"/>\n      <text x="${x + width / 2}" y="${y + 29}" font-family="Arial, Helvetica, sans-serif" font-size="${slotFontSize}" font-weight="900" fill="#000000" text-anchor="middle" pointer-events="none">${code}</text>\n    </g>`;
+  }).join("");
+
+  // Les trois petites places du haut conservent leur position, avec les
+  // nouveaux codes P11, P12 et P13.
+  const upperSlots = Array.from({ length: 3 }, (_, index) => {
+    const code = `P${index + 11}`;
+    const x = 2455;
+    const y = 468 - index * 84;
+    const width = 54;
+    const height = 82;
+    const badgeWidth = 38;
+    const badgeX = x + (width - badgeWidth) / 2;
+    return `\n    <g class="right-parking-slot" opacity="0.98">\n      <rect id="${code}" x="${x}" y="${y}" width="${width}" height="${height}" rx="5" fill="#ffffff" stroke="#64748b" stroke-width="2"/>\n      <line x1="${x + 5}" y1="${y + 6}" x2="${x + width - 5}" y2="${y + 6}" stroke="#64748b" stroke-width="2.5" pointer-events="none"/>\n      <rect x="${badgeX}" y="${y + 10}" width="${badgeWidth}" height="26" rx="5" fill="#ffffff" stroke="#475569" stroke-width="2" filter="url(#badgeGlow)" pointer-events="none"/>\n      <text x="${x + width / 2}" y="${y + 29}" font-family="Arial, Helvetica, sans-serif" font-size="10" font-weight="900" fill="#000000" text-anchor="middle" pointer-events="none">${code}</text>\n    </g>`;
+  }).join("");
+
+  return result
+    .replace(
+      /PARKING VÉHICULES EN ATTENTE D'INTERVENTION \(P\d+ - P\d+\)/,
+      "PARKING VÉHICULES EN ATTENTE D'INTERVENTION (P14 - P81)"
+    )
+    .replace("</svg>", `${mainSlots}${upperSlots}\n  </svg>`);
+}
+
+const atelierMapDisplaySvg = makeRightParkingTenSlots(
+  addAdditionalLourdStations(extendLourdZoneFrame(renameElectricStations(atelierMapSvg)))
+);
+// La même référence doit être conservée entre les rendus React. Sinon React
+// réinjecte le SVG et efface les couleurs appliquées aux places occupées.
+const atelierMapInnerHtml = { __html: atelierMapDisplaySvg };
 
 const waitingStatuses = new Set<WorkshopStatus>([
   "Attente Client",
@@ -186,17 +296,9 @@ const editableStatusOptions = statusMeta.map((status) => status.label);
 const editableStatusSet = new Set<WorkshopStatus>(editableStatusOptions);
 
 const mapZoneIds = new Set(
-  Array.from(atelierMapSvg.matchAll(/\bid="([^"]+)"/g), (match) =>
+  Array.from(atelierMapDisplaySvg.matchAll(/\bid="([^"]+)"/g), (match) =>
     match[1].toUpperCase()
   )
-);
-
-const editableMapZoneIds = Array.from(
-  new Set([
-    AUTO_DELIVERED_EMPLACEMENT,
-    ...ALL_EMPLACEMENTS,
-    ...Array.from(mapZoneIds).filter((zone) => /^[A-Z]+\d+$/.test(zone)),
-  ])
 );
 
 function removeDraft(
@@ -534,19 +636,6 @@ function getPlanVehicleColor(row: Pick<Flux, "avancement" | "etatIntervention">)
   if (advancement.includes("essai")) return "#8b5cf6"; // violet
   if (advancement.includes("attente réparation") || advancement.includes("attente reparation") || String(row.etatIntervention || "").toLowerCase().includes("attente réparation")) return "#64748b"; // gris ardoise
   return getStatusColor(row.etatIntervention);
-}
-
-/** Couleurs stables des postes libres : elles ne disparaissent pas après le chargement. */
-function getFreeEmplacementStyle(zone: string): { fill: string; stroke: string } {
-  const prefix = zone.charAt(0).toUpperCase();
-  if (prefix === "D") return { fill: "#dbeafe", stroke: "#60a5fa" };
-  if (prefix === "J") return { fill: "#dcfce7", stroke: "#34d399" };
-  if (prefix === "E") return { fill: "#f3e8ff", stroke: "#c084fc" };
-  if (prefix === "S") return { fill: "#d1fae5", stroke: "#34d399" };
-  if (prefix === "C") return { fill: "#fae8ff", stroke: "#d946ef" };
-  if (prefix === "T" || prefix === "M") return { fill: "#e0f2fe", stroke: "#38bdf8" };
-  if (prefix === "L") return { fill: "#ffedd5", stroke: "#fb923c" };
-  return { fill: "#f1f5f9", stroke: "#94a3b8" };
 }
 
 function badgeStyle(status: WorkshopStatus): CSSProperties {
@@ -1315,7 +1404,37 @@ export default function Dashboard() {
         });
       });
       const mergedRows = mergeRecentAddedVehicles(withReceptionLocations);
-      setVehicles(mergedRows);
+      setVehicles((currentRows) => {
+        // Certaines réponses de synchronisation arrivent sans leur champ
+        // emplacement pendant une très courte période. Elles ne doivent jamais
+        // vider visuellement le plan entre deux réponses complètes.
+        const previousByKey = new Map<string, Flux>();
+        currentRows.forEach((vehicle) => {
+          [vehicle.id, vehicle.no, vehicle.ordre, vehicle.chassis]
+            .map((value) => String(value || "").trim().toUpperCase())
+            .filter(Boolean)
+            .forEach((key) => previousByKey.set(key, vehicle));
+        });
+
+        return mergedRows.map((vehicle) => {
+          const incomingLocation = normalizeEmplacementCode(vehicle.emplacement || "");
+          const hasIncomingMapLocation = mapZoneIds.has(incomingLocation);
+          const isDelivered =
+            String(vehicle.etatIntervention || vehicle.statut || "").toLowerCase().includes("livr") ||
+            String(vehicle.avancement || "").toLowerCase().includes("livr");
+
+          if (hasIncomingMapLocation || isDelivered) return vehicle;
+
+          const previous = [vehicle.id, vehicle.no, vehicle.ordre, vehicle.chassis]
+            .map((value) => previousByKey.get(String(value || "").trim().toUpperCase()))
+            .find(Boolean);
+          const previousLocation = normalizeEmplacementCode(previous?.emplacement || "");
+
+          return previous && mapZoneIds.has(previousLocation)
+            ? { ...vehicle, emplacement: previous!.emplacement }
+            : vehicle;
+        });
+      });
       setDatabaseStatus("ready");
       setDatabaseError("");
     } catch (error) {
@@ -1437,27 +1556,25 @@ export default function Dashboard() {
             return !status.includes("livr");
           })
         : undefined;
-      if (occupiedBy) {
-        setWriteError(`L'emplacement ${nextEmplacement} est déjà occupé par le véhicule ${occupiedBy.no || occupiedBy.ordre || occupiedBy.chassis}.`);
-        return;
-      }
-
       const previousEmplacement = row.emplacement;
 
       setWriteNotice("");
       setWriteError("");
       setSavingVehicleId(row.id);
-      setVehicles((current) =>
-        current.map((item) =>
-          item.id === row.id
-            ? { ...item, emplacement: nextEmplacement }
-            : item
-        )
-      );
+      setVehicles((current) => current.map((item) => {
+        if (item.id === row.id) return { ...item, emplacement: nextEmplacement };
+        if (occupiedBy && item.id === occupiedBy.id) return { ...item, emplacement: previousEmplacement };
+        return item;
+      }));
       setSelectedVehicleId(row.id);
       setSelectedZone(nextEmplacement);
 
       if (!canWriteToDatabase) {
+        setVehicles((current) => current.map((item) => {
+          if (item.id === row.id) return { ...item, emplacement: previousEmplacement };
+          if (occupiedBy && item.id === occupiedBy.id) return { ...item, emplacement: nextEmplacement };
+          return item;
+        }));
         setSavingVehicleId(null);
         setDraftEmplacements((current) => removeDraft(current, row.id));
         setWriteError(
@@ -1477,17 +1594,16 @@ export default function Dashboard() {
           "Emplacement modifié",
           `${previousEmplacement || "-"} → ${nextEmplacement}`,
         );
-        setWriteNotice(
-          `Emplacement ${row.serie || row.no} mis à jour: ${previousEmplacement} -> ${nextEmplacement}.`
+        setWriteNotice(occupiedBy
+          ? `Emplacements échangés : ${row.serie || row.no} → ${nextEmplacement}, ${occupiedBy.serie || occupiedBy.no} → ${previousEmplacement}.`
+          : `Emplacement ${row.serie || row.no} mis à jour: ${previousEmplacement} -> ${nextEmplacement}.`
         );
       } catch (error) {
-        setVehicles((current) =>
-          current.map((item) =>
-            item.id === row.id
-              ? { ...item, emplacement: previousEmplacement }
-              : item
-          )
-        );
+        setVehicles((current) => current.map((item) => {
+          if (item.id === row.id) return { ...item, emplacement: previousEmplacement };
+          if (occupiedBy && item.id === occupiedBy.id) return { ...item, emplacement: nextEmplacement };
+          return item;
+        }));
         setSelectedVehicleId(row.id);
         setSelectedZone(previousEmplacement);
         setWriteError(
@@ -1534,16 +1650,15 @@ export default function Dashboard() {
         }
       }
 
-      // Calcul automatique de l'emplacement selon l'état et l'équipe active
+      // L'emplacement n'est jamais modifié automatiquement : seul le
+      // déplacement manuel sur le plan peut le changer.
       const computedVehicle: Partial<Flux> = {
         ...row,
         etatIntervention: nextEtat,
         statut: nextEtat,
         equipe: (isGoingToEnCours && assignedTeam ? assignedTeam : row.equipe) || "Daily1",
       };
-      const nextEmplacement = isDelivered
-        ? DELIVERED_EMPLACEMENT
-        : calculerEmplacementAutomatique(computedVehicle, vehicles, row.id);
+      const nextEmplacement = row.emplacement || "NA";
 
       setWriteNotice("");
       setWriteError("");
@@ -1674,7 +1789,7 @@ export default function Dashboard() {
         statutAcceptation: "accepte",
         dateAcceptation: row.dateAcceptation || currentDateTime,
       };
-      const nextEmplacement = calculerEmplacementAutomatique(computedVehicle, vehicles, row.id);
+      const nextEmplacement = row.emplacement || "NA";
 
       setWriteNotice("");
       setWriteError("");
@@ -1873,9 +1988,7 @@ export default function Dashboard() {
         etatIntervention: "En cours",
         statut: "En cours",
       };
-      const nextEmplacement = isTransferInit
-        ? calculerEmplacementAutomatique(computedVehicle, vehicles, row.id)
-        : row.emplacement;
+      const nextEmplacement = row.emplacement || "NA";
 
       setVehicles((current) =>
         current.map((item) => {
@@ -2187,10 +2300,8 @@ export default function Dashboard() {
         nomTechnicien: targetNomTech,
         ...(isVrTransfer ? { statutAcceptation: "en_attente" as const } : {}),
       };
-      // Toute attente (devis inclus) doit recevoir une place P numérotée du
-      // plan atelier, jamais le code générique « P ». Le calcul choisit P1 à
-      // P76 selon la première place réellement libre.
-      const nextEmplacement = calculerEmplacementAutomatique(computedVehicle, vehicles, row.id);
+      // Une évolution de dossier ne déplace jamais automatiquement le véhicule.
+      const nextEmplacement = row.emplacement || "NA";
 
       // Transferts VR : enregistrer le début du transfert vers l'équipe cible horodaté à maintenant
       if (isVrTransfer) {
@@ -2462,9 +2573,11 @@ export default function Dashboard() {
             ? `🔄 Transfert ${nextAvancement} : véhicule ${row.serie || row.no} envoyé en Attente Réparation à l'équipe ${targetEquipe}, en attente de son acceptation. Technicien ${row.nomTechnicien || row.technicien || ""} libéré (🟢 Disponible).`
             : nextAvancement === "Essai"
               ? `Véhicule ${row.serie || row.no} mis à jour : Essai (transféré vers la Page Essai).`
-              : nextAvancement === "attends acheter"
-                ? `Véhicule ${row.serie || row.no} mis à jour : attends acheter (transféré vers la Page Acheter).`
-                : isDevis
+                : nextAvancement === "attends acheter"
+                  ? `Véhicule ${row.serie || row.no} mis à jour : attends acheter (transféré vers la Page Acheter).`
+                  : nextAvancement === "Attente PDR"
+                    ? `Véhicule ${row.serie || row.no} mis en Attente PDR. Technicien ${row.nomTechnicien || row.technicien || ""} libéré (🟢 Disponible).`
+                  : isDevis
                   ? `📋 Véhicule ${row.serie || row.no} : Lancement devis enregistré${demandeDevis?.numeroDevis ? ` (N° DV ${demandeDevis.numeroDevis})` : ""}. Le véhicule retourne dans Tableaux de chargement avec l'avancement "Attente accord" (emplacement ${nextEmplacement}). Technicien ${row.nomTechnicien || row.technicien || ""} libéré (🟢 Disponible).`
                   : nextAvancement === "Technicien réaffecté"
                     ? `🔄 Technicien réaffecté pour ${row.serie || row.no} : avancement passé en "Attente réparation" (reste dans Interventions En cours).`
@@ -2476,50 +2589,6 @@ export default function Dashboard() {
         setWriteNotice(noticeMsg);
       } catch (error) {
         const errorMessage = error instanceof Error ? error.message : String(error);
-        // Les données locales peuvent être en retard sur PostgreSQL. Si la
-        // première place automatique (ex. D1) vient d'être prise, relire les
-        // emplacements et enregistrer directement la prochaine place libre.
-        if (errorMessage.toLowerCase().includes("emplacement") && errorMessage.toLowerCase().includes("occup")) {
-          try {
-            const freshVehicles = await fetchDatabaseFluxData();
-            const alternativeEmplacement = calculerEmplacementAutomatique(
-              computedVehicle,
-              freshVehicles,
-              row.id,
-            );
-            if (alternativeEmplacement && alternativeEmplacement !== nextEmplacement && alternativeEmplacement !== FULL_PARKING_EMPLACEMENT) {
-              const retryPayload = { ...extraPayload, emplacement: alternativeEmplacement };
-              await updateDatabaseAvancement(
-                row,
-                effectiveAvancement,
-                targetEquipe,
-                nextBloc,
-                activeDemandeAchat,
-                retryPayload,
-                demandeDevis,
-              );
-              setVehicles((current) => current.map((item) =>
-                item.id === row.id ? { ...item, emplacement: alternativeEmplacement } : item
-              ));
-              setSelectedZone(alternativeEmplacement);
-              setLastRefresh(formatRefreshDate());
-              setDatabaseStatus("ready");
-              setWriteError("");
-              recordAvancementStatusChange(row, nextAvancement, nowFormatted, currentUserName);
-              recordVehicleModification(
-                row,
-                "Avancement modifié",
-                `${previousAvancement || "-"} → ${effectiveAvancement} • Emplacement : ${nextEmplacement} → ${alternativeEmplacement}`,
-              );
-              setWriteNotice(
-                `La place ${nextEmplacement} était déjà occupée. Le véhicule ${row.serie || row.no} a été placé automatiquement en ${alternativeEmplacement}.`
-              );
-              return;
-            }
-          } catch (retryError) {
-            error = retryError;
-          }
-        }
         if (
           nextAvancement === "attends acheter" ||
           nextAvancement === "Essai" ||
@@ -2846,8 +2915,10 @@ export default function Dashboard() {
     const zones = new Map<string, Flux[]>();
 
     vehicles.forEach((row) => {
-      if (isCompletedWarrantyVehicle(row)) return;
-      const zone = (row.emplacement || "").toUpperCase().trim();
+      // Tous les dossiers R10 sont suivis dans le Tableau Garantie,
+      // jamais sur le plan opérationnel de l'atelier.
+      if (isWarrantyVehicle(row)) return;
+      const zone = normalizeEmplacementCode(row.emplacement || "");
       if (!zone || zone === "NA" || zone.startsWith("#") || isSheetEmplacementOutsideMap(zone)) {
         return;
       }
@@ -3295,8 +3366,8 @@ export default function Dashboard() {
             acceptePar: chefName,
           };
 
-      // Calcul automatique de l'emplacement selon l'équipe responsable (Daily->D, Électrique->E, Service Rapide->S, Carrosserie->C, Lourd->T/M)
-      const autoEmp = calculerEmplacementAutomatique(baseVehicle, vehicles, baseVehicle.id);
+      // L'acceptation par une équipe ne modifie pas la position réelle.
+      const autoEmp = baseVehicle.emplacement || "NA";
       baseVehicle.emplacement = autoEmp;
 
       const { dateTime: currentDateTime, time: currentTime } = getWorkshopNow();
@@ -3424,9 +3495,9 @@ export default function Dashboard() {
 
     return vehicles
       .filter((row) => {
-        // Une intervention garantie terminée est sortie du flux opérationnel :
-        // elle reste accessible uniquement depuis le Tableau de Suivi Garantie.
-        if (isCompletedWarrantyVehicle(row)) {
+        // Tous les dossiers R10 sortent du flux opérationnel :
+        // ils restent accessibles uniquement depuis le Tableau de Suivi Garantie.
+        if (isWarrantyVehicle(row)) {
           return false;
         }
         if (role !== "administration" && (
@@ -3539,7 +3610,7 @@ export default function Dashboard() {
   }, [activeFilter, dateFilter, search, vehicles, role, assignedReceptionCs, activeTab, effectiveChefFilterTeam, enCoursTransferOnly]);
 
   const workshopVehicles = useMemo(
-    () => vehicles.filter((vehicle) => !isCompletedWarrantyVehicle(vehicle)),
+    () => vehicles.filter((vehicle) => !isWarrantyVehicle(vehicle)),
     [vehicles]
   );
 
@@ -3665,12 +3736,13 @@ export default function Dashboard() {
       const isSelected = selectedZone === zone;
 
       if (!isOccupied) {
-        const freeStyle = getFreeEmplacementStyle(zone);
-        element.style.setProperty("fill", isSelected ? "#3b82f6" : freeStyle.fill);
-        element.style.setProperty("fill-opacity", isSelected ? "0.55" : "0.95");
-        element.style.setProperty("stroke", isSelected ? "#1d4ed8" : freeStyle.stroke);
-        element.style.setProperty("stroke-width", isSelected ? "3.5" : "2");
-        element.style.setProperty("stroke-opacity", "1");
+        // Une place vide reste neutre. La couleur est réservée strictement
+        // aux emplacements qui contiennent un véhicule.
+        element.style.setProperty("fill", "transparent");
+        element.style.setProperty("fill-opacity", "0");
+        element.style.setProperty("stroke", "transparent");
+        element.style.setProperty("stroke-width", "0");
+        element.style.setProperty("stroke-opacity", "0");
       }
       const previousTitle = element.querySelector("title[data-atelier-zone-tooltip]");
       previousTitle?.remove();
@@ -3682,7 +3754,10 @@ export default function Dashboard() {
       element.prepend(title);
       element.style.setProperty("cursor", "pointer");
       element.style.setProperty("pointer-events", "visiblePainted");
-      element.style.setProperty("transition", "all 160ms ease");
+      // Les emplacements sont des indicateurs d'occupation, pas des alertes :
+      // aucune animation ne doit les faire disparaître ou varier visuellement.
+      element.style.setProperty("transition", "none");
+      element.style.setProperty("animation", "none");
     });
 
     const labelLayer = document.createElementNS(
@@ -3751,10 +3826,32 @@ export default function Dashboard() {
       try {
         const box = element.getBBox();
         const label = row.serie || row.no.slice(-4);
-        const fontSize = Math.max(14, Math.min(20, box.height * 0.3));
+        const fontSize = Math.max(8, Math.min(20, box.height * 0.3, box.width * 0.26));
+
+        // Calque visuel indépendant du SVG source. Plusieurs emplacements du
+        // plan historique sont définis avec opacity: 0 ; ce rectangle garde
+        // donc la couleur visible même après un rafraîchissement du plan.
+        const occupiedOverlay = document.createElementNS(
+          "http://www.w3.org/2000/svg",
+          "rect"
+        );
+        occupiedOverlay.setAttribute("x", String(box.x));
+        occupiedOverlay.setAttribute("y", String(box.y));
+        occupiedOverlay.setAttribute("width", String(box.width));
+        occupiedOverlay.setAttribute("height", String(box.height));
+        occupiedOverlay.setAttribute("rx", "5");
+        occupiedOverlay.setAttribute("fill", color);
+        occupiedOverlay.setAttribute("fill-opacity", "0.82");
+        occupiedOverlay.setAttribute("stroke", isSelected ? "#ffffff" : color);
+        occupiedOverlay.setAttribute("stroke-width", isSelected ? "5" : "3");
+        occupiedOverlay.setAttribute("pointer-events", "none");
+        labelLayer.appendChild(occupiedOverlay);
 
         // Background capsule badge for the vehicle label
-        const badgeW = Math.min(box.width - 4, Math.max(64, label.length * 10 + 16));
+        const badgeW = Math.min(
+          box.width - 4,
+          Math.max(Math.min(64, box.width - 4), label.length * fontSize * 0.65 + 8)
+        );
         const badgeH = Math.max(22, Math.min(28, box.height * 0.35));
         const badgeX = box.x + box.width / 2 - badgeW / 2;
         const badgeY = box.y + box.height / 2 - badgeH / 2;
@@ -3794,8 +3891,12 @@ export default function Dashboard() {
       }
     });
   }, [
+    // Les données arrivent après le montage du SVG et sont ensuite
+    // resynchronisées : reprendre la carte à chaque nouvelle liste garantit
+    // que toutes les places réellement occupées restent affichées.
     rowsByZone,
     selectedZone,
+    activeTab,
   ]);
 
   const handleMapClick = (event: MouseEvent<HTMLDivElement>) => {
@@ -5309,7 +5410,7 @@ export default function Dashboard() {
 
                 <div
                   className="atelier-map"
-                  dangerouslySetInnerHTML={{ __html: atelierMapDisplaySvg }}
+                  dangerouslySetInnerHTML={atelierMapInnerHtml}
                   onClick={handleMapClick}
                   ref={mapRef}
                 />
@@ -5433,6 +5534,10 @@ export default function Dashboard() {
                       <div>
                         <span>Emplacement</span>
                         <strong>{displayText(selectedVehicle.emplacement)}</strong>
+                      </div>
+                      <div className="col-span-2">
+                        <span>Description / commentaire</span>
+                        <strong className="whitespace-pre-wrap">{displayText((selectedVehicle as any).commentaireAtelier)}</strong>
                       </div>
                     </div>
 
@@ -5897,14 +6002,6 @@ export default function Dashboard() {
                         {writeNotice}
                       </div>
                     )}
-
-                    <datalist id="atelier-zone-options">
-                      <option value="Place complet" />
-                      <option value="Livraison au client" />
-                      {editableMapZoneIds.map((zone) => (
-                        <option key={zone} value={zone} />
-                      ))}
-                    </datalist>
 
                     {(() => {
                       const isChefEquipeChargement = activeTab === "chargement" && role === "chef_equipe";
@@ -6672,71 +6769,69 @@ export default function Dashboard() {
 
                                 const renderCellEmplacement = () => {
                                   const isComplet = draftValue === FULL_PARKING_EMPLACEMENT || row.emplacement === FULL_PARKING_EMPLACEMENT;
+                                  const occupiedEmplacements = new Set(
+                                    vehicles
+                                      .filter((vehicle) => {
+                                        if (vehicle.id === row.id) return false;
+                                        const status = `${vehicle.etatIntervention || ""} ${vehicle.avancement || ""}`.toLowerCase();
+                                        return !status.includes("livr");
+                                      })
+                                      .map((vehicle) => normalizeEmplacementCode(vehicle.emplacement || ""))
+                                  );
+                                  const availableEmplacements = ALL_EMPLACEMENTS.filter(
+                                    (emplacement) =>
+                                      normalizeEmplacementCode(emplacement) !== normalizeEmplacementCode(row.emplacement || "") &&
+                                      !occupiedEmplacements.has(normalizeEmplacementCode(emplacement))
+                                  );
                                   return (
                                     <td>
                                       <div className="flex items-center gap-1.5">
                                         <div className={`emplacement-editor ${isComplet ? "border-red-400 bg-red-50/50" : ""}`}>
-                                      <input
+                                      <select
                                         aria-label={`Modifier emplacement ${row.no}`}
                                         disabled={isSaving || !permissions.canEditEmplacement}
-                                        title={!permissions.canEditEmplacement ? "Modification de l'emplacement réservée au Chef Atelier ou Chef d'équipe" : undefined}
-                                        list="atelier-zone-options"
-                                        onBlur={(event) => {
-                                          const nextValue = event.currentTarget.value;
-                                          if (
-                                            normalizeSheetEmplacement(nextValue) !==
-                                            row.emplacement
-                                          ) {
-                                            void saveVehicleEmplacement(row, nextValue);
-                                          }
-                                        }}
+                                        title={!permissions.canEditEmplacement ? "Modification de l'emplacement réservée au Chef Atelier ou Chef d'équipe" : "Choisir une place libre"}
                                         onChange={(event) => {
                                           const nextValue = normalizeSheetEmplacement(
                                             event.target.value
                                           );
-                                          setDraftEmplacements((current) => ({
-                                            ...current,
-                                            [row.id]: nextValue,
-                                          }));
+                                          // Les navigateurs mobiles referment le sélecteur
+                                          // immédiatement. Sauvegarder à ce moment évite de
+                                          // demander un second toucher sur la petite icône
+                                          // d'enregistrement, souvent manqué sur téléphone.
+                                          void saveVehicleEmplacement(row, nextValue);
                                         }}
                                         onFocus={() => {
                                           setSelectedVehicleId(row.id);
                                           setSelectedZone(row.emplacement);
                                         }}
-                                        onKeyDown={(event) => {
-                                          if (event.key === "Enter") {
-                                            event.preventDefault();
-                                            void saveVehicleEmplacement(
-                                              row,
-                                              event.currentTarget.value
-                                            );
-                                          }
-                                          if (event.key === "Escape") {
-                                            event.preventDefault();
-                                            setDraftEmplacements((current) =>
-                                              removeDraft(current, row.id)
-                                            );
-                                          }
-                                        }}
                                         value={draftValue}
-                                      />
-
-                                      <button
-                                        aria-label={`Enregistrer emplacement ${row.no}`}
-                                        className="emplacement-save"
-                                        disabled={!hasDraftChange || isSaving || !permissions.canEditEmplacement}
-                                        onClick={(event) => {
-                                          event.stopPropagation();
-                                          void saveVehicleEmplacement(row, draftValue);
-                                        }}
-                                        onMouseDown={(event) => {
-                                          event.preventDefault();
-                                        }}
-                                        title="Enregistrer emplacement"
-                                        type="button"
                                       >
-                                        <Save size={12} />
-                                      </button>
+                                        <option value={row.emplacement}>
+                                          {row.emplacement || "Emplacement actuel"}
+                                        </option>
+                                        {availableEmplacements.map((emplacement) => (
+                                          <option key={emplacement} value={emplacement}>
+                                            {emplacement}
+                                          </option>
+                                        ))}
+                                      </select>
+
+                                      {hasDraftChange && (
+                                        <button
+                                          aria-label={`Enregistrer emplacement ${row.no}`}
+                                          className="emplacement-save"
+                                          disabled={isSaving || !permissions.canEditEmplacement}
+                                          onClick={(event) => {
+                                            event.stopPropagation();
+                                            void saveVehicleEmplacement(row, draftValue);
+                                          }}
+                                          title="Enregistrer emplacement"
+                                          type="button"
+                                        >
+                                          <Save size={12} />
+                                        </button>
+                                      )}
                                     </div>
 
                                     {row.emplacement && row.emplacement !== "-" && row.emplacement !== "NA" && (

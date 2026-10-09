@@ -113,11 +113,20 @@ export function addVehicleInventory(input: ManualVehicleInventoryInput): Promise
   });
 }
 
+export function updateVehicleInventory(sourceRow: number, input: ManualVehicleInventoryInput): Promise<{ ok: boolean; row: VehicleInventoryRow }> {
+  return apiRequest<{ ok: boolean; row: VehicleInventoryRow }>(`/api/inventory/vehicles/${encodeURIComponent(String(sourceRow))}`, {
+    method: 'PUT',
+    body: JSON.stringify(input),
+  });
+}
+
 export interface VehicleInventoryImportResult {
   ok: boolean;
   fileName: string;
   inputRows: number;
   addedRows: number;
+  updatedRows: number;
+  unchangedRows: number;
   duplicateVinRows: number;
   missingVinRows: number;
   total: number;

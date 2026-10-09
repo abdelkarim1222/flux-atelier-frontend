@@ -248,12 +248,18 @@ export default function NouvelleEntreeModal({
       setLoading(true);
       // Contrôle d'unicité du N° OR (les autres champs peuvent être identiques, mais le N° OR doit être unique)
       const existingVehicles = await fetchDatabaseFluxData().catch(() => []);
-      const orConflict = existingVehicles.some((v) => {
-        const vNo = String(v.no || v.ordre || (v as unknown as { numeroOR?: string }).numeroOR || "").trim();
-        return vNo.toLowerCase() === cleanNoOr.toLowerCase();
+      const normalizedOr = cleanNoOr.replace(/\s+/g, "").toUpperCase();
+      const existingOr = existingVehicles.find((v) => {
+        const vNo = String(v.no || v.ordre || (v as unknown as { numeroOR?: string }).numeroOR || "")
+          .replace(/\s+/g, "")
+          .toUpperCase();
+        return vNo === normalizedOr;
       });
-      if (orConflict) {
-        setError(`Le N° OR « ${cleanNoOr} » existe déjà. Un nouvel Ordre de Réparation doit obligatoirement avoir un numéro unique.`);
+      if (existingOr) {
+        // Le tableau Réception peut avoir été chargé juste avant cette vérification.
+        // Demander un rechargement immédiat afin que l'OR déjà existant soit visible.
+        window.dispatchEvent(new CustomEvent("flux_refresh_requested"));
+        setError(`Le N° OR « ${cleanNoOr} » existe déjà. Le tableau a été actualisé : recherchez ce dossier existant au lieu d'en créer un second.`);
         setLoading(false);
         return;
       }

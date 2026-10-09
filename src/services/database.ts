@@ -4,7 +4,7 @@ import {
   type WorkshopStatus,
 } from "../data/mockData";
 
-import { FULL_PARKING_EMPLACEMENT, calculerEmplacementAutomatique } from "./emplacementService";
+import { FULL_PARKING_EMPLACEMENT } from "./emplacementService";
 import { getWorkshopNow } from "./workshopTime";
 
 export const DELIVERED_EMPLACEMENT = "Livraison au client";
@@ -2705,10 +2705,7 @@ export function registerPendingAddedVehicle(entree: {
     equipe1: equipeName,
     avancement: "-",
     avancement1: "-",
-    emplacement: calculerEmplacementAutomatique(
-      { statut: "Attente Réparation", etatIntervention: "Attente Réparation", equipe: equipeName },
-      []
-    ),
+    emplacement: "NA",
     bloc: 1,
     nbIntervention: 1,
     montant: 0,
@@ -2810,20 +2807,11 @@ export async function ajouterNouvelleEntree(entree: {
   })();
 
   const equipeName = (entree.equipe || "Daily").trim();
-  let autoEmp = (entree.emplacement && entree.emplacement !== "-" && entree.emplacement !== "NA")
+  // Une nouvelle entrée n'occupe aucune place du plan avant une décision
+  // manuelle explicite de l'utilisateur.
+  const autoEmp = (entree.emplacement && entree.emplacement !== "-")
     ? entree.emplacement
-    : "";
-  if (!autoEmp) {
-    try {
-      const allVehicles = await fetchDatabaseFluxData();
-      autoEmp = calculerEmplacementAutomatique(
-        { statut: "Attente Réparation", etatIntervention: "Attente Réparation", equipe: equipeName },
-        allVehicles
-      );
-    } catch {
-      autoEmp = "P1";
-    }
-  }
+    : "NA";
 
   await callDatabaseAction(entree.historique ? "ajouterEntreeHistorique" : "ajouterEntree", {
       ...entree,
@@ -2997,7 +2985,7 @@ export interface ModifierEntreePayload {
   id?: string | number;
   recordKey?: string;
   noOr: string; cs: string; chassis: string; codeClient?: string; nomClient?: string; dateEntreeHeure?: string;
-  marque?: string; modele?: string; categorie?: string; etat?: string; equipe?: string; emplacement?: string;
+  marque?: string; modele?: string; categorie?: string; commentaireAtelier?: string; etat?: string; equipe?: string; emplacement?: string;
   rowSuivi?: number; rowNumber?: number; origNo?: string; origCs?: string; origChassis?: string;
 }
 

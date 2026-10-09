@@ -10,6 +10,8 @@ export default defineConfig({
     host: '0.0.0.0',
     port: 5174,
     strictPort: true,
+    // Autorise les URL temporaires Cloudflare Tunnel (ex. *.trycloudflare.com).
+    allowedHosts: ['.trycloudflare.com'],
     proxy: {
       '/api': {
         target: 'http://127.0.0.1:3001',

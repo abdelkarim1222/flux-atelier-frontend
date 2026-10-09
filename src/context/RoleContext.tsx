@@ -66,7 +66,9 @@ export const ROLES_META: Record<RoleType, RoleInfo> = {
       canViewAll: false,
       canEditChargement: false,
       canAddEntree: true,
-      canEditEmplacement: false,
+      // Le positionnement est partagé : la réception doit pouvoir signaler la
+      // place réelle d'un véhicule depuis un téléphone comme depuis un PC.
+      canEditEmplacement: true,
       canEditEtat: false,
       canEditAvancement: false,  // Réception ne peut pas modifier l'avancement atelier
       canViewMap: true,          // Accessible à tous les rôles
@@ -114,7 +116,9 @@ export const ROLES_META: Record<RoleType, RoleInfo> = {
       canViewAll: false,
       canEditChargement: false,
       canAddEntree: false,
-      canEditEmplacement: false,
+      // Même règle que pour les autres utilisateurs connectés : la place
+      // réelle peut être mise à jour directement sur le plan.
+      canEditEmplacement: true,
       canEditEtat: false,
       canEditAvancement: false,
       canViewMap: true,          // Accessible à tous les rôles
@@ -138,7 +142,9 @@ export const ROLES_META: Record<RoleType, RoleInfo> = {
       canViewAll: false,
       canEditChargement: false,
       canAddEntree: true, // Ouvre des ORs comme réception
-      canEditEmplacement: false,
+      // Le serveur autorise le changement d'emplacement à tout utilisateur
+      // connecté ; ne pas bloquer cette action uniquement dans l'interface.
+      canEditEmplacement: true,
       canEditEtat: false,
       canEditAvancement: false,
       canViewMap: true,

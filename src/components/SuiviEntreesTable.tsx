@@ -26,6 +26,7 @@ import {
   Eye,
   RotateCcw,
   Send,
+  ChevronDown,
 } from "lucide-react";
 import {
   fetchSuiviEntreesData,
@@ -48,7 +49,7 @@ import ModifierEntreeModal from "./ModifierEntreeModal";
 import ConfirmationSuppressionModal from "./ConfirmationSuppressionModal";
 import DetailVehiculeModal from "./DetailVehiculeModal";
 import { recordVehicleModification } from "../services/timeTracking";
-import { isCompletedWarrantyVehicle } from "../services/warranty";
+import { isWarrantyVehicle } from "../services/warranty";
 
 export interface SuiviEntreesTableProps {
   onNavigateToMap?: (emplacement: string) => void;
@@ -100,6 +101,7 @@ export interface UnifiedReceptionRow {
   retourVehicule?: boolean;
   statutRetour?: string;
   descriptionRetour?: string;
+  commentaireAtelier?: string;
   dateRetour?: string;
 }
 
@@ -117,6 +119,28 @@ type SortField =
   | "emplacement";
 
 type SortDirection = "asc" | "desc";
+
+type ColumnFilterField = "noOr" | "dateEntreeHeure" | "cs" | "chassis" | "immatriculation" | "modele" | "nomClient" | "etat" | "equipe" | "matricule" | "avancement" | "dateFinRep" | "emplacement" | "description";
+
+function getColumnFilterValue(item: UnifiedReceptionRow, field: ColumnFilterField): string {
+  const values: Record<ColumnFilterField, string | undefined> = {
+    noOr: item.noOr,
+    dateEntreeHeure: item.dateEntreeHeure,
+    cs: item.cs,
+    chassis: item.chassis,
+    immatriculation: item.immatriculation,
+    modele: item.modele,
+    nomClient: item.nomClient,
+    etat: item.etat,
+    equipe: item.equipe,
+    matricule: item.matricule,
+    avancement: item.avancement,
+    dateFinRep: item.dateFinRep,
+    emplacement: item.emplacement,
+    description: item.commentaireAtelier || item.descriptionRetour,
+  };
+  return String(values[field] || "Non renseigné").trim() || "Non renseigné";
+}
 
 function normalizeKey(value?: string): string {
   return (value || "")
@@ -271,6 +295,7 @@ export default function SuiviEntreesTable({ onNavigateToMap, initialNotice }: Su
   const [search, setSearch] = useState("");
   const [selectedEquipe, setSelectedEquipe] = useState<string>("Toutes");
   const [selectedEtat, setSelectedEtat] = useState<string>("Tous");
+  const [columnFilters, setColumnFilters] = useState<Partial<Record<ColumnFilterField, Set<string>>>>({});
   const [selectedRowIds, setSelectedRowIds] = useState<Set<string>>(new Set());
   const [isModalOpen, setIsModalOpen] = useState(false);
   const [isHistoricalModalOpen, setIsHistoricalModalOpen] = useState(false);
@@ -642,6 +667,7 @@ export default function SuiviEntreesTable({ onNavigateToMap, initialNotice }: Su
           retourVehicule: Boolean((s as any).retourVehicule || (f as any)?.retourVehicule),
           statutRetour: (s as any).statutRetour || (f as any)?.statutRetour,
           descriptionRetour: (s as any).descriptionRetour || (f as any)?.descriptionRetour,
+          commentaireAtelier: (s as any).commentaireAtelier || (f as any)?.commentaireAtelier || '',
           dateRetour: (s as any).dateRetour || (f as any)?.dateRetour,
         };
       });
@@ -705,13 +731,14 @@ export default function SuiviEntreesTable({ onNavigateToMap, initialNotice }: Su
           retourVehicule: Boolean((f as any).retourVehicule),
           statutRetour: (f as any).statutRetour,
           descriptionRetour: (f as any).descriptionRetour,
+          commentaireAtelier: (f as any).commentaireAtelier || '',
           dateRetour: (f as any).dateRetour,
         });
       });
 
-      // Les OR de garantie dont les travaux sont terminés poursuivent leur
-      // traitement uniquement dans le Tableau de Suivi Garantie.
-      setItems(merged.filter((item) => !isCompletedWarrantyVehicle({
+      // Tous les OR R10 sont gérés exclusivement dans le Tableau de Suivi
+      // Garantie, qu'ils soient en cours ou terminés.
+      setItems(merged.filter((item) => !isWarrantyVehicle({
         cs: item.cs,
         isGarantie: item.isGarantie,
         typeDossier: item.typeDossier,
@@ -831,16 +858,11 @@ export default function SuiviEntreesTable({ onNavigateToMap, initialNotice }: Su
     }
   };
 
-  // Action: Changer l'Emplacement (autorisé quand AVANCEMENT = Terminer)
+  // Action: Changer l'Emplacement (choix manuel, quel que soit l'avancement)
   const handleUpdateEmplacement = async (
     item: UnifiedReceptionRow,
     nextEmplacement: string
   ) => {
-    if (!isAvancementTermine(item.avancement)) {
-      setNotice("Modification impossible : les réparations ne sont pas terminées.");
-      return;
-    }
-
     if (!nextEmplacement || nextEmplacement === item.emplacement) return;
 
     const normalizedTarget = normalizeEmplacementCode(nextEmplacement);
@@ -853,11 +875,6 @@ export default function SuiviEntreesTable({ onNavigateToMap, initialNotice }: Su
           return !`${row.etat} ${row.avancement}`.toLowerCase().includes("livr");
         })
       : undefined;
-    if (occupiedBy) {
-      setNotice(`Emplacement ${nextEmplacement} indisponible : il est déjà occupé par le dossier ${occupiedBy.noOr || occupiedBy.chassis}.`);
-      return;
-    }
-
     const previousEmplacement = item.emplacement;
     setSavingRowId(item.id);
     setNotice(null);
@@ -865,15 +882,20 @@ export default function SuiviEntreesTable({ onNavigateToMap, initialNotice }: Su
     // Optimistic UI update
     setItems((current) =>
       current.map((row) =>
-        row.id === item.id ? { ...row, emplacement: nextEmplacement } : row
+        row.id === item.id
+          ? { ...row, emplacement: nextEmplacement }
+          : occupiedBy && row.id === occupiedBy.id
+            ? { ...row, emplacement: previousEmplacement }
+            : row
       )
     );
 
     try {
       if (isDatabaseWriteConfigured()) {
         await updateReceptionRowEmplacement(item, nextEmplacement);
-        setNotice(
-          `Emplacement ${item.noOr} mis à jour : ${previousEmplacement} -> ${nextEmplacement}.`
+        setNotice(occupiedBy
+          ? `Emplacements échangés : ${item.noOr} → ${nextEmplacement}, ${occupiedBy.noOr || occupiedBy.chassis} → ${previousEmplacement}.`
+          : `Emplacement ${item.noOr} mis à jour : ${previousEmplacement} → ${nextEmplacement}.`
         );
       } else {
         setNotice(
@@ -889,7 +911,11 @@ export default function SuiviEntreesTable({ onNavigateToMap, initialNotice }: Su
       // Revert on error
       setItems((current) =>
         current.map((row) =>
-          row.id === item.id ? { ...row, emplacement: previousEmplacement } : row
+          row.id === item.id
+            ? { ...row, emplacement: previousEmplacement }
+            : occupiedBy && row.id === occupiedBy.id
+              ? { ...row, emplacement: nextEmplacement }
+              : row
         )
       );
       setNotice(
@@ -999,6 +1025,10 @@ export default function SuiviEntreesTable({ onNavigateToMap, initialNotice }: Su
         selectedEtat === "Tous" || item.etat.trim() === selectedEtat;
 
       if (!matchesEquipe || !matchesEtat) return false;
+      const matchesColumnFilters = (Object.entries(columnFilters) as Array<[ColumnFilterField, Set<string> | undefined]>).every(
+        ([field, selected]) => !selected?.size || selected.has(getColumnFilterValue(item, field))
+      );
+      if (!matchesColumnFilters) return false;
       if (!q) return true;
 
       const haystack = [
@@ -1018,6 +1048,8 @@ export default function SuiviEntreesTable({ onNavigateToMap, initialNotice }: Su
         item.emplacement,
         item.marque,
         item.modele,
+        item.commentaireAtelier,
+        item.descriptionRetour,
       ]
         .join(" ")
         .toLowerCase();
@@ -1107,11 +1139,76 @@ export default function SuiviEntreesTable({ onNavigateToMap, initialNotice }: Su
     search,
     selectedEquipe,
     selectedEtat,
+    columnFilters,
     assignedReceptionCs,
     sortField,
     sortDirection,
     role,
   ]);
+
+  const columnFilterOptions = useMemo(() => {
+    const fields: Array<{ field: ColumnFilterField; label: string }> = [
+      { field: "noOr", label: "N° OR" }, { field: "dateEntreeHeure", label: "Date entrée" },
+      { field: "cs", label: "CS" }, { field: "chassis", label: "N° châssis" },
+      { field: "immatriculation", label: "Immatriculation" },
+      { field: "modele", label: "Modèle" }, { field: "nomClient", label: "Client" },
+      { field: "etat", label: "État" }, { field: "equipe", label: "Équipe" },
+      { field: "matricule", label: "Matricule" }, { field: "avancement", label: "Avancement" },
+      { field: "dateFinRep", label: "Date fin rép." }, { field: "emplacement", label: "Emplacement" },
+      { field: "description", label: "Description" },
+    ];
+    return fields.map(({ field, label }) => ({
+      field,
+      label,
+      values: Array.from(new Set(items.map((item) => getColumnFilterValue(item, field)))).sort((a, b) => a.localeCompare(b, "fr")),
+    }));
+  }, [items]);
+
+  const toggleColumnFilterValue = (field: ColumnFilterField, value: string) => {
+    setColumnFilters((current) => {
+      const next = new Set(current[field] || []);
+      if (next.has(value)) next.delete(value); else next.add(value);
+      return { ...current, [field]: next };
+    });
+  };
+
+  const renderHeaderFilter = (field: ColumnFilterField) => {
+    const option = columnFilterOptions.find((item) => item.field === field);
+    if (!option) return null;
+    const selected = columnFilters[field] || new Set<string>();
+
+    return (
+      <details className="relative shrink-0" onClick={(event) => event.stopPropagation()}>
+        <summary
+          className={`list-none cursor-pointer rounded p-0.5 transition-colors ${selected.size ? "bg-emerald-200 text-emerald-900" : "text-slate-400 hover:bg-slate-200 hover:text-slate-700"}`}
+          title={`Filtrer la colonne ${option.label}`}
+          aria-label={`Filtrer la colonne ${option.label}`}
+        >
+          <ChevronDown className="w-3.5 h-3.5" />
+        </summary>
+        <div className="absolute z-40 top-6 left-0 w-60 max-h-64 overflow-y-auto p-2 rounded-lg border border-slate-200 bg-white shadow-xl normal-case tracking-normal">
+          <div className="flex items-center justify-between gap-2 pb-1.5 mb-1.5 border-b border-slate-100">
+            <span className="text-[10px] font-bold text-slate-500">Filtrer {option.label}</span>
+            {selected.size > 0 && (
+              <button
+                type="button"
+                onClick={() => setColumnFilters((current) => ({ ...current, [field]: new Set() }))}
+                className="text-[10px] font-bold text-emerald-700 hover:underline"
+              >
+                Effacer
+              </button>
+            )}
+          </div>
+          {option.values.map((value) => (
+            <label key={value} className="flex items-center gap-2 px-1 py-1 text-[11px] font-medium text-slate-700 hover:bg-slate-50 cursor-pointer">
+              <input type="checkbox" checked={selected.has(value)} onChange={() => toggleColumnFilterValue(field, value)} className="accent-emerald-600" />
+              <span className="truncate" title={value}>{value}</span>
+            </label>
+          ))}
+        </div>
+      </details>
+    );
+  };
 
   const allFilteredRowsSelected = filteredData.length > 0 && filteredData.every((item) => selectedRowIds.has(item.id));
 
@@ -1585,138 +1682,157 @@ export default function SuiviEntreesTable({ onNavigateToMap, initialNotice }: Su
                 {/* 1. N° OR */}
                 <th
                   onClick={() => handleSort("noOr")}
-                  className="py-3 px-3.5 whitespace-nowrap cursor-pointer hover:bg-slate-200/60 transition-colors group"
+                  className="relative py-3 px-3.5 whitespace-nowrap cursor-pointer hover:bg-slate-200/60 transition-colors group"
                   title="Cliquez pour trier par N° OR"
                 >
                   <div className="flex items-center gap-1.5">
                     <span>N° OR</span>
                     {renderSortIndicator("noOr")}
+                    {renderHeaderFilter("noOr")}
                   </div>
                 </th>
 
                 {/* 2. Date Entrée & Heure */}
                 <th
                   onClick={() => handleSort("dateEntreeHeure")}
-                  className="py-3 px-3.5 whitespace-nowrap cursor-pointer hover:bg-slate-200/60 transition-colors group"
+                  className="relative py-3 px-3.5 whitespace-nowrap cursor-pointer hover:bg-slate-200/60 transition-colors group"
                   title="Cliquez pour trier par Date Entrée & Heure (nouveaux au sommet)"
                 >
                   <div className="flex items-center gap-1.5 text-emerald-800 font-extrabold">
                     <span>Date Entrée & Heure</span>
                     {renderSortIndicator("dateEntreeHeure")}
+                    {renderHeaderFilter("dateEntreeHeure")}
                   </div>
                 </th>
 
                 {/* 3. CS */}
-                <th className="py-3 px-3 whitespace-nowrap">CS</th>
+                <th className="relative py-3 px-3 whitespace-nowrap">
+                  <div className="flex items-center gap-1.5">CS {renderHeaderFilter("cs")}</div>
+                </th>
 
                 {/* 4. N° Châssis */}
-                <th className="py-3 px-3.5 whitespace-nowrap">N° Châssis</th>
+                <th className="relative py-3 px-3.5 whitespace-nowrap">
+                  <div className="flex items-center gap-1.5">N° Châssis {renderHeaderFilter("chassis")}</div>
+                </th>
 
                 {/* 4b. N° Immatriculation */}
                 <th
                   onClick={() => handleSort("immatriculation")}
-                  className="py-3 px-3.5 whitespace-nowrap cursor-pointer hover:bg-slate-200/60 transition-colors group"
+                  className="relative py-3 px-3.5 whitespace-nowrap cursor-pointer hover:bg-slate-200/60 transition-colors group"
                   title="Cliquez pour trier par N° Immatriculation"
                 >
                   <div className="flex items-center gap-1.5">
                     <span>N° Immatriculation</span>
                     {renderSortIndicator("immatriculation")}
+                    {renderHeaderFilter("immatriculation")}
                   </div>
                 </th>
 
                 {/* 5. Modèle */}
                 <th
                   onClick={() => handleSort("modele")}
-                  className="py-3 px-3.5 whitespace-nowrap cursor-pointer hover:bg-slate-200/60 transition-colors group"
+                  className="relative py-3 px-3.5 whitespace-nowrap cursor-pointer hover:bg-slate-200/60 transition-colors group"
                   title="Cliquez pour trier par Modèle"
                 >
                   <div className="flex items-center gap-1.5">
                     <span>Modèle</span>
                     {renderSortIndicator("modele")}
+                    {renderHeaderFilter("modele")}
                   </div>
                 </th>
 
                 {/* 6. Client */}
                 <th
                   onClick={() => handleSort("nomClient")}
-                  className="py-3 px-4 min-w-[190px] cursor-pointer hover:bg-slate-200/60 transition-colors group"
+                  className="relative py-3 px-4 min-w-[190px] cursor-pointer hover:bg-slate-200/60 transition-colors group"
                   title="Cliquez pour trier par Client"
                 >
                   <div className="flex items-center gap-1.5">
                     <span>Client</span>
                     {renderSortIndicator("nomClient")}
+                    {renderHeaderFilter("nomClient")}
                   </div>
+                </th>
+
+                <th className="relative py-3 px-3.5 min-w-[180px] whitespace-nowrap">
+                  <div className="flex items-center gap-1.5">Description {renderHeaderFilter("description")}</div>
                 </th>
 
                 {/* 7. État (Modifiable si Avancement = Terminer) */}
                 <th
                   onClick={() => handleSort("etat")}
-                  className="py-3 px-3.5 whitespace-nowrap cursor-pointer hover:bg-slate-200/60 transition-colors group"
+                  className="relative py-3 px-3.5 whitespace-nowrap cursor-pointer hover:bg-slate-200/60 transition-colors group"
                   title="État du véhicule (modifiable si Avancement = Terminer)"
                 >
                   <div className="flex items-center gap-1.5">
                     <span>État</span>
                     {renderSortIndicator("etat")}
+                    {renderHeaderFilter("etat")}
                   </div>
                 </th>
 
                 {/* 8. EQUIPE */}
                 <th
                   onClick={() => handleSort("equipe")}
-                  className="py-3 px-3.5 whitespace-nowrap cursor-pointer hover:bg-slate-200/60 transition-colors group"
+                  className="relative py-3 px-3.5 whitespace-nowrap cursor-pointer hover:bg-slate-200/60 transition-colors group"
                   title="Cliquez pour trier par Équipe"
                 >
                   <div className="flex items-center gap-1.5">
                     <span>Équipe</span>
                     {renderSortIndicator("equipe")}
+                    {renderHeaderFilter("equipe")}
                   </div>
                 </th>
 
                 {/* 9. N° Matricule */}
                 <th
                   onClick={() => handleSort("matricule")}
-                  className="py-3 px-3.5 whitespace-nowrap cursor-pointer hover:bg-slate-200/60 transition-colors group"
+                  className="relative py-3 px-3.5 whitespace-nowrap cursor-pointer hover:bg-slate-200/60 transition-colors group"
                   title="Cliquez pour trier par N° Matricule"
                 >
                   <div className="flex items-center gap-1.5">
                     <span>N° Matricule</span>
                     {renderSortIndicator("matricule")}
+                    {renderHeaderFilter("matricule")}
                   </div>
                 </th>
 
                 {/* 10. AVANCEMENT */}
                 <th
                   onClick={() => handleSort("avancement")}
-                  className="py-3 px-3.5 min-w-[140px] cursor-pointer hover:bg-slate-200/60 transition-colors group"
+                  className="relative py-3 px-3.5 min-w-[140px] cursor-pointer hover:bg-slate-200/60 transition-colors group"
                   title="Cliquez pour trier par Avancement %"
                 >
                   <div className="flex items-center gap-1.5">
                     <span>Avancement</span>
                     {renderSortIndicator("avancement")}
+                    {renderHeaderFilter("avancement")}
                   </div>
                 </th>
 
                 {/* 11. Date Fin Rép. */}
                 <th
                   onClick={() => handleSort("dateFinRep")}
-                  className="py-3 px-3.5 whitespace-nowrap cursor-pointer hover:bg-slate-200/60 transition-colors group"
+                  className="relative py-3 px-3.5 whitespace-nowrap cursor-pointer hover:bg-slate-200/60 transition-colors group"
                   title="Cliquez pour trier par Date Fin"
                 >
                   <div className="flex items-center gap-1.5">
                     <span>Date Fin Rép.</span>
                     {renderSortIndicator("dateFinRep")}
+                    {renderHeaderFilter("dateFinRep")}
                   </div>
                 </th>
 
                 {/* 12. Emplacement (Modifiable si Avancement = Terminer) */}
                 <th
                   onClick={() => handleSort("emplacement")}
-                  className="py-3 px-3.5 whitespace-nowrap cursor-pointer hover:bg-slate-200/60 transition-colors group"
+                  className="relative py-3 px-3.5 whitespace-nowrap cursor-pointer hover:bg-slate-200/60 transition-colors group"
                   title="Emplacement atelier (modifiable si Avancement = Terminer)"
                 >
                   <div className="flex items-center gap-1.5">
                     <span>Emplacement</span>
                     {renderSortIndicator("emplacement")}
+                    {renderHeaderFilter("emplacement")}
                   </div>
                 </th>
 
@@ -1731,7 +1847,7 @@ export default function SuiviEntreesTable({ onNavigateToMap, initialNotice }: Su
             <tbody className="divide-y divide-slate-100">
               {loading && items.length === 0 ? (
                 <tr>
-                  <td colSpan={canManageActions ? 15 : 14} className="py-16 text-center text-slate-400">
+                  <td colSpan={canManageActions ? 16 : 15} className="py-16 text-center text-slate-400">
                     <div className="flex flex-col items-center justify-center gap-2.5">
                       <RefreshCcw className="w-7 h-7 animate-spin text-emerald-600" />
                       <p className="font-semibold text-slate-700 text-sm">
@@ -1745,24 +1861,25 @@ export default function SuiviEntreesTable({ onNavigateToMap, initialNotice }: Su
                 </tr>
               ) : filteredData.length === 0 ? (
                 <tr>
-                  <td colSpan={canManageActions ? 15 : 14} className="py-16 text-center text-slate-400">
+                  <td colSpan={canManageActions ? 16 : 15} className="py-16 text-center text-slate-400">
                     <div className="flex flex-col items-center justify-center gap-2">
                       <Car className="w-9 h-9 text-slate-300" />
                       <p className="font-bold text-slate-700 text-sm">
                         Aucun dossier trouvé
                       </p>
                       <p className="text-xs text-slate-400 max-w-sm">
-                        {search || selectedEquipe !== "Toutes" || selectedEtat !== "Tous"
+                        {search || selectedEquipe !== "Toutes" || selectedEtat !== "Tous" || Object.values(columnFilters).some((values) => values?.size)
                           ? "Aucun résultat ne correspond à vos filtres. Essayez de réinitialiser la recherche."
                           : "La base de données est actuellement vide."}
                       </p>
-                      {(search || selectedEquipe !== "Toutes" || selectedEtat !== "Tous") && (
+                      {(search || selectedEquipe !== "Toutes" || selectedEtat !== "Tous" || Object.values(columnFilters).some((values) => values?.size)) && (
                         <button
                           type="button"
                           onClick={() => {
                             setSearch("");
                             setSelectedEquipe("Toutes");
                             setSelectedEtat("Tous");
+                            setColumnFilters({});
                             setSortField("dateEntreeHeure");
                             setSortDirection("desc");
                           }}
@@ -1794,11 +1911,21 @@ export default function SuiviEntreesTable({ onNavigateToMap, initialNotice }: Su
                     const isDelivered = isVehiculeLivre(item);
                     const isReturnAwaitingReception = item.statutRetour === "a_receptionner" ||
                       String(item.etat || "").toLowerCase().includes("à réceptionner");
-                    // Att Facture autorise la livraison : le règlement final
-                    // intervient ensuite, à la fin du mois.
+                    // Dès qu'un mode de paiement est enregistré par la
+                    // Facturation (y compris « Att Facture »), le dossier est
+                    // prêt à être remis au client.
                     const hasFacturation = ["Facture", "Bon de commande", "Att Facture", "Attente Facture", "Édition fin de travaux"].includes(item.modePaiement || "");
-                    const canEditEmplacement =
-                      (permissions.canEditEmplacement || permissions.canViewAll) && isTermine;
+                    // L'emplacement est un choix manuel disponible à tous les
+                    // utilisateurs ayant accès au suivi (sauf dossier livré).
+                    const canEditEmplacement = !isDelivered;
+                    const isAvailableEmplacement = (emplacement: string) => {
+                      const target = normalizeEmplacementCode(emplacement);
+                      return !items.some((row) =>
+                        row.id !== item.id &&
+                        !isVehiculeLivre(row) &&
+                        normalizeEmplacementCode(row.emplacement) === target
+                      );
+                    };
 
                   return (
                     <tr
@@ -1912,6 +2039,20 @@ export default function SuiviEntreesTable({ onNavigateToMap, initialNotice }: Su
                         </div>
                       </td>
 
+                      {/* Description / commentaire atelier */}
+                      <td className="py-3 px-3.5 max-w-[260px]">
+                        {item.commentaireAtelier || item.descriptionRetour ? (
+                          <p
+                            className="text-[11px] leading-snug text-slate-700 line-clamp-3"
+                            title={item.commentaireAtelier || item.descriptionRetour}
+                          >
+                            {item.commentaireAtelier || item.descriptionRetour}
+                          </p>
+                        ) : (
+                          <span className="text-slate-300 italic text-[11px]">-</span>
+                        )}
+                      </td>
+
                       {/* 6. État : Débloqué quand AVANCEMENT = Terminer */}
                       <td
                         onClick={(e) => e.stopPropagation()}
@@ -1960,7 +2101,7 @@ export default function SuiviEntreesTable({ onNavigateToMap, initialNotice }: Su
                           </div>
                         ) : isTermine ? (
                           <div className="flex flex-col gap-1 items-start">
-                            {/* Ligne 1 : Badge Attente Client + Bouton Livrer vert (conforme à l'image) */}
+                            {/* Terminé → Att Facture ; Facturé → À livrer. */}
                             <div className="flex items-center gap-1.5 flex-wrap">
                               <span
                                 className={`inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-bold border ${getEtatBadge(
@@ -1974,18 +2115,18 @@ export default function SuiviEntreesTable({ onNavigateToMap, initialNotice }: Su
                                   type="button"
                                   onClick={() => handleConfirmLivraisonDirect(item)}
                                   className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-semibold text-slate-900 bg-emerald-600 hover:bg-emerald-700 hover:text-white active:scale-95 shadow-2xs transition-all cursor-pointer"
-                                  title={`Facturation validée (${item.modePaiement || "Facture"}). Cliquer pour confirmer et mettre Livré au client.`}
+                                  title={`Facturation validée (${item.modePaiement || "Facture"}). Cliquer pour confirmer la livraison au client.`}
                                 >
                                   <CheckCircle2 className="w-3.5 h-3.5 text-slate-900" />
-                                  <span>Livrer</span>
+                                  <span>À livrer</span>
                                 </button>
                               ) : role === "reception" ? (
                                 <span
                                   className="inline-flex items-center gap-1 px-2.5 py-0.5 text-xs font-bold text-amber-800 bg-amber-50 border border-amber-300 rounded-full shadow-2xs"
-                                  title="Travaux terminés en atelier. En attente de validation du mode de paiement par la Facturation."
+                                  title="Travaux terminés en atelier. En attente de facturation."
                                 >
                                   <Clock className="w-3.5 h-3.5 text-amber-600" />
-                                  <span>Attente Facturation</span>
+                                  <span>Att Facture</span>
                                 </span>
                               ) : (
                                 <button
@@ -1993,11 +2134,11 @@ export default function SuiviEntreesTable({ onNavigateToMap, initialNotice }: Su
                                   onClick={() =>
                                     setPaiementModal({ item, mode: item.modePaiement || "Facture" })
                                   }
-                                  className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-semibold text-slate-900 bg-emerald-600 hover:bg-emerald-700 hover:text-white active:scale-95 shadow-2xs transition-all cursor-pointer"
-                                  title="Choisir le mode de paiement et passer à Livré (Direction)"
+                                  className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-semibold text-amber-900 bg-amber-100 border border-amber-300 hover:bg-amber-200 active:scale-95 shadow-2xs transition-all cursor-pointer"
+                                  title="Travaux terminés : choisir le mode de facturation"
                                 >
                                   <CheckCircle2 className="w-3.5 h-3.5 text-slate-900" />
-                                  <span>Livrer</span>
+                                  <span>Att Facture</span>
                                 </button>
                               )}
                             </div>
@@ -2183,63 +2324,63 @@ export default function SuiviEntreesTable({ onNavigateToMap, initialNotice }: Su
                                 ⛔ Place complet
                               </option>
                               <optgroup label="Zone D — Daily1 / Daily2">
-                                {EMPLACEMENT_ZONES.DAILY.map((z) => (
+                                {EMPLACEMENT_ZONES.DAILY.filter(isAvailableEmplacement).map((z) => (
                                   <option key={z} value={z}>
                                     Zone {z}
                                   </option>
                                 ))}
                               </optgroup>
                               <optgroup label="Zone J — Changan / JMC">
-                                {EMPLACEMENT_ZONES.CHANGAN.map((z) => (
+                                {EMPLACEMENT_ZONES.CHANGAN.filter(isAvailableEmplacement).map((z) => (
                                   <option key={z} value={z}>
                                     Zone {z}
                                   </option>
                                 ))}
                               </optgroup>
                               <optgroup label="Zone E — Électrique">
-                                {EMPLACEMENT_ZONES.ELECTRIQUE.map((z) => (
+                                {EMPLACEMENT_ZONES.ELECTRIQUE.filter(isAvailableEmplacement).map((z) => (
                                   <option key={z} value={z}>
                                     Zone {z}
                                   </option>
                                 ))}
                               </optgroup>
                               <optgroup label="Zone S — Service Rapide">
-                                {EMPLACEMENT_ZONES.SERVICE_RAPIDE.map((z) => (
+                                {EMPLACEMENT_ZONES.SERVICE_RAPIDE.filter(isAvailableEmplacement).map((z) => (
                                   <option key={z} value={z}>
                                     Zone {z}
                                   </option>
                                 ))}
                               </optgroup>
                               <optgroup label="Zone C — Carrosserie">
-                                {EMPLACEMENT_ZONES.CARROSSERIE.map((z) => (
+                                {EMPLACEMENT_ZONES.CARROSSERIE.filter(isAvailableEmplacement).map((z) => (
                                   <option key={z} value={z}>
                                     Zone {z}
                                   </option>
                                 ))}
                               </optgroup>
                               <optgroup label="Zone T — Lourd (Postes T)">
-                                {EMPLACEMENT_ZONES.LOURD_T.map((z) => (
+                                {EMPLACEMENT_ZONES.LOURD_T.filter(isAvailableEmplacement).map((z) => (
                                   <option key={z} value={z}>
                                     Zone {z}
                                   </option>
                                 ))}
                               </optgroup>
                               <optgroup label="Zone M — Lourd (Postes M)">
-                                {EMPLACEMENT_ZONES.LOURD_M.map((z) => (
+                                {EMPLACEMENT_ZONES.LOURD_M.filter(isAvailableEmplacement).map((z) => (
                                   <option key={z} value={z}>
                                     Zone {z}
                                   </option>
                                 ))}
                               </optgroup>
                               <optgroup label="Zone L — Attente Client">
-                                {EMPLACEMENT_ZONES.ATTENTE_CLIENT_L.map((z) => (
+                                {EMPLACEMENT_ZONES.ATTENTE_CLIENT_L.filter(isAvailableEmplacement).map((z) => (
                                   <option key={z} value={z}>
                                     Zone {z}
                                   </option>
                                 ))}
                               </optgroup>
                               <optgroup label="Zone P — Parking général">
-                                {EMPLACEMENT_ZONES.PARKING_P.map((z) => (
+                                {EMPLACEMENT_ZONES.PARKING_P.filter(isAvailableEmplacement).map((z) => (
                                   <option key={z} value={z}>
                                     Parking {z}
                                   </option>

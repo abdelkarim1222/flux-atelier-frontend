@@ -1207,7 +1207,8 @@ button {
   gap: 4px;
 }
 
-.emplacement-editor input {
+.emplacement-editor input,
+.emplacement-editor select {
   width: 100%;
   min-width: 0;
   height: 24px;
@@ -1232,13 +1233,15 @@ button {
     background 150ms ease;
 }
 
-.emplacement-editor input:focus {
+.emplacement-editor input:focus,
+.emplacement-editor select:focus {
   border-color: #ff6b35;
   background: #ffffff;
   box-shadow: 0 0 0 2px rgba(255, 107, 53, 0.14);
 }
 
-.emplacement-editor input:disabled {
+.emplacement-editor input:disabled,
+.emplacement-editor select:disabled {
   background: #f5f2ee;
   opacity: 0.65;
 }
@@ -1438,6 +1441,18 @@ button {
 }
 
 @media (max-width: 640px) {
+  /* La modification est enregistrée dès le choix. Le sélecteur reste assez
+     grand pour être utilisé avec le doigt sur un écran étroit. */
+  .emplacement-editor select {
+    min-height: 44px;
+    font-size: 13px;
+  }
+
+  .emplacement-save {
+    width: 44px;
+    height: 44px;
+  }
+
   .monitor-topbar {
     align-items: flex-start;
   }

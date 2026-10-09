@@ -261,6 +261,8 @@ async function importVehicleWorkbook(req, res) {
   let transactionStarted = false;
   let inputRows = 0;
   let addedRows = 0;
+  let updatedRows = 0;
+  let unchangedRows = 0;
   let duplicateVinRows = 0;
   let missingVinRows = 0;
   const seenVinsInFile = new Set();
@@ -295,15 +297,37 @@ async function importVehicleWorkbook(req, res) {
       return `(${columns.map((_, columnIndex) => `$${start + columnIndex + 1}${columnIndex === width - 1 ? '::jsonb' : ''}`).join(', ')})`;
     });
 
-    const inserted = await client.query(
+    const synchronized = await client.query(
       `INSERT INTO vehicle_inventory (${columns.join(', ')})
        VALUES ${valueGroups.join(', ')}
-       ON CONFLICT (vin_key) WHERE vin_key IS NOT NULL DO NOTHING
-       RETURNING source_row`,
+       ON CONFLICT (vin_key) WHERE vin_key IS NOT NULL DO UPDATE SET
+         serial_no = EXCLUDED.serial_no,
+         vin = EXCLUDED.vin,
+         brand_code = EXCLUDED.brand_code,
+         model_code = EXCLUDED.model_code,
+         model_description = EXCLUDED.model_description,
+         registration = EXCLUDED.registration,
+         stock_status = EXCLUDED.stock_status,
+         warehouse_code = EXCLUDED.warehouse_code,
+         location_code = EXCLUDED.location_code,
+         customer_code = EXCLUDED.customer_code,
+         customer_name = EXCLUDED.customer_name,
+         raw_data = EXCLUDED.raw_data
+       WHERE (vehicle_inventory.serial_no, vehicle_inventory.vin, vehicle_inventory.brand_code,
+              vehicle_inventory.model_code, vehicle_inventory.model_description, vehicle_inventory.registration,
+              vehicle_inventory.stock_status, vehicle_inventory.warehouse_code, vehicle_inventory.location_code,
+              vehicle_inventory.customer_code, vehicle_inventory.customer_name, vehicle_inventory.raw_data)
+         IS DISTINCT FROM
+             (EXCLUDED.serial_no, EXCLUDED.vin, EXCLUDED.brand_code, EXCLUDED.model_code,
+              EXCLUDED.model_description, EXCLUDED.registration, EXCLUDED.stock_status, EXCLUDED.warehouse_code,
+              EXCLUDED.location_code, EXCLUDED.customer_code, EXCLUDED.customer_name, EXCLUDED.raw_data)
+       RETURNING (xmax = 0) AS inserted`,
       values,
     );
-    addedRows += inserted.rowCount;
-    duplicateVinRows += (batch.length - inserted.rowCount);
+    const insertedRows = synchronized.rows.filter((row) => row.inserted).length;
+    addedRows += insertedRows;
+    updatedRows += synchronized.rowCount - insertedRows;
+    unchangedRows += batch.length - synchronized.rowCount;
     batch.length = 0;
   }
 
@@ -386,6 +410,8 @@ async function importVehicleWorkbook(req, res) {
       fileName,
       inputRows,
       addedRows,
+      updatedRows,
+      unchangedRows,
       duplicateVinRows,
       missingVinRows,
       total: count.rows[0].total,
@@ -620,7 +646,7 @@ async function updateVehicleBySelectors(query, updates, preferredType, allowedTe
     const locationKey = String(updates.emplacement).trim().toUpperCase().replace(/\s+/g, '');
     const targetIds = found.rows.map((row) => row.id);
     const occupied = await pool.query(
-      `SELECT no_or, chassis FROM vehicles
+      `SELECT id, no_or, chassis, record_type, record_key, payload FROM vehicles
        WHERE UPPER(REGEXP_REPLACE(COALESCE(NULLIF(location, ''), payload->>'emplacement', ''), '\\s+', '', 'g')) = $1
          AND NOT (id = ANY($2::bigint[]))
          -- Flux et Réception sont deux lignes du même véhicule : elles ne
@@ -635,59 +661,33 @@ async function updateVehicleBySelectors(query, updates, preferredType, allowedTe
        LIMIT 1`,
       [locationKey, targetIds, noOr, chassis, origNo, origChassis],
     );
-    if (occupied.rowCount) {
-      const isAttente = String(updates.etat || updates.etatIntervention || '').toLowerCase().includes('attente')
-        || locationKey.startsWith('P');
-      const isStartingWork =
-        String(updates.etat || updates.etatIntervention || '').toLowerCase().includes('en cours') ||
-        String(updates.avancement || '').toLowerCase().startsWith('en cours');
-      if (isAttente || isStartingWork) {
-        // Lors d'une prise en charge, ne jamais bloquer le véhicule sur une
-        // ancienne place occupée : choisir la prochaine place libre de son
-        // équipe, puis un emplacement de parking en dernier recours.
-        const allOccupied = await pool.query(
-          `SELECT DISTINCT UPPER(REGEXP_REPLACE(COALESCE(NULLIF(location, ''), payload->>'emplacement', ''), '\\s+', '', 'g')) AS loc
-           FROM vehicles
-           WHERE location IS NOT NULL AND location <> ''
-             AND LOWER(COALESCE(status, payload->>'etatIntervention', payload->>'etat', '')) NOT LIKE '%livr%'`
-        );
-        const occupiedSet = new Set(allOccupied.rows.map((r) => r.loc));
-        let freePlace = 'Place complet';
-        const team = String(
-          updates.equipe || found.rows[0]?.team || found.rows[0]?.payload?.equipe || ''
-        ).toLowerCase();
-        const teamPlaces = team.includes('lourd')
-          ? ['T1', 'T2', 'T3', 'T4', 'T11', 'T12', 'T21', 'T22', 'T31', 'T32', 'T41', 'T42', 'M11', 'M21', 'M12']
-          : team.includes('rapide') || team.includes('serv')
-            ? ['S21', 'S11', 'S22']
-            : team.includes('carross')
-              ? ['C1', 'C2', 'C3']
-              : team.includes('elect') || team.includes('elict')
-                ? ['E1', 'E2', 'E11', 'E12', 'E21', 'E22']
-                : team.includes('changan')
-                  ? ['J11', 'J12', 'J21', 'J22', 'J31', 'J32', 'J41', 'J42', 'J51', 'J52', 'J61', 'J62']
-                  : ['D510', 'D520', 'D610', 'D620', 'D710', 'D720', 'D810', 'D820', 'D511', 'D512', 'D521', 'D522', 'D611', 'D612', 'D621', 'D622', 'D711', 'D712', 'D721', 'D722', 'D811', 'D812', 'D821', 'D822'];
-        if (isStartingWork) {
-          freePlace = teamPlaces.find((place) => !occupiedSet.has(place)) || freePlace;
-        }
-        if (freePlace === 'Place complet') {
-          for (let i = 1; i <= 76; i++) {
-            const p = `P${i}`;
-            if (!occupiedSet.has(p)) {
-              freePlace = p;
-              break;
-            }
-          }
-        }
-        updates.emplacement = freePlace;
-      } else {
-        const vehicle = occupied.rows[0];
-        const error = new Error(`L'emplacement ${updates.emplacement} est déjà occupé par le véhicule ${vehicle.no_or || vehicle.chassis || ''}.`);
+    if (occupied.rowCount && updates.swapEmplacement === true) {
+      const sourceLocation = String(found.rows[0]?.location || found.rows[0]?.payload?.emplacement || '').trim();
+      const vehicle = occupied.rows[0];
+      if (!sourceLocation || !isExclusiveWorkshopLocation(sourceLocation)) {
+        const error = new Error('L’emplacement actuel du véhicule doit être renseigné pour pouvoir échanger les places.');
         error.statusCode = 409;
         throw error;
       }
+      await pool.query(
+        `UPDATE vehicles SET location = $1,
+           payload = jsonb_set(COALESCE(payload, '{}'::jsonb), '{emplacement}', to_jsonb($1::text), true),
+           updated_at = NOW()
+         WHERE id <> ALL($2::bigint[])
+           AND ((NULLIF($3, '') IS NOT NULL AND no_or = $3) OR (NULLIF($3, '') IS NULL AND NULLIF($4, '') IS NOT NULL AND UPPER(chassis) = UPPER($4)))`,
+        [sourceLocation, targetIds, String(vehicle.no_or || ''), String(vehicle.chassis || '')],
+      );
+      delete updates.swapEmplacement;
+    } else if (occupied.rowCount) {
+      // Aucun déplacement automatique : seule une demande explicite de
+      // changement d'emplacement peut déclencher un échange entre véhicules.
+      const vehicle = occupied.rows[0];
+      const error = new Error(`L'emplacement ${updates.emplacement} est déjà occupé par le véhicule ${vehicle.no_or || vehicle.chassis || ''}.`);
+      error.statusCode = 409;
+      throw error;
     }
   }
+  delete updates.swapEmplacement;
   for (const current of found.rows) {
     const payload = { ...current.payload, ...updates };
     const workState = String(updates.etat || updates.etatIntervention || updates.statut || updates.avancement || '').toLowerCase();
@@ -861,7 +861,9 @@ async function handleDatabaseAction(req, res, url) {
   if (receptionActions.has(action) && !receptionRoles.has(account.role) && !hasReceptionPerm) {
     return sendActionResult(res, { ok: false, error: 'Action réservée à la réception et à la direction atelier.' });
   }
-  if (workshopActions.has(action) && !workshopRoles.has(account.role) && !hasWorkshopPerm) {
+  // Le positionnement est manuel et partagé : tout utilisateur connecté peut
+  // renseigner l'emplacement réel d'un véhicule.
+  if (action !== 'updateEmplacement' && workshopActions.has(action) && !workshopRoles.has(account.role) && !hasWorkshopPerm) {
     if (action === 'updateEtat' && (account.role === 'reception' || account.role === 'garantie' || hasReceptionPerm)) {
       const targetEtat = String(query.get('etat') || query.get('etatIntervention') || '');
       if (targetEtat === 'Livré' || targetEtat === 'Attente Réparation' || targetEtat === 'Attente Client') {
@@ -904,10 +906,10 @@ async function handleDatabaseAction(req, res, url) {
     return sendActionResult(res, { ok: false, error: 'La réouverture d’un OR est réservée à l’Administration.' });
   }
   const allowedTeam = ['chef_equipe', 'chef_atelier'].includes(account.role)
-    && workshopActions.has(action)
+    && workshopActions.has(action) && action !== 'updateEmplacement'
     ? await resolveAccountTeam(account)
     : '';
-  if (account.role === 'chef_equipe' && workshopActions.has(action) && !allowedTeam) {
+  if (account.role === 'chef_equipe' && workshopActions.has(action) && action !== 'updateEmplacement' && !allowedTeam) {
     return sendActionResult(res, { ok: false, error: 'Aucune équipe n’est affectée à ce compte.' });
   }
 
@@ -1285,27 +1287,12 @@ async function handleDatabaseAction(req, res, url) {
     const newId = Date.now();
     const newRecordKey = `${noOr}_${newId}`;
 
-    // 3. Emplacement automatique pour Attente Réparation
-    let emplacement = text('emplacement');
-    const occupiedRows = await pool.query(
-      `SELECT DISTINCT UPPER(REGEXP_REPLACE(COALESCE(NULLIF(location, ''), payload->>'emplacement', ''), '\\s+', '', 'g')) AS loc
-       FROM vehicles
-       WHERE location IS NOT NULL AND location <> ''
-         AND LOWER(COALESCE(status, payload->>'etatIntervention', payload->>'etat', '')) NOT LIKE '%livr%'`
-    );
-    const occupiedSet = new Set(occupiedRows.rows.map((r) => r.loc));
-
-    const isEmpTaken = Boolean(emplacement && occupiedSet.has(emplacement.trim().toUpperCase().replace(/\s+/g, '')));
-    if (!emplacement || emplacement === '-' || emplacement === 'NA' || isEmpTaken) {
-      emplacement = 'Place complet';
-      for (let i = 1; i <= 76; i++) {
-        const candidate = `P${i}`;
-        if (!occupiedSet.has(candidate)) {
-          emplacement = candidate;
-          break;
-        }
-      }
-    }
+    // 3. L'emplacement est toujours choisi manuellement après la création.
+    // Une nouvelle entrée ne doit jamais réserver automatiquement une place.
+    const requestedEmplacement = text('emplacement');
+    const emplacement = !requestedEmplacement || requestedEmplacement === '-'
+      ? 'NA'
+      : requestedEmplacement;
 
     const defaultClient = invClient || fallbackData.nomClient || fallbackData.client || 'Client non renseigné';
     const formClient = text('nomClient', text('client'));
@@ -1443,6 +1430,7 @@ async function handleDatabaseAction(req, res, url) {
     const newMarque = text('marque', 'IVECO');
     const newModele = text('modele', '-');
     const newCategorie = text('categorie', '-');
+    const commentaireAtelier = text('commentaireAtelier');
     const newDateEntreeHeure = text('dateEntreeHeure');
     const newImmat = text('immatriculation', text('immat', '-'));
     const targetId = text('id');
@@ -1520,22 +1508,10 @@ async function handleDatabaseAction(req, res, url) {
         [locationKey, targetIds],
       );
       if (occupied.rowCount) {
-        const allOccupied = await pool.query(
-          `SELECT DISTINCT UPPER(REGEXP_REPLACE(COALESCE(NULLIF(location, ''), payload->>'emplacement', ''), '\\s+', '', 'g')) AS loc
-           FROM vehicles
-           WHERE location IS NOT NULL AND location <> ''
-             AND LOWER(COALESCE(status, payload->>'etatIntervention', payload->>'etat', '')) NOT LIKE '%livr%'`
-        );
-        const occupiedSet = new Set(allOccupied.rows.map((r) => r.loc));
-        let freePlace = 'Place complet';
-        for (let i = 1; i <= 76; i++) {
-          const p = `P${i}`;
-          if (!occupiedSet.has(p)) {
-            freePlace = p;
-            break;
-          }
-        }
-        effectiveEmplacement = freePlace;
+        const vehicle = occupied.rows[0];
+        const error = new Error(`L'emplacement ${effectiveEmplacement} est déjà occupé par le véhicule ${vehicle.no_or || vehicle.chassis || ''}.`);
+        error.statusCode = 409;
+        throw error;
       }
     }
 
@@ -1563,6 +1539,7 @@ async function handleDatabaseAction(req, res, url) {
         ...(newMarque ? { marque: newMarque } : {}),
         ...(newModele ? { modele: newModele, modelePowerBI: newModele } : {}),
         ...(newCategorie ? { categorie: newCategorie } : {}),
+        commentaireAtelier,
         ...(newDateEntreeHeure ? { dateEntreeHeure: newDateEntreeHeure, dateEntree: newDateEntreeHeure.split(' ')[0] || newDateEntreeHeure } : {}),
         ...(newImmat ? { immatriculation: newImmat, serie: newImmat } : {}),
       };
@@ -1919,32 +1896,7 @@ async function handleDatabaseAction(req, res, url) {
     if (numeroEdition) updateObj.numeroEdition = numeroEdition;
     if (commentaire) updateObj.commentaireFacturation = commentaire;
 
-    // L'emplacement client est attribué au moment du transfert à la réception.
-    if (!isRegularisation) try {
-      const allOccupied = await pool.query(
-        `SELECT DISTINCT UPPER(REGEXP_REPLACE(COALESCE(NULLIF(location, ''), payload->>'emplacement', ''), '\\s+', '', 'g')) AS loc
-         FROM vehicles
-         WHERE location IS NOT NULL AND location <> ''
-           AND LOWER(COALESCE(status, payload->>'etatIntervention', payload->>'etat', '')) NOT LIKE '%livr%'`
-      );
-      const occupiedSet = new Set(allOccupied.rows.map((r) => r.loc));
-      let freePlace = '';
-      for (let i = 1; i <= 8; i++) {
-        const l = `L${i}`;
-        if (!occupiedSet.has(l)) { freePlace = l; break; }
-      }
-      if (!freePlace) {
-        for (let i = 1; i <= 76; i++) {
-          const p = `P${i}`;
-          if (!occupiedSet.has(p)) { freePlace = p; break; }
-        }
-      }
-      if (freePlace) {
-        updateObj.emplacement = freePlace;
-      }
-    } catch (e) {
-      console.warn("Attribution emplacement Zone L ignorée:", e);
-    }
+    // La validation Facturation ne déplace jamais automatiquement le véhicule.
 
     let updated = await updateVehicleBySelectors(query, updateObj, undefined, '');
 
@@ -2223,6 +2175,7 @@ async function handleDatabaseAction(req, res, url) {
     updateFields.heureDebutTravail = now.time;
   }
   if (['updateEmplacement', 'updateEtat', 'updateTechnicien', 'updateAvancement', 'updateStatutAchat', 'updateStatutDevis', 'updateStatutGarantie'].includes(action)) {
+    if (action === 'updateEmplacement') updateFields.swapEmplacement = true;
     const updated = await updateVehicleBySelectors(query, updateFields, undefined, allowedTeam);
     if (!updated) return sendActionResult(res, { ok: false, error: 'Véhicule introuvable dans PostgreSQL.' });
     return sendActionResult(res, { ok: true, message: 'Véhicule mis à jour dans PostgreSQL.' });
@@ -2622,6 +2575,65 @@ async function handle(req, res) {
         return send(res, 409, { ok: false, error: 'Ce VIN existe déjà dans le Parc véhicules & engins.' });
       }
       return send(res, 201, { ok: true, row: result.rows[0] });
+    }
+
+    if (parts.length === 4 && req.method === 'PUT') {
+      const account = await requireAccount(req, res);
+      if (!account) return;
+      if (!['administration', 'chef_atelier'].includes(account.role)) {
+        return send(res, 403, { ok: false, error: 'La modification du parc est réservée à l’administration et au Chef d’Atelier.' });
+      }
+
+      const sourceRow = Number.parseInt(parts[3], 10);
+      if (!Number.isSafeInteger(sourceRow) || sourceRow < 1) {
+        return send(res, 400, { ok: false, error: 'Identifiant de véhicule invalide.' });
+      }
+      const body = await readJson(req);
+      const text = (key) => String(body[key] || '').trim();
+      const vin = text('vin').toUpperCase();
+      const brandCode = text('brandCode').toUpperCase();
+      if (!vin || !brandCode) {
+        return send(res, 400, { ok: false, error: 'Le VIN et le code marque sont obligatoires.' });
+      }
+
+      const vinKey = vin.replace(/\s+/g, '');
+      const serialNo = text('serialNo') || `MAN-${vinKey}`;
+      const current = await pool.query('SELECT raw_data FROM vehicle_inventory WHERE source_row = $1', [sourceRow]);
+      if (!current.rowCount) return send(res, 404, { ok: false, error: 'Véhicule introuvable.' });
+      const rawData = {
+        ...(current.rows[0].raw_data || {}),
+        'N° de série': serialNo,
+        VIN: vin,
+        'Code marque': brandCode,
+        'Code modèle': text('modelCode') || null,
+        Description: text('modelDescription') || null,
+        'N° Immatriculation': text('registration') || null,
+        Stocks: text('stockStatus') || null,
+        'Code magasin': text('warehouseCode') || null,
+        'Code emplacement': text('locationCode') || null,
+        'N° client': text('customerCode') || null,
+        'Nom du client': text('customerName') || null,
+      };
+      try {
+        const result = await pool.query(
+          `UPDATE vehicle_inventory SET
+            serial_no = $2, vin = $3, vin_key = $4, brand_code = $5, model_code = $6,
+            model_description = $7, registration = $8, stock_status = $9, warehouse_code = $10,
+            location_code = $11, customer_code = $12, customer_name = $13, raw_data = $14::jsonb
+           WHERE source_row = $1
+           RETURNING source_row AS "sourceRow", serial_no AS "serialNo", vin,
+             brand_code AS "brandCode", model_code AS "modelCode", model_description AS "modelDescription",
+             registration, stock_status AS "stockStatus", warehouse_code AS "warehouseCode",
+             location_code AS "locationCode", customer_code AS "customerCode", customer_name AS "customerName", raw_data AS "data"`,
+          [sourceRow, serialNo, vin, vinKey, brandCode, text('modelCode') || null, text('modelDescription') || null,
+            text('registration') || null, text('stockStatus') || null, text('warehouseCode') || null,
+            text('locationCode') || null, text('customerCode') || null, text('customerName') || null, JSON.stringify(rawData)],
+        );
+        return send(res, 200, { ok: true, row: result.rows[0] });
+      } catch (error) {
+        if (error?.code === '23505') return send(res, 409, { ok: false, error: 'Ce VIN existe déjà dans le Parc véhicules & engins.' });
+        throw error;
+      }
     }
 
     if (parts.length === 3 && req.method === 'GET') {

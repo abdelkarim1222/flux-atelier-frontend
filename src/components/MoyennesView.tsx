@@ -32,12 +32,15 @@ import {
   fetchMoyennesSheetData,
   updateDatabaseMoyennesPeriode,
   fetchDatabaseFluxData,
+  fetchSuiviEntreesData,
   DEFAULT_MOYENNES_DATA,
   type MoyennesSheetData,
+  type SuiviEntree,
 } from "../services/database";
 import type { Flux } from "../data/mockData";
-import { calculateVehicleTimes, formatMinutes } from "../services/timeTracking";
-import { isVehicleFinished, getActiveVehicleForTech } from "./AffecterTechnicienModal";
+import { formatMinutes } from "../services/timeTracking";
+import { getActiveVehicleForTech } from "./AffecterTechnicienModal";
+import { buildChronoTimeCalculations } from "../services/chronoCalculations";
 
 const MONTH_NAMES = [
   "Janvier", "Février", "Mars", "Avril", "Mai", "Juin",
@@ -89,11 +92,82 @@ interface MoyennesViewProps {
   vehicles?: Flux[];
 }
 
+type TechnicianReference = {
+  matricule: string;
+  name: string;
+};
+
+/**
+ * Un transfert VR libère le technicien courant, mais ne doit jamais effacer
+ * son travail déjà réalisé. Les champs technicien1/2/3 sont les snapshots
+ * conservés lors des passages entre équipes.
+ */
+function getVehicleTechnicianHistory(vehicle: Flux): TechnicianReference[] {
+  const vehicleRecord = vehicle as unknown as Record<string, unknown>;
+  const entries = ["", "1", "2", "3"].map((suffix) => ({
+    matricule: String(vehicleRecord[`technicien${suffix}`] || "").trim(),
+    name: String(vehicleRecord[`nomTechnicien${suffix}`] || "").trim(),
+  }));
+  const seen = new Set<string>();
+
+  return entries.filter(({ matricule, name }) => {
+    if ((!matricule || matricule === "-") && (!name || name === "-")) return false;
+    const key = (matricule && matricule !== "-" ? matricule : name).toLocaleLowerCase();
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+/** Un événement Chronométrie appartient au technicien indiqué dans sa note. */
+function isChronoStepForTechnician(
+  step: { label?: string; commentaire?: string },
+  technician: TechnicianReference,
+): boolean {
+  const text = `${step.label || ''} ${step.commentaire || ''}`.toLocaleLowerCase();
+  if (!text.includes('technicien')) return false;
+  const matricule = String(technician.matricule || '').trim();
+  const name = String(technician.name || '').trim().toLocaleLowerCase();
+  return Boolean(
+    (matricule && matricule !== '-' && new RegExp(`(^|\\D)${matricule.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(\\D|$)`).test(text)) ||
+    (name && name !== '-' && text.includes(name)),
+  );
+}
+
+function getChronoStepTechnician(step: { commentaire?: string }): TechnicianReference | null {
+  const match = String(step.commentaire || '').match(/technicien\s*:\s*([^•\n]+)/i);
+  if (!match) return null;
+  const description = match[1].trim();
+  if (!description || description === '-') return null;
+  const matricule = description.match(/\b\d{3,}\b/)?.[0] || '';
+  const name = description.replace(matricule, '').trim();
+  return matricule || name ? { matricule, name } : null;
+}
+
+/** Accepte les dates historiques françaises et les dates ISO venant de PostgreSQL. */
+function getWorkshopDateParts(value?: string) {
+  const date = String(value || "").trim();
+  if (!date || date.includes("1899")) return null;
+
+  const french = date.match(/^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{4})/);
+  if (french) {
+    return { day: Number(french[1]), month: Number(french[2]), year: Number(french[3]) };
+  }
+
+  const iso = date.match(/^(\d{4})-(\d{1,2})-(\d{1,2})/);
+  if (iso) {
+    return { day: Number(iso[3]), month: Number(iso[2]), year: Number(iso[1]) };
+  }
+
+  return null;
+}
+
 export default function MoyennesView({ vehicles: vehiclesProp }: MoyennesViewProps = {}) {
   const { role, roleInfo } = useRole();
   const [sheetData, setSheetData] = useState<MoyennesSheetData>(DEFAULT_MOYENNES_DATA);
   // Internal vehicles state — seeded from prop when available, otherwise fetched from DB
   const [vehicles, setVehicles] = useState<Flux[]>(vehiclesProp ?? []);
+  const [suiviEntries, setSuiviEntries] = useState<SuiviEntree[]>([]);
   const [selectedYear, setSelectedYear] = useState<number>(2026);
   const [selectedMonth, setSelectedMonth] = useState<number>(9);
   const [hasInitializedPeriod, setHasInitializedPeriod] = useState<boolean>(false);
@@ -120,22 +194,28 @@ export default function MoyennesView({ vehicles: vehiclesProp }: MoyennesViewPro
     if (isManual) setRefreshing(true);
     else setLoading(true);
     try {
-      // If vehicles are provided via prop, only fetch the moyennes sheet metadata
+      // Les KPI de rendement utilisent la même fusion Flux + Réception que Chronométrie.
       if (vehiclesProp) {
-        const fetchedMoyennes = await fetchMoyennesSheetData();
+        const [fetchedMoyennes, fetchedSuivi] = await Promise.all([
+          fetchMoyennesSheetData(),
+          fetchSuiviEntreesData().catch(() => [] as SuiviEntree[]),
+        ]);
         setSheetData(fetchedMoyennes);
+        setSuiviEntries(fetchedSuivi);
         if (!hasInitializedPeriod) {
           setSelectedYear(fetchedMoyennes.annee || 2026);
           setSelectedMonth(fetchedMoyennes.mois || 9);
           setHasInitializedPeriod(true);
         }
       } else {
-        const [fetchedMoyennes, fetchedFlux] = await Promise.all([
+        const [fetchedMoyennes, fetchedFlux, fetchedSuivi] = await Promise.all([
           fetchMoyennesSheetData(),
           fetchDatabaseFluxData().catch(() => []),
+          fetchSuiviEntreesData().catch(() => [] as SuiviEntree[]),
         ]);
         setSheetData(fetchedMoyennes);
         setVehicles(fetchedFlux);
+        setSuiviEntries(fetchedSuivi);
         if (!hasInitializedPeriod) {
           setSelectedYear(fetchedMoyennes.annee || 2026);
           setSelectedMonth(fetchedMoyennes.mois || 9);
@@ -219,9 +299,11 @@ export default function MoyennesView({ vehicles: vehiclesProp }: MoyennesViewPro
     });
 
     vehicles.forEach((veh) => {
-      // Prioritize dateEntree (entry date from Suivi des Entrées). Strip time
-      // component if present: "28/09/2026 08:30" → "28/09/2026"
-      const rawDate = (veh.dateEntree || veh.date || "").trim().split(" ")[0];
+      // La date de Chronométrie est la référence : elle intègre les éventuelles
+      // corrections manuelles enregistrées sur le dossier de temps.
+      const chronoKey = String(veh.ordre || veh.no || veh.chassis || "")
+        .trim().toUpperCase().replace(/[^A-Z0-9]/g, "");
+      const rawDate = (chronoDateByVehicleKey.get(chronoKey) || "").trim().split(" ")[0];
       if (!rawDate || rawDate.includes("1899")) return;
       const match = rawDate.match(/^(\d{1,2})[/\-](\d{1,2})[/\-](\d{4})$/);
       if (!match) return;
@@ -341,12 +423,6 @@ export default function MoyennesView({ vehicles: vehiclesProp }: MoyennesViewPro
     };
   };
 
-  // Always compute from live vehicles (Suivi des Entrées + Avancement Atelier)
-  const displayData = useMemo<MoyennesSheetData>(
-    () => computeLiveData(selectedYear, selectedMonth),
-    [selectedYear, selectedMonth, sheetData, vehicles, timeTrackingRevision]
-  );
-
   // Days list: 1 to N where N = exact days in the selected month
   const daysInSelectedMonth = useMemo(
     () => new Date(selectedYear, selectedMonth, 0).getDate(),
@@ -357,86 +433,67 @@ export default function MoyennesView({ vehicles: vehiclesProp }: MoyennesViewPro
     [daysInSelectedMonth]
   );
 
-  // Compute active days (days where total > 0 across teams)
+  // Même liste et mêmes règles de calcul que « Chronométrie & Calcul des Temps Atelier ».
+  // Les pauses, PDR, devis, réaffectations, essais et corrections manuelles sont inclus.
+  const chronoCalculations = useMemo(
+    () => buildChronoTimeCalculations(vehicles, suiviEntries),
+    [vehicles, suiviEntries, timeTrackingRevision],
+  );
+  const periodChronoCalculations = useMemo(() => chronoCalculations.filter((calculation) => {
+    const dateParts = getWorkshopDateParts(calculation.dateEntreeReception);
+    return Boolean(dateParts && dateParts.year === selectedYear && dateParts.month === selectedMonth);
+  }), [chronoCalculations, selectedYear, selectedMonth]);
+
+  const vehicleByChronoKey = useMemo(() => {
+    const index = new Map<string, Flux>();
+    vehicles.forEach((vehicle) => {
+      [vehicle.ordre, vehicle.no, vehicle.chassis].forEach((value) => {
+        const key = String(value || '').trim().toUpperCase().replace(/[^A-Z0-9]/g, '');
+        if (key) index.set(key, vehicle);
+      });
+    });
+    return index;
+  }, [vehicles]);
+
+  const chronoDateByVehicleKey = useMemo(() => {
+    const index = new Map<string, string>();
+    chronoCalculations.forEach((calculation) => {
+      const date = calculation.dateEntreeReception || '';
+      if (!getWorkshopDateParts(date)) return;
+      [calculation.vehicleKey, calculation.noOr, calculation.chassis].forEach((value) => {
+        const key = String(value || '').trim().toUpperCase().replace(/[^A-Z0-9]/g, '');
+        if (key) index.set(key, date);
+      });
+    });
+    return index;
+  }, [chronoCalculations]);
+
+  // Les deux tableaux de volume utilisent eux aussi la date validée par Chronométrie.
+  const displayData = useMemo<MoyennesSheetData>(
+    () => computeLiveData(selectedYear, selectedMonth),
+    [selectedYear, selectedMonth, sheetData, vehicles, chronoDateByVehicleKey, timeTrackingRevision]
+  );
+
   const activeDays = useMemo(() => {
     const list: number[] = [];
-    if (!displayData.equipesTotal) return list;
-    displayData.equipesTotal.days.forEach((val, idx) => {
-      if (val > 0) list.push(idx + 1);
-    });
+    displayData.equipesTotal?.days.forEach((val, idx) => { if (val > 0) list.push(idx + 1); });
     return list;
   }, [displayData.equipesTotal]);
-
-  // Top Team & Top Model
-  const topTeam = useMemo(() => {
-    if (!displayData.equipes.length) return null;
-    return [...displayData.equipes].sort((a, b) => b.total - a.total)[0];
-  }, [displayData.equipes]);
-
-  const topModel = useMemo(() => {
-    if (!displayData.modeles.length) return null;
-    return [...displayData.modeles].sort((a, b) => b.total - a.total)[0];
-  }, [displayData.modeles]);
-
-  // Chart data: Teams comparison
-  const teamsChartData = useMemo(() => {
-    return displayData.equipes.map((eq) => ({
-      name: eq.name,
-      total: eq.total,
-      moyenne: eq.moyenne,
-      color: TEAM_COLORS[eq.name] || "#64748b",
-    }));
-  }, [displayData.equipes]);
-
-  // Chart data: Models comparison
-  const modelsChartData = useMemo(() => {
-    return displayData.modeles.map((mod) => ({
-      name: mod.name,
-      total: mod.total,
-      moyenne: mod.moyenne,
-      color: MODEL_COLORS[mod.name] || "#64748b",
-    }));
-  }, [displayData.modeles]);
-
-  // Totaux calculés pour affichage au-dessus des graphiques
-  const totalVehiculesEquipes = useMemo(() => {
-    return displayData.equipesTotal?.total ?? teamsChartData.reduce((acc, t) => acc + t.total, 0);
-  }, [displayData.equipesTotal, teamsChartData]);
-
-  const totalUnitesModeles = useMemo(() => {
-    return displayData.modelesTotal?.total ?? modelsChartData.reduce((acc, m) => acc + m.total, 0);
-  }, [displayData.modelesTotal, modelsChartData]);
-
-  // Filtered correspondances
+  const topTeam = useMemo(() => [...displayData.equipes].sort((a, b) => b.total - a.total)[0] || null, [displayData.equipes]);
+  const topModel = useMemo(() => [...displayData.modeles].sort((a, b) => b.total - a.total)[0] || null, [displayData.modeles]);
+  const teamsChartData = useMemo(() => displayData.equipes.map((eq) => ({ name: eq.name, total: eq.total, moyenne: eq.moyenne, color: TEAM_COLORS[eq.name] || "#64748b" })), [displayData.equipes]);
+  const modelsChartData = useMemo(() => displayData.modeles.map((mod) => ({ name: mod.name, total: mod.total, moyenne: mod.moyenne, color: MODEL_COLORS[mod.name] || "#64748b" })), [displayData.modeles]);
+  const totalVehiculesEquipes = useMemo(() => displayData.equipesTotal?.total ?? teamsChartData.reduce((acc, item) => acc + item.total, 0), [displayData.equipesTotal, teamsChartData]);
+  const totalUnitesModeles = useMemo(() => displayData.modelesTotal?.total ?? modelsChartData.reduce((acc, item) => acc + item.total, 0), [displayData.modelesTotal, modelsChartData]);
   const filteredCorrespondances = useMemo(() => {
     if (!searchFilter.trim()) return displayData.correspondances;
-    const q = searchFilter.toLowerCase().trim();
-    return displayData.correspondances.filter(
-      (c) =>
-        c.codeModele.toLowerCase().includes(q) ||
-        c.famille.toLowerCase().includes(q)
-    );
+    const query = searchFilter.toLowerCase().trim();
+    return displayData.correspondances.filter((item) => item.codeModele.toLowerCase().includes(query) || item.famille.toLowerCase().includes(query));
   }, [displayData.correspondances, searchFilter]);
-
-  // 1. Same entry scope as the two yield tables: all workshop entries,
-  // including warranty vehicles, selected by their entry date.
-  const periodVehicles = useMemo(() => {
-    return vehicles.filter((veh) => {
-      const dStr = veh.dateEntree || veh.date || veh.dateDebutRep || "";
-      if (!dStr || dStr.includes("1899")) return false;
-      const match = dStr.match(/^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{4})/);
-      // An invalid date cannot be placed in a daily yield column, so it must
-      // not inflate the card above the tables.
-      if (!match) return false;
-      const m = parseInt(match[2], 10);
-      const y = parseInt(match[3], 10);
-      return y === selectedYear && m === selectedMonth;
-    });
-  }, [vehicles, selectedYear, selectedMonth]);
 
   // 2. Calcul des 8 indicateurs d'atelier pour la page Moyennes
   const atelierStats = useMemo(() => {
-    const totalEntres = periodVehicles.length;
+    const totalEntres = periodChronoCalculations.length;
     let totalTermines = 0;
     let totalEnCours = 0;
     let sumDureeRepMin = 0;
@@ -454,15 +511,15 @@ export default function MoyennesView({ vehicles: vehiclesProp }: MoyennesViewPro
       countDuree: number;
     }>();
 
-    periodVehicles.forEach((veh) => {
-      const isFin = isVehicleFinished(veh);
+    periodChronoCalculations.forEach((stats) => {
+      const veh = vehicleByChronoKey.get(String(stats.vehicleKey || '').toUpperCase().replace(/[^A-Z0-9]/g, ''));
+      const isFin = stats.resteTravailStatut === "termine";
       if (isFin) {
         totalTermines++;
       } else {
         totalEnCours++;
       }
 
-      const stats = calculateVehicleTimes(veh);
       if (stats.tempsTravailEffectifMin > 0) {
         sumTravailNetMin += stats.tempsTravailEffectifMin;
       }
@@ -472,14 +529,14 @@ export default function MoyennesView({ vehicles: vehiclesProp }: MoyennesViewPro
       }
 
       // Ventilation par mécanicien
-      const mat = (veh.technicien || "").trim();
-      const nom = (veh.nomTechnicien || "").trim();
+      const mat = (veh?.technicien || "").trim();
+      const nom = (veh?.nomTechnicien || "").trim();
       if ((mat && mat !== "-") || (nom && nom !== "-")) {
         const key = mat && mat !== "-" ? mat : nom;
         const existing = techMap.get(key) || {
           matricule: mat && mat !== "-" ? mat : "-",
           name: nom && nom !== "-" ? nom : mat,
-          equipe: veh.equipe || "-",
+          equipe: veh?.equipe || stats.equipe || "-",
           total: 0,
           termines: 0,
           enCours: 0,
@@ -528,43 +585,72 @@ export default function MoyennesView({ vehicles: vehiclesProp }: MoyennesViewPro
       travailNetMoyenFormat: formatMinutes(travailNetMoyenMin),
       techniciensList,
     };
-  }, [periodVehicles, vehicles, timeTrackingRevision]);
+  }, [periodChronoCalculations, vehicleByChronoKey, vehicles, timeTrackingRevision]);
 
   // Daily workload: a vehicle is assigned to the day on which the technician
   // actually started work. When that timestamp is absent, use the repair start
   // date, then the entry date as a final fallback.
   const technicianDailyRows = useMemo(() => {
     const daysInMonth = new Date(selectedYear, selectedMonth, 0).getDate();
-    const rows = new Map<string, { matricule: string; name: string; equipe: string; days: number[]; total: number }>();
+    const rows = new Map<string, { matricule: string; name: string; equipe: string; days: number[]; vehicleKeysByDay: Array<Set<string>> }>();
 
-    vehicles.forEach((veh) => {
-      const matricule = (veh.technicien || "").trim();
-      const name = (veh.nomTechnicien || "").trim();
-      if ((!matricule || matricule === "-") && (!name || name === "-")) return;
+    chronoCalculations.forEach((calculation) => {
+      const veh = vehicleByChronoKey.get(String(calculation.vehicleKey || '').toUpperCase().replace(/[^A-Z0-9]/g, ''));
+      if (!veh) return;
+      const technicianHistory = getVehicleTechnicianHistory(veh);
+      if (technicianHistory.length === 0) return;
 
-      const rawDate = (veh.dateDebutTravail || veh.dateDebutRep || veh.dateEntree || veh.date || "").trim().split(" ")[0];
-      const match = rawDate.match(/^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{4})$/);
-      if (!match) return;
-      const day = Number(match[1]);
-      const month = Number(match[2]);
-      const year = Number(match[3]);
-      if (year !== selectedYear || month !== selectedMonth || day < 1 || day > daysInMonth) return;
-
-      const key = matricule && matricule !== "-" ? matricule : name;
-      const existing = rows.get(key) || {
-        matricule: matricule && matricule !== "-" ? matricule : "-",
-        name: name && name !== "-" ? name : matricule,
-        equipe: veh.equipe || "-",
-        days: Array(daysInMonth).fill(0),
-        total: 0,
+      const addVehicleForDay = ({ matricule, name }: TechnicianReference, day: number) => {
+        const key = matricule && matricule !== "-" ? matricule : name;
+        const existing = rows.get(key) || {
+          matricule: matricule && matricule !== "-" ? matricule : "-",
+          name: name && name !== "-" ? name : matricule,
+          equipe: veh.equipe || "-",
+          days: Array(daysInMonth).fill(0),
+          vehicleKeysByDay: Array.from({ length: daysInMonth }, () => new Set<string>()),
+        };
+        existing.vehicleKeysByDay[day - 1].add(calculation.vehicleKey);
+        rows.set(key, existing);
       };
-      existing.days[day - 1] += 1;
-      existing.total += 1;
-      rows.set(key, existing);
+
+      // Référence exacte : les prises en charge/terminaisons consignées dans
+      // Chronométrie. Un même OR n'est compté qu'une fois par technicien et jour.
+      let hasLoggedTechnicianActivity = false;
+      calculation.steps.forEach((step) => {
+        const dateParts = getWorkshopDateParts(step.dateDebut);
+        if (!dateParts || dateParts.year !== selectedYear || dateParts.month !== selectedMonth || dateParts.day < 1 || dateParts.day > daysInMonth) return;
+        const recordedTechnician = getChronoStepTechnician(step);
+        if (recordedTechnician) {
+          addVehicleForDay(recordedTechnician, dateParts.day);
+          hasLoggedTechnicianActivity = true;
+          return;
+        }
+        technicianHistory.forEach((technician) => {
+          if (!isChronoStepForTechnician(step, technician)) return;
+          addVehicleForDay(technician, dateParts.day);
+          hasLoggedTechnicianActivity = true;
+        });
+      });
+
+      // Compatibilité avec les anciens dossiers qui n'ont pas encore d'événement
+      // nominatif : une seule attribution à la date de prise en charge.
+      if (!hasLoggedTechnicianActivity) {
+        const dateParts = getWorkshopDateParts(calculation.datePriseEnChargeEquipe || calculation.dateEntreeReception);
+        if (dateParts && dateParts.year === selectedYear && dateParts.month === selectedMonth && dateParts.day >= 1 && dateParts.day <= daysInMonth) {
+          technicianHistory.forEach((technician) => addVehicleForDay(technician, dateParts.day));
+        }
+      }
     });
 
-    return Array.from(rows.values()).sort((a, b) => b.total - a.total || a.name.localeCompare(b.name));
-  }, [vehicles, selectedYear, selectedMonth, timeTrackingRevision]);
+    return Array.from(rows.values()).map((row) => {
+      const days = row.vehicleKeysByDay.map((vehiclesForDay, index) => {
+        const count = vehiclesForDay.size;
+        row.days[index] = count;
+        return count;
+      });
+      return { matricule: row.matricule, name: row.name, equipe: row.equipe, days, total: days.reduce((sum, count) => sum + count, 0) };
+    }).sort((a, b) => b.total - a.total || a.name.localeCompare(b.name));
+  }, [chronoCalculations, vehicleByChronoKey, selectedYear, selectedMonth, timeTrackingRevision]);
 
   // CSV Export handler
   const handleExportCSV = () => {
@@ -693,7 +779,7 @@ export default function MoyennesView({ vehicles: vehiclesProp }: MoyennesViewPro
                 </span>
               </div>
               <span className="text-[11px] text-slate-500 font-medium">
-                Suivi quantitatif mensuel par Équipe & Famille de Modèles
+                Moyennes calculées depuis la Chronométrie atelier
               </span>
             </div>
           </div>
@@ -805,7 +891,7 @@ export default function MoyennesView({ vehicles: vehiclesProp }: MoyennesViewPro
           {/* ─── Source fixe : toujours Temps Réel ─── */}
           <span
             className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg bg-emerald-600 text-white text-xs font-extrabold shadow-sm select-none"
-            title="Données calculées en temps réel depuis Suivi des Entrées & Avancement Atelier"
+            title="Données calculées en temps réel depuis Chronométrie & Calcul des Temps Atelier"
           >
             <span>⚡</span>
             <span>Temps Réel</span>

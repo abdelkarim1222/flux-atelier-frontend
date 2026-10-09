@@ -39,6 +39,13 @@ export interface Flux {
   heureEntree?: string;
   technicien?: string;
   nomTechnicien?: string;
+  /** Historique des techniciens ayant déjà travaillé avant un transfert VR. */
+  technicien1?: string;
+  nomTechnicien1?: string;
+  technicien2?: string;
+  nomTechnicien2?: string;
+  technicien3?: string;
+  nomTechnicien3?: string;
   /** Indique exceptionnellement que le technicien affecté travaille le samedi. */
   travailleSamedi?: boolean;
   equipe?: string;

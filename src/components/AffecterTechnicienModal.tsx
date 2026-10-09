@@ -215,15 +215,16 @@ export function isVehicleActivelyOccupyingTech(
     return false;
   }
 
-  // 5. Attente PDR : Le travail est arrêté car une pièce de rechange est nécessaire.
-  // Le véhicule reste associé à l'intervention du technicien -> 🔴/🟠 Occupé / Réservé
+  // 5. Attente PDR : le travail est suspendu en attendant la pièce.
+  // Le technicien est immédiatement disponible pour prendre un autre travail.
   if (normAv === "attente pdr" || normAv.includes("pdr")) {
-    return true;
+    return false;
   }
 
-  // 6. Essai routier : La réparation nécessite un essai avant validation finale -> 🟠 Intervention active (Occupé)
+  // 6. Essai routier : l'intervention technique est suspendue pendant le
+  // contrôle. Le technicien peut donc être affecté à un autre véhicule.
   if (normAv === "essai" || normEtat === "essai") {
-    return true;
+    return false;
   }
 
   // 7. Technicien réaffecté, attends acheter, Lancement devis -> Le mécanicien est DISPONIBLE

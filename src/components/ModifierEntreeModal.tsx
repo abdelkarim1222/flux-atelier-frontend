@@ -70,6 +70,7 @@ export default function ModifierEntreeModal({
     marque: "IVECO",
     modele: "",
     categorie: "",
+    commentaireAtelier: "",
     etat: "Attente Réparation",
     equipe: "Daily",
     emplacement: "",
@@ -94,6 +95,7 @@ export default function ModifierEntreeModal({
         marque: row.marque || "IVECO",
         modele: row.modele || "",
         categorie: row.categorie || "",
+        commentaireAtelier: (row as unknown as { commentaireAtelier?: string }).commentaireAtelier || "",
         etat: row.etat || "Attente Réparation",
         equipe: row.equipe && row.equipe !== "-" ? row.equipe : "Daily",
         emplacement: row.emplacement || "",
@@ -260,6 +262,7 @@ export default function ModifierEntreeModal({
         marque: formData.marque.trim() || "IVECO",
         modele: formData.modele.trim() || "-",
         categorie: formData.categorie.trim() || "-",
+        commentaireAtelier: formData.commentaireAtelier.trim(),
         etat: effectiveEtat,
         equipe: formData.equipe.trim(),
         emplacement: effectiveEmplacement,
@@ -676,6 +679,20 @@ export default function ModifierEntreeModal({
                 )}
               </div>
             </div>
+          </div>
+
+          <div className="bg-slate-50/80 border border-slate-200/80 rounded-xl p-4 space-y-2">
+            <label className="block text-xs font-bold uppercase tracking-wider text-slate-500">
+              Commentaire / description de l’intervention
+            </label>
+            <textarea
+              rows={3}
+              value={formData.commentaireAtelier}
+              onChange={(e) => setFormData((prev) => ({ ...prev, commentaireAtelier: e.target.value }))}
+              placeholder="Ex. Bruit moteur à contrôler, remplacement frein avant…"
+              className="w-full rounded-xl border border-slate-300 bg-white px-3 py-2 text-sm outline-none focus:border-blue-500 focus:ring-2 focus:ring-blue-500/20"
+            />
+            <p className="text-[11px] text-slate-400">Ce commentaire sera visible sur la fiche du véhicule dans le Plan d’Atelier.</p>
           </div>
 
           {/* Modal Footer */}

@@ -30,6 +30,15 @@ export const LEGACY_DAILY_MAPPING: Record<string, string> = {
   D82: "D822",
 };
 
+export const LEGACY_ELECTRIQUE_MAPPING: Record<string, string> = {
+  E1: "E410",
+  E11: "E411",
+  E12: "E412",
+  E2: "E420",
+  E21: "E421",
+  E22: "E422",
+};
+
 export const EMPLACEMENT_ZONES = {
   DAILY: [
     "D510", "D520", "D610", "D620", "D710", "D720", "D810", "D820",
@@ -40,7 +49,7 @@ export const EMPLACEMENT_ZONES = {
     "J11", "J12", "J21", "J22", "J31", "J32", "J41", "J42", "J51", "J52", "J61", "J62"
   ],
   ELECTRIQUE: [
-    "E1", "E2", "E11", "E12", "E21", "E22"
+    "E410", "E411", "E412", "E420", "E421", "E422"
   ],
   SERVICE_RAPIDE: [
     "S21", "S11", "S22"
@@ -49,7 +58,7 @@ export const EMPLACEMENT_ZONES = {
     "C1", "C2", "C3"
   ],
   LOURD_T: [
-    "T1", "T2", "T3", "T4", "T11", "T12", "T21", "T22", "T31", "T32", "T41", "T42"
+    "T1", "T2", "T3", "T4", "T5", "T6", "T7", "T11", "T12", "T21", "T22", "T31", "T32", "T41", "T42"
   ],
   LOURD_M: [
     "M11", "M21", "M12"
@@ -57,7 +66,8 @@ export const EMPLACEMENT_ZONES = {
   ATTENTE_CLIENT_L: [
     "L1", "L2", "L3", "L4", "L5", "L6", "L7", "L8"
   ],
-  PARKING_P: Array.from({ length: 76 }, (_, i) => `P${i + 1}`)
+  // Colonne droite P1–P10, petites places P11–P13, puis parking P14–P81.
+  PARKING_P: Array.from({ length: 81 }, (_, i) => `P${i + 1}`)
 } as const;
 
 export const ALL_EMPLACEMENTS: string[] = [
@@ -75,6 +85,7 @@ export const ALL_EMPLACEMENTS: string[] = [
 export const VALID_EMPLACEMENTS_SET = new Set<string>([
   ...ALL_EMPLACEMENTS.map((e) => e.toUpperCase()),
   ...Object.keys(LEGACY_DAILY_MAPPING),
+  ...Object.keys(LEGACY_ELECTRIQUE_MAPPING),
   FULL_PARKING_EMPLACEMENT.toUpperCase(),
   "PARC COMPLET",
   "PARCCOMPLET",
@@ -111,6 +122,7 @@ export function normalizeEmplacementCode(val: string): string {
   if (clean.includes("COMPLET") || clean.includes("PLEIN")) return FULL_PARKING_EMPLACEMENT;
   const stripped = clean.replace(/^(ZONE|PARKING)/, "");
   if (LEGACY_DAILY_MAPPING[stripped]) return LEGACY_DAILY_MAPPING[stripped];
+  if (LEGACY_ELECTRIQUE_MAPPING[stripped]) return LEGACY_ELECTRIQUE_MAPPING[stripped];
   if (VALID_EMPLACEMENTS_SET.has(stripped)) return stripped;
   return clean;
 }
@@ -140,9 +152,9 @@ export function getZoneForEmplacement(place: string): string {
  *    - Devient « Livraison au client », ce qui libère sa précédente place dans l'atelier.
  * 2. Véhicule « Attente client » (ou terminé à 100% en attente livraison) :
  *    - Utilise en priorité la zone L (L1 à L8).
- *    - Si la zone L est pleine, bascule sur le parking général P (P1 à P76).
+ *    - Si la zone L est pleine, bascule sur le parking général P (P1 à P85).
  * 3. Véhicule « Attente réparation » (ou toute mise en attente) :
- *    - Attribué dans le parking général P (P1 à P76).
+ *    - Attribué dans le parking général P (P1 à P85).
  * 4. Véhicule « En cours » :
  *    - Dépend de l'équipe active (Daily1/Daily2 -> D, Changan -> J, Électrique -> E,
  *      Service Rapide -> S, Carrosserie -> C, Lourd -> T/M).
