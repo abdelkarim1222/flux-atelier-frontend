@@ -86,6 +86,7 @@ import {
   getCustomEquipeMembers,
   normalizePersonName,
   fetchDatabaseFluxData,
+  fetchDatabaseSharedPlanLocations,
   fetchSuiviEntreesData,
   synchroniserTableauxDeChargement,
   getTeamForChefEquipe,
@@ -913,6 +914,7 @@ export default function Dashboard() {
   const [search, setSearch] = useState("");
   const [dateFilter, setDateFilter] = useState(ALL_DATES);
   const [draftEmplacements, setDraftEmplacements] = useState<Record<number, string>>({});
+  const [sharedPlanVehicles, setSharedPlanVehicles] = useState<Flux[]>([]);
   const [savingVehicleId, setSavingVehicleId] = useState<number | null>(null);
   const [writeNotice, setWriteNotice] = useState("");
   const [writeError, setWriteError] = useState("");
@@ -2911,13 +2913,37 @@ export default function Dashboard() {
     setSelectedVehicleId(item.vehicle.id);
   }, [vehicles, reaffectationsMap, saveVehicleAvancement]);
 
+  useEffect(() => {
+    if (activeTab !== "plan_atelier") return;
+
+    let cancelled = false;
+    void fetchDatabaseSharedPlanLocations()
+      .then((rows) => {
+        if (!cancelled) setSharedPlanVehicles(rows);
+      })
+      .catch((error) => console.warn("Lecture des emplacements partagés P/L impossible:", error));
+
+    return () => {
+      cancelled = true;
+    };
+  }, [activeTab]);
+
+  const mapVehicles = useMemo(() => {
+    const records = new Map<string, Flux>();
+    [...vehicles, ...sharedPlanVehicles].forEach((row) => {
+      const key = String(row.no || row.ordre || row.chassis || row.id).trim().toUpperCase();
+      records.set(key, row);
+    });
+    return [...records.values()];
+  }, [vehicles, sharedPlanVehicles]);
+
   const rowsByZone = useMemo(() => {
     const zones = new Map<string, Flux[]>();
 
-    vehicles.forEach((row) => {
-      // Tous les dossiers R10 sont suivis dans le Tableau Garantie,
-      // jamais sur le plan opérationnel de l'atelier.
-      if (isWarrantyVehicle(row)) return;
+    mapVehicles.forEach((row) => {
+      // Le plan est le référentiel physique commun : tout véhicule possédant
+      // une place doit être visible, y compris un dossier Garantie (R10).
+      // Les restrictions de rôle restent limitées aux autres tableaux.
       const zone = normalizeEmplacementCode(row.emplacement || "");
       if (!zone || zone === "NA" || zone.startsWith("#") || isSheetEmplacementOutsideMap(zone)) {
         return;
@@ -2926,7 +2952,7 @@ export default function Dashboard() {
     });
 
     return zones;
-  }, [vehicles]);
+  }, [mapVehicles]);
 
   const attenteReparationCount = useMemo(() => {
     if (role === "chef_equipe" && effectiveChefFilterTeam) {
@@ -4304,8 +4330,7 @@ export default function Dashboard() {
               </button>
             )}
 
-            {permissions.canViewMap && (
-              <button
+            <button
                 type="button"
                 onClick={() => setActiveTab("plan_atelier")}
                 className={`w-full flex items-center justify-between px-3.5 py-2.5 rounded-xl text-xs font-bold transition-all cursor-pointer text-left ${activeTab === "plan_atelier"
@@ -4329,7 +4354,6 @@ export default function Dashboard() {
                   Synoptique
                 </span>
               </button>
-            )}
 
 
             {permissions.canViewSuiviTemps && (

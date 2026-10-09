@@ -128,6 +128,20 @@ export async function fetchDatabaseFluxData() {
   return await response.json() as Flux[];
 }
 
+/**
+ * Vue physique partagée du plan : seuls les véhicules réellement placés dans
+ * le parking P ou sur les ponts L. Cette lecture ne sert jamais aux tableaux
+ * d'équipe, qui conservent leurs filtres habituels.
+ */
+export async function fetchDatabaseSharedPlanLocations() {
+  const response = await fetch('/api/data/plan-locations', {
+    cache: 'no-store',
+    credentials: 'same-origin',
+  });
+  if (!response.ok) throw new Error('Impossible de récupérer les emplacements P et L du plan.');
+  return await response.json() as Flux[];
+}
+
 export async function fetchSuiviEntreesData() {
   const response = await fetch('/api/data/reception', { cache: 'no-store', credentials: 'same-origin' });
   if (!response.ok) throw new Error('Impossible de récupérer le suivi des entrées depuis PostgreSQL.');

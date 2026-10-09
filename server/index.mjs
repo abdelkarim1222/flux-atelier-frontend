@@ -2339,6 +2339,27 @@ async function handle(req, res) {
 
   if (parts[0] !== 'api') return send(res, 404, { ok: false, error: 'Route introuvable.' });
 
+  // Vue partagée, exclusivement utilisée par le Plan d'Atelier. Un Chef
+  // d'équipe conserve les filtres de son équipe dans les tableaux, mais doit
+  // pouvoir identifier toute voiture physiquement stationnée au parking P ou
+  // sur les ponts L.
+  if (parts[1] === 'data' && parts[2] === 'plan-locations' && req.method === 'GET') {
+    const account = await requireAccount(req, res);
+    if (!account) return;
+    const result = await pool.query(`
+      SELECT payload FROM vehicles
+      WHERE record_type = 'flux'
+        AND UPPER(REGEXP_REPLACE(
+          COALESCE(NULLIF(location, ''), payload->>'emplacement', ''),
+          '\\s+', '', 'g'
+        )) ~ '^(P([1-9]|[1-7][0-9]|8[01])|L[1-8])$'
+      ORDER BY id
+    `);
+    const records = result.rows.map((row) => row.payload);
+    await enrichVehiclesWithInventory(records);
+    return send(res, 200, records);
+  }
+
   if (parts[1] === 'accounts') {
     const actor = await requireAdministrator(req, res);
     if (!actor) return;
