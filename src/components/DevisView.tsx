@@ -577,7 +577,7 @@ export default function DevisView({
   };
 
   return (
-    <div className="p-4 sm:p-6 space-y-6 animate-in fade-in duration-200">
+    <div className="h-full min-h-0 overflow-y-auto overscroll-contain p-4 sm:p-6 pb-8 space-y-6 animate-in fade-in duration-200">
       {/* Bannière de notification d'action */}
       {actionSuccessNotice && (
         <div className="p-4 rounded-xl bg-emerald-500/10 border border-emerald-500/30 text-emerald-900 flex flex-col sm:flex-row sm:items-center justify-between gap-3 shadow-sm animate-in slide-in-from-top-2 duration-200">

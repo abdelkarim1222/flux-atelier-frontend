@@ -222,7 +222,7 @@ export default function AcheterView({
   }, [acheterVehicles, selectedEquipe, search, statusFilter, demandesMap]);
 
   return (
-    <div className="p-4 sm:p-6 space-y-6 animate-in fade-in duration-200">
+    <div className="h-full min-h-0 overflow-y-auto overscroll-contain p-4 sm:p-6 pb-8 space-y-6 animate-in fade-in duration-200">
       {/* En-tête de la Page Acheter */}
       <div className="bg-gradient-to-r from-amber-900 via-orange-950 to-slate-900 rounded-2xl p-6 text-white shadow-xl border border-amber-500/20 relative overflow-hidden">
         <div className="absolute right-0 top-0 w-96 h-96 bg-amber-500/10 rounded-full blur-3xl pointer-events-none" />

@@ -122,7 +122,28 @@ type SortDirection = "asc" | "desc";
 
 type ColumnFilterField = "noOr" | "dateEntreeHeure" | "cs" | "chassis" | "immatriculation" | "modele" | "nomClient" | "etat" | "equipe" | "matricule" | "avancement" | "dateFinRep" | "emplacement" | "description";
 
+function getEntryDateForFilter(value?: string): string {
+  const raw = String(value || "").trim();
+  if (!raw) return "Non renseigné";
+
+  const frenchDate = raw.match(/^(\d{1,2})[/-](\d{1,2})[/-](\d{4})/);
+  if (frenchDate) {
+    return `${frenchDate[1].padStart(2, "0")}/${frenchDate[2].padStart(2, "0")}/${frenchDate[3]}`;
+  }
+
+  const isoDate = raw.match(/^(\d{4})-(\d{1,2})-(\d{1,2})/);
+  if (isoDate) {
+    return `${isoDate[3].padStart(2, "0")}/${isoDate[2].padStart(2, "0")}/${isoDate[1]}`;
+  }
+
+  return raw.split(/[ T]/)[0] || "Non renseigné";
+}
+
 function getColumnFilterValue(item: UnifiedReceptionRow, field: ColumnFilterField): string {
+  if (field === "dateEntreeHeure") {
+    return getEntryDateForFilter(item.dateEntreeHeure);
+  }
+
   const values: Record<ColumnFilterField, string | undefined> = {
     noOr: item.noOr,
     dateEntreeHeure: item.dateEntreeHeure,

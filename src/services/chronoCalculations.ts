@@ -1,7 +1,6 @@
 import type { Flux } from '../data/mockData';
 import type { SuiviEntree } from './database';
 import { calculateVehicleTimes, type VehicleTimeCalculation } from './timeTracking';
-import { isCompletedWarrantyVehicle } from './warranty';
 
 /**
  * Source unique des dossiers analysés par Chronométrie et Rendement.
@@ -73,7 +72,8 @@ export function buildChronoTimeCalculations(
     });
   });
 
-  return merged
-    .filter((vehicle) => !isCompletedWarrantyVehicle(vehicle))
-    .map((vehicle) => calculateVehicleTimes(vehicle));
+  // Les dossiers Garantie (R10) utilisent les mêmes équipes, techniciens et
+  // temps de travail que les autres OR. Ils doivent donc être intégrés à la
+  // Chronométrie et, par conséquent, à la page Moyennes.
+  return merged.map((vehicle) => calculateVehicleTimes(vehicle));
 }

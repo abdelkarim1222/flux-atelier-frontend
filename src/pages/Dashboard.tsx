@@ -160,6 +160,7 @@ import {
 type StatusFilter = "Tous" | "Attentes" | WorkshopStatus;
 type DatabaseStatus = "loading" | "ready" | "fallback";
 const ALL_DATES = "Toutes";
+const ALL_TEAMS = "Toutes";
 
 /** P1–P10 sont regroupées dans le parking vertical de droite. */
 function renameElectricStations(svgMarkup: string) {
@@ -913,6 +914,7 @@ export default function Dashboard() {
   const [lastRefresh, setLastRefresh] = useState("26/03/2026 08:57");
   const [search, setSearch] = useState("");
   const [dateFilter, setDateFilter] = useState(ALL_DATES);
+  const [teamFilter, setTeamFilter] = useState(ALL_TEAMS);
   const [draftEmplacements, setDraftEmplacements] = useState<Record<number, string>>({});
   const [sharedPlanVehicles, setSharedPlanVehicles] = useState<Flux[]>([]);
   const [savingVehicleId, setSavingVehicleId] = useState<number | null>(null);
@@ -1480,6 +1482,7 @@ export default function Dashboard() {
           setActiveFilter("Tous");
         }
         setDateFilter(ALL_DATES);
+        setTeamFilter(ALL_TEAMS);
       }
     };
     window.addEventListener("flux_new_vehicle_added", handleNewVehicleAdded);
@@ -1510,6 +1513,7 @@ export default function Dashboard() {
       if (role === "administration" || role === "chef_atelier") {
         setActiveFilter("Tous");
         setDateFilter(ALL_DATES);
+        setTeamFilter(ALL_TEAMS);
         setSelectedZone(null);
         setSelectedVehicleId(null);
         setIsDetailPinned(false);
@@ -3521,9 +3525,14 @@ export default function Dashboard() {
 
     return vehicles
       .filter((row) => {
-        // Tous les dossiers R10 sortent du flux opérationnel :
-        // ils restent accessibles uniquement depuis le Tableau de Suivi Garantie.
-        if (isWarrantyVehicle(row)) {
+        // Un dossier R10 reste géré dans le Tableau Garantie, mais il doit
+        // aussi être transmis à l'équipe choisie pendant les travaux. Il est
+        // donc visible dans Chargement / En cours pour le Chef d'équipe et la
+        // direction, sans apparaître dans les autres tableaux opérationnels.
+        const canSeeWarrantyInWorkshop =
+          (activeTab === "chargement" || activeTab === "en_cours") &&
+          ["chef_equipe", "chef_atelier", "administration"].includes(role);
+        if (isWarrantyVehicle(row) && !canSeeWarrantyInWorkshop) {
           return false;
         }
         if (role !== "administration" && (
@@ -3581,6 +3590,9 @@ export default function Dashboard() {
         const matchesDate =
           dateFilter === ALL_DATES ||
           normalizeDateLabel(row.dateEntree) === dateFilter;
+        const matchesTeam =
+          teamFilter === ALL_TEAMS ||
+          String(row.equipe || "").trim() === teamFilter;
         const haystack = [
           row.emplacement,
           row.l2n2500,
@@ -3604,7 +3616,7 @@ export default function Dashboard() {
           .join(" ")
           .toLowerCase();
 
-        return matchesStatus && matchesDate && (!query || haystack.includes(query));
+        return matchesStatus && matchesDate && matchesTeam && (!query || haystack.includes(query));
       })
       .sort((a, b) => {
         // 1. Priorité absolue : entrées en cours d'ajout / locales récentes (optimistes)
@@ -3633,7 +3645,7 @@ export default function Dashboard() {
         if (dateA !== dateB) return dateB - dateA;
         return String(b.id ?? "").localeCompare(String(a.id ?? ""), undefined, { numeric: true });
       });
-  }, [activeFilter, dateFilter, search, vehicles, role, assignedReceptionCs, activeTab, effectiveChefFilterTeam, enCoursTransferOnly]);
+  }, [activeFilter, dateFilter, teamFilter, search, vehicles, role, assignedReceptionCs, activeTab, effectiveChefFilterTeam, enCoursTransferOnly]);
 
   const workshopVehicles = useMemo(
     () => vehicles.filter((vehicle) => !isWarrantyVehicle(vehicle)),
@@ -3650,6 +3662,18 @@ export default function Dashboard() {
         )
       ).sort((a, b) => parseStoredDate(b) - parseStoredDate(a)),
     [workshopVehicles]
+  );
+
+  const teamOptions = useMemo(
+    () =>
+      Array.from(
+        new Set(
+          vehicles
+            .map((row) => String(row.equipe || "").trim())
+            .filter(Boolean)
+        )
+      ).sort((a, b) => a.localeCompare(b, "fr")),
+    [vehicles]
   );
 
   const statusRows = useMemo(
@@ -3962,6 +3986,7 @@ export default function Dashboard() {
       setActiveFilter("Tous");
     }
     setDateFilter(ALL_DATES);
+    setTeamFilter(ALL_TEAMS);
     setSelectedZone(null);
     setSelectedVehicleId(null);
     setIsDetailPinned(false);
@@ -5866,6 +5891,29 @@ export default function Dashboard() {
                           ))}
                         </select>
                       </label>
+
+                      {role === "administration" && (
+                        <label className="state-filter">
+                          <span>Équipe</span>
+                          <select
+                            aria-label="Filtrer par équipe"
+                            onChange={(event) => {
+                              setTeamFilter(event.target.value);
+                              setSelectedZone(null);
+                              setSelectedVehicleId(null);
+                              setIsDetailPinned(false);
+                            }}
+                            value={teamFilter}
+                          >
+                            <option value={ALL_TEAMS}>Toutes</option>
+                            {teamOptions.map((team) => (
+                              <option key={team} value={team}>
+                                {team}
+                              </option>
+                            ))}
+                          </select>
+                        </label>
+                      )}
 
                       {/* Sélecteur multi-équipes pour le Chef d'Équipe gérant plusieurs équipes */}
                       {role === "chef_equipe" && chefAssignedTeams.length > 1 && (
