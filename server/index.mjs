@@ -32,7 +32,7 @@ const VEHICLE_COLLECTIONS = new Set(['flux', 'reception', 'vin']);
 const RECORD_COLLECTIONS = new Set([
   'teams', 'averages', 'purchases', 'quotes', 'essai_controls',
   'vehicle_times', 'transfers', 'reassignments', 'essais', 'devis_notifications',
-  'entree_notifications', 'facturation_notifications',
+  'entree_notifications', 'facturation_notifications', 'intervention_history',
 ]);
 
 if (!DATABASE_URL) {
@@ -921,7 +921,8 @@ async function handleDatabaseAction(req, res, url) {
     return sendActionResult(res, { ok: true, message: 'Synchronisation SQL terminée.' });
   }
   // ══ reouvrirOR : archive l'intervention livrée et crée un nouveau cycle à la Réception.
-  // Les lignes originales ne sont jamais modifiées : elles restent l'historique de l'intervention 1.
+  // Un OR reste unique dans les tableaux opérationnels. Chaque réouverture crée
+  // un cycle distinct ; le cycle précédent est archivé intégralement.
   if (action === 'reouvrirOR') {
     const noOr = text('noOr', text('no'));
     const chassis = text('chassis').toUpperCase();
@@ -930,6 +931,7 @@ async function handleDatabaseAction(req, res, url) {
       `SELECT record_key, payload FROM vehicles
        WHERE (($1 <> '' AND (no_or = $1 OR payload->>'noOr' = $1 OR payload->>'numeroOR' = $1))
           OR ($2 <> '' AND (UPPER(chassis) = $2 OR UPPER(payload->>'chassis') = $2 OR UPPER(payload->>'vin') = $2)))
+         AND COALESCE(payload->>'interventionArchive', 'false') <> 'true'
          AND (LOWER(COALESCE(status, payload->>'etat', payload->>'etatIntervention', '')) LIKE '%livr%'
            OR LOWER(COALESCE(advancement, payload->>'avancement', '')) LIKE '%livr%')
        ORDER BY updated_at DESC, id DESC LIMIT 1`,
@@ -987,10 +989,38 @@ async function handleDatabaseAction(req, res, url) {
       modePaiement: '',
       statutFacturation: '',
       statutFacturationFinale: '',
+      dateDebutRep: '',
+      dateDebutTravail: '',
+      heureDebutTravail: '',
+      dateFinRep: '',
+      dateFin: '',
+      dateEnvoiEquipe: '',
+      interventionArchive: false,
     };
     const client = await pool.connect();
     try {
       await client.query('BEGIN');
+      // Conserver la fiche complète de l'intervention terminée. Cette archive
+      // contient notamment les travaux, dates et techniciens du cycle précédent.
+      const historyKey = `intervention-${sourceResult.rows[0].record_key}-I${Math.max(1, interventionNumero - 1)}`;
+      await client.query(
+        `INSERT INTO app_records (collection, record_key, vehicle_key, payload)
+         VALUES ('intervention_history', $1, $2, $3::jsonb)
+         ON CONFLICT (collection, record_key) DO UPDATE SET payload = EXCLUDED.payload, updated_at = NOW()`,
+        [historyKey, effectiveOr || effectiveChassis, JSON.stringify({
+          type: 'intervention_terminee', noOr: effectiveOr, chassis: effectiveChassis,
+          interventionNumero: Math.max(1, interventionNumero - 1), archiveLe: now,
+          archivePar: account.name || account.email || 'Administration', intervention: source,
+        })],
+      );
+      // Les deux projections (Réception et Flux) de l'ancien cycle restent
+      // en base, mais sortent des tableaux actifs.
+      await client.query(
+        `UPDATE vehicles
+         SET payload = payload || $1::jsonb, updated_at = NOW()
+         WHERE record_key = $2 AND record_type IN ('reception', 'flux')`,
+        [JSON.stringify({ interventionArchive: true, archiveLe: now, archivePar: account.name || account.email || 'Administration' }), sourceResult.rows[0].record_key],
+      );
       await saveVehicleRecord(client, 'reception', reopened, returnKey);
       await saveVehicleRecord(client, 'flux', reopened, returnKey);
       await client.query(
@@ -2813,11 +2843,42 @@ async function handle(req, res) {
         if (collection === 'flux' || collection === 'reception') {
           await enrichVehiclesWithInventory(records);
         }
+        // Une réouverture conserve l'ancien cycle dans intervention_history,
+        // mais le même OR ne doit jamais apparaître deux fois dans les listes
+        // opérationnelles. Ce filtre couvre aussi les doublons créés avant la
+        // mise en place de l'archivage explicite.
+        const activeOrs = new Set(records
+          .filter((record) => {
+            const state = String(record.etatIntervention || record.etat || record.statut || '').toLowerCase();
+            const advancement = String(record.avancement || '').toLowerCase();
+            return !state.includes('livr') && !advancement.includes('livr') && !advancement.includes('sorti');
+          })
+          .map((record) => String(record.noOr || record.numeroOR || record.no || record.or || '').trim().toUpperCase())
+          .filter(Boolean));
+        // Les lignes sont lues dans l'ordre de création : en cas de données
+        // anciennes non encore archivées, la dernière intervention est celle
+        // à exposer pour cet OR.
+        const latestRecordByOr = new Map();
+        for (const record of records) {
+          if (record.interventionArchive === true || record.interventionArchive === 'true') continue;
+          const noOr = String(record.noOr || record.numeroOR || record.no || record.or || '').trim().toUpperCase();
+          if (noOr) latestRecordByOr.set(noOr, String(record.recordKey || record.id || ''));
+        }
+        const operationalRecords = records.filter((record) => {
+          if (record.interventionArchive === true || record.interventionArchive === 'true') return false;
+          const noOr = String(record.noOr || record.numeroOR || record.no || record.or || '').trim().toUpperCase();
+          const recordKey = String(record.recordKey || record.id || '');
+          if (noOr && latestRecordByOr.get(noOr) !== recordKey) return false;
+          const state = String(record.etatIntervention || record.etat || record.statut || '').toLowerCase();
+          const advancement = String(record.avancement || '').toLowerCase();
+          const isClosed = state.includes('livr') || advancement.includes('livr') || advancement.includes('sorti');
+          return !(noOr && activeOrs.has(noOr) && isClosed);
+        });
         // Les véhicules livrés sont un historique réservé à l'Administration,
         // y compris lorsqu'un autre profil appelle directement l'API.
         const visibleRecords = account.role === 'administration'
-          ? records
-          : records.filter((record) => {
+          ? operationalRecords
+          : operationalRecords.filter((record) => {
               const state = String(record.etatIntervention || record.etat || record.statut || '').toLowerCase();
               const advancement = String(record.avancement || '').toLowerCase();
               return !state.includes('livr') && !advancement.includes('livr') && !advancement.includes('sorti');
