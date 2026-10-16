@@ -1,0 +1,40 @@
+services:
+  app:
+    build: .
+    ports:
+      - "172.16.6.100:5174:80"
+    depends_on:
+      - api
+
+  api:
+    build:
+      context: .
+      target: api
+    environment:
+      API_PORT: 3001
+      NODE_ENV: development
+      SKIP_DATABASE_BOOTSTRAP: "true"
+      DATABASE_URL: postgresql://${POSTGRES_USER:-flux_app}:${POSTGRES_PASSWORD:-flux_app_password}@db:5432/${POSTGRES_DB:-flux_atelier_app}
+      SESSION_SECRET: ${SESSION_SECRET:?Definissez SESSION_SECRET dans .env}
+      WORKSHOP_TIME_ZONE: ${WORKSHOP_TIME_ZONE:-Africa/Tunis}
+    depends_on:
+      db:
+        condition: service_healthy
+
+  db:
+    image: postgres:18-alpine
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-flux_atelier_app}
+      POSTGRES_USER: ${POSTGRES_USER:-flux_app}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-flux_app_password}
+    volumes:
+      - postgres_data:/var/lib/postgresql
+      - ./docker/postgres-init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
+volumes:
+  postgres_data:

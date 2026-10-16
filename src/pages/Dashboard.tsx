@@ -152,9 +152,12 @@ import { isVehicleMatchingTeam } from "../config/teams";
 import {
   ALL_EMPLACEMENTS,
   DELIVERED_EMPLACEMENT as AUTO_DELIVERED_EMPLACEMENT,
+  EMPLACEMENT_ZONES,
   FULL_PARKING_EMPLACEMENT,
+  calculerEmplacementAutomatique,
   getZoneForEmplacement,
   normalizeEmplacementCode,
+  WAITING_FOR_PLACE_EMPLACEMENT,
 } from "../services/emplacementService";
 
 type StatusFilter = "Tous" | "Attentes" | WorkshopStatus;
@@ -1314,7 +1317,12 @@ export default function Dashboard() {
             : undefined;
 
         if (existing) {
-          if (!isSheetEmplacementOutsideMap(emplacement)) {
+          const existingIsAwaitingClient =
+            String(existing.etatIntervention || existing.statut || "").toLowerCase().includes("attente client") ||
+            String(existing.avancement || "").toLowerCase().includes("termin");
+          // Une ancienne position de la réception ne doit pas ramener un
+          // dossier terminé dans son poste atelier après son transfert en L.
+          if (!existingIsAwaitingClient && !isSheetEmplacementOutsideMap(emplacement)) {
             existing.emplacement = emplacement;
           }
           // L'état actif du flux (interventions atelier en cours) EST STRICTEMENT PRIORITAIRE :
@@ -1408,6 +1416,45 @@ export default function Dashboard() {
         });
       });
       const mergedRows = mergeRecentAddedVehicles(withReceptionLocations);
+      const relocatedVehicles: Array<{ vehicle: Flux; emplacement: string }> = [];
+      const normalizedMergedRows = mergedRows.map((vehicle) => ({ ...vehicle }));
+
+      // Régularise également les dossiers déjà terminés avant cette règle :
+      // ils libèrent leur poste atelier et vont en L1–L8 (ou en attente).
+      normalizedMergedRows.forEach((vehicle) => {
+        const isAwaitingClient =
+          String(vehicle.etatIntervention || vehicle.statut || "").toLowerCase().includes("attente client") ||
+          String(vehicle.avancement || "").toLowerCase().includes("termin");
+        const currentEmplacement = normalizeEmplacementCode(vehicle.emplacement || "");
+        const isAlreadyOutsideWorkshop =
+          currentEmplacement.startsWith("L") ||
+          currentEmplacement === WAITING_FOR_PLACE_EMPLACEMENT ||
+          currentEmplacement === AUTO_DELIVERED_EMPLACEMENT;
+        const workshopStations = new Set<string>([
+          ...EMPLACEMENT_ZONES.DAILY,
+          ...EMPLACEMENT_ZONES.CHANGAN,
+          ...EMPLACEMENT_ZONES.ELECTRIQUE,
+          ...EMPLACEMENT_ZONES.SERVICE_RAPIDE,
+          ...EMPLACEMENT_ZONES.CARROSSERIE,
+          ...EMPLACEMENT_ZONES.LOURD_T,
+          ...EMPLACEMENT_ZONES.LOURD_M,
+        ]);
+        const isWorkshopStation = workshopStations.has(currentEmplacement);
+
+        // Le parking P est un choix manuel valide : ne jamais le remplacer
+        // automatiquement. Seuls les postes atelier (ou NA) sont régularisés.
+        if (!isAwaitingClient || isAlreadyOutsideWorkshop || (!isWorkshopStation && currentEmplacement !== "NA")) return;
+
+        const nextEmplacement = calculerEmplacementAutomatique(
+          vehicle,
+          normalizedMergedRows,
+          vehicle.id
+        );
+        if (nextEmplacement !== currentEmplacement) {
+          vehicle.emplacement = nextEmplacement;
+          relocatedVehicles.push({ vehicle, emplacement: nextEmplacement });
+        }
+      });
       setVehicles((currentRows) => {
         // Certaines réponses de synchronisation arrivent sans leur champ
         // emplacement pendant une très courte période. Elles ne doivent jamais
@@ -1420,7 +1467,7 @@ export default function Dashboard() {
             .forEach((key) => previousByKey.set(key, vehicle));
         });
 
-        return mergedRows.map((vehicle) => {
+        return normalizedMergedRows.map((vehicle) => {
           const incomingLocation = normalizeEmplacementCode(vehicle.emplacement || "");
           const hasIncomingMapLocation = mapZoneIds.has(incomingLocation);
           const isDelivered =
@@ -1439,6 +1486,13 @@ export default function Dashboard() {
             : vehicle;
         });
       });
+      if (canWriteToDatabase && relocatedVehicles.length > 0) {
+        void Promise.all(
+          relocatedVehicles.map(({ vehicle, emplacement }) =>
+            updateDatabaseEmplacement(vehicle, emplacement)
+          )
+        ).catch((error) => console.warn("Déplacement automatique vers la zone L impossible:", error));
+      }
       setDatabaseStatus("ready");
       setDatabaseError("");
     } catch (error) {
@@ -1656,15 +1710,17 @@ export default function Dashboard() {
         }
       }
 
-      // L'emplacement n'est jamais modifié automatiquement : seul le
-      // déplacement manuel sur le plan peut le changer.
       const computedVehicle: Partial<Flux> = {
         ...row,
         etatIntervention: nextEtat,
         statut: nextEtat,
         equipe: (isGoingToEnCours && assignedTeam ? assignedTeam : row.equipe) || "Daily1",
       };
-      const nextEmplacement = row.emplacement || "NA";
+      // « Attente Client » libère toujours le poste atelier et place le
+      // véhicule dans L1–L8, ou en attente si la zone L est complète.
+      const nextEmplacement = String(nextEtat).toLowerCase().includes("attente client")
+        ? calculerEmplacementAutomatique(computedVehicle, vehicles, row.id)
+        : row.emplacement || "NA";
 
       setWriteNotice("");
       setWriteError("");
@@ -2306,8 +2362,14 @@ export default function Dashboard() {
         nomTechnicien: targetNomTech,
         ...(isVrTransfer ? { statutAcceptation: "en_attente" as const } : {}),
       };
-      // Une évolution de dossier ne déplace jamais automatiquement le véhicule.
-      const nextEmplacement = row.emplacement || "NA";
+      // « Terminer » et « Attente Client » libèrent le poste atelier pour
+      // L1–L8. Si la zone L est pleine, le dossier attend une place.
+      const nextEmplacement = (
+        effectiveAvancement.toLowerCase().includes("termin") ||
+        nextEtat.toLowerCase().includes("attente client")
+      )
+        ? calculerEmplacementAutomatique(computedVehicle, vehicles, row.id)
+        : row.emplacement || "NA";
 
       // Transferts VR : enregistrer le début du transfert vers l'équipe cible horodaté à maintenant
       if (isVrTransfer) {

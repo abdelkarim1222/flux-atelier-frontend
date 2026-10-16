@@ -4,7 +4,7 @@ import {
   type WorkshopStatus,
 } from "../data/mockData";
 
-import { FULL_PARKING_EMPLACEMENT } from "./emplacementService";
+import { FULL_PARKING_EMPLACEMENT, WAITING_FOR_PLACE_EMPLACEMENT } from "./emplacementService";
 import { getWorkshopNow } from "./workshopTime";
 
 export const DELIVERED_EMPLACEMENT = "Livraison au client";
@@ -91,6 +91,7 @@ const outsideMapEmplacements = new Set([
   "PARCPLEIN",
   "PLACECOMPLET",
   "PLACECOMPLETE",
+  "ENATTENTEDEPLACE",
 ]);
 
 export function normalizeSheetEmplacement(value: string) {
@@ -102,6 +103,10 @@ export function normalizeSheetEmplacement(value: string) {
 
   if (normalizedValue === "LIVRAISONAUCLIENT" || normalizedValue.includes("LIVR")) {
     return DELIVERED_EMPLACEMENT;
+  }
+
+  if (normalizedValue === "ENATTENTEDEPLACE") {
+    return WAITING_FOR_PLACE_EMPLACEMENT;
   }
 
   if (normalizedValue.includes("COMPLET") || normalizedValue.includes("PLEIN")) {

@@ -83,6 +83,21 @@ function getAvancementBadgeStyle(val?: string): CSSProperties {
   };
 }
 
+/** Date de création/entrée, utilisée pour garder les nouveaux dossiers en tête. */
+function getNewestFirstTimestamp(vehicle: Flux): number {
+  if (typeof vehicle.creationTimestamp === "number") return vehicle.creationTimestamp;
+
+  const value = String((vehicle as any).dateEntreeHeure || `${vehicle.dateEntree || vehicle.date || ""} ${vehicle.heureEntree || ""}`).trim();
+  const frenchDate = value.match(/^(\d{1,2})[/-](\d{1,2})[/-](\d{2,4})(?:\s+(\d{1,2}):(\d{2})(?::(\d{2}))?)?/);
+  if (frenchDate) {
+    const year = frenchDate[3].length === 2 ? 2000 + Number(frenchDate[3]) : Number(frenchDate[3]);
+    return new Date(year, Number(frenchDate[2]) - 1, Number(frenchDate[1]), Number(frenchDate[4] || 0), Number(frenchDate[5] || 0), Number(frenchDate[6] || 0)).getTime();
+  }
+
+  const parsed = Date.parse(value);
+  return Number.isFinite(parsed) ? parsed : Number(vehicle.id || 0);
+}
+
 export default function EssaiView({
   vehicles,
   onUpdateAvancement,
@@ -188,7 +203,10 @@ export default function EssaiView({
         .toLowerCase();
 
       return haystack.includes(q);
-    }).sort((a, b) => Number(b.creationTimestamp || b.id || 0) - Number(a.creationTimestamp || a.id || 0));
+    }).sort((a, b) => {
+      const byDate = getNewestFirstTimestamp(b) - getNewestFirstTimestamp(a);
+      return byDate || String(b.id).localeCompare(String(a.id), undefined, { numeric: true });
+    });
   }, [tracedVehicles, selectedEquipe, search]);
 
   return (
@@ -285,9 +303,9 @@ export default function EssaiView({
 
       {/* Tableau des véhicules en essai */}
       <div className="bg-white rounded-2xl shadow-sm border border-slate-200/80 overflow-hidden">
-        <div className="overflow-x-auto">
+        <div className="max-h-[calc(100vh-20rem)] min-h-56 overflow-auto overscroll-contain">
           <table className="zebra-table w-full text-left border-collapse text-xs">
-            <thead>
+            <thead className="sticky top-0 z-10 shadow-sm">
               <tr className="bg-slate-50 border-b border-slate-200 text-slate-600 font-bold uppercase tracking-wider text-[10px]">
                 <th className="py-3 px-3.5">N° OR / Dossier</th>
                 <th className="py-3 px-3.5">Châssis & Véhicule</th>

@@ -25,3 +25,5 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
+flux-atelier-images.tar
+docker/postgres-init/flux_atelier.backup

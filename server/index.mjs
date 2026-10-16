@@ -483,7 +483,7 @@ function getVehicleColumns(record) {
 
 function isExclusiveWorkshopLocation(value) {
   const location = String(value || '').trim().toUpperCase().replace(/\s+/g, '');
-  return Boolean(location) && !['-', 'NA', 'LIVRAISONAUCLIENT', 'PLACECOMPLET', 'PARCCOMPLET'].includes(location);
+  return Boolean(location) && !['-', 'NA', 'LIVRAISONAUCLIENT', 'PLACECOMPLET', 'PARCCOMPLET', 'ENATTENTEDEPLACE'].includes(location);
 }
 
 async function requireAccount(req, res) {
@@ -661,7 +661,22 @@ async function updateVehicleBySelectors(query, updates, preferredType, allowedTe
        LIMIT 1`,
       [locationKey, targetIds, noOr, chassis, origNo, origChassis],
     );
-    if (occupied.rowCount && updates.swapEmplacement === true) {
+    const isClientWaitingVehicle = found.rows.some((row) => {
+      const state = String(
+        updates.etat || updates.etatIntervention || updates.statut || updates.avancement ||
+        row.status || row.advancement || row.payload?.etatIntervention || row.payload?.etat || row.payload?.avancement || ''
+      ).toLowerCase();
+      return state.includes('attente client') || state.includes('termin');
+    });
+    const isClientWaitingLocation = /^L[1-8]$/i.test(String(updates.emplacement || '').trim());
+
+    // L1–L8 peut être devenu occupé entre le calcul local et l'écriture SQL.
+    // Un dossier terminé / attente client doit alors attendre une place, jamais
+    // conserver ou échanger un poste atelier, et l'action ne doit pas échouer.
+    if (occupied.rowCount && isClientWaitingVehicle && isClientWaitingLocation) {
+      updates.emplacement = 'En attente de place';
+      delete updates.swapEmplacement;
+    } else if (occupied.rowCount && updates.swapEmplacement === true) {
       const sourceLocation = String(found.rows[0]?.location || found.rows[0]?.payload?.emplacement || '').trim();
       const vehicle = occupied.rows[0];
       if (!sourceLocation || !isExclusiveWorkshopLocation(sourceLocation)) {
@@ -2214,6 +2229,10 @@ async function handleDatabaseAction(req, res, url) {
 }
 
 async function bootstrap() {
+  if (process.env.SKIP_DATABASE_BOOTSTRAP === 'true') {
+    console.log('Initialisation de la base ignorée : utilisation de la base PostgreSQL existante.');
+    return;
+  }
   const schema = await readFile(schemaPath, 'utf8');
   await pool.query(schema);
 

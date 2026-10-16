@@ -2884,37 +2884,14 @@ function mettreEmplacementAutomatique_(
 
     } else {
 
-      place =
-        trouverPlaceLibre_(
-          sheet,
-          emplacementCol,
-          EMPLACEMENTS.P,
-          row
+      sheet
+        .getRange(
+          row,
+          emplacementCol
+        )
+        .setValue(
+          "En attente de place"
         );
-
-
-      if (place !== "") {
-
-        sheet
-          .getRange(
-            row,
-            emplacementCol
-          )
-          .setValue(
-            place
-          );
-
-      } else {
-
-        sheet
-          .getRange(
-            row,
-            emplacementCol
-          )
-          .setValue(
-            "Place complet"
-          );
-      }
     }
 
 
@@ -2923,7 +2900,7 @@ function mettreEmplacementAutomatique_(
       row,
       emplacementCol,
       EMPLACEMENTS.L.concat(
-        EMPLACEMENTS.P
+        ["En attente de place"]
       )
     );
 
@@ -3098,7 +3075,7 @@ function verifierEmplacementManuel_(
     return;
   }
 
-  if (valeur === "Place complet" || valeur === "Livraison au client") {
+  if (valeur === "Place complet" || valeur === "Livraison au client" || valeur === "En attente de place") {
     return;
   }
 
@@ -3224,6 +3201,7 @@ function verifierEmplacementManuel_(
   ) {
 
     const autorise =
+      valeur === "En attente de place" ||
       EMPLACEMENTS.L.includes(
         valeur
       ) ||
@@ -3237,7 +3215,7 @@ function verifierEmplacementManuel_(
       SpreadsheetApp
         .getActive()
         .toast(
-          "⚠️ Pour Attente client, utilisez L1-L8 ou P1-P76.",
+          "⚠️ Pour Attente client, utilisez L1-L8.",
           "Emplacement",
           5
         );

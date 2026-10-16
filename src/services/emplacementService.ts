@@ -2,6 +2,7 @@ import type { Flux } from "../data/mockData";
 
 export const DELIVERED_EMPLACEMENT = "Livraison au client";
 export const FULL_PARKING_EMPLACEMENT = "Place complet";
+export const WAITING_FOR_PLACE_EMPLACEMENT = "En attente de place";
 
 export const LEGACY_DAILY_MAPPING: Record<string, string> = {
   D1: "D510",
@@ -87,6 +88,7 @@ export const VALID_EMPLACEMENTS_SET = new Set<string>([
   ...Object.keys(LEGACY_DAILY_MAPPING),
   ...Object.keys(LEGACY_ELECTRIQUE_MAPPING),
   FULL_PARKING_EMPLACEMENT.toUpperCase(),
+  WAITING_FOR_PLACE_EMPLACEMENT.toUpperCase(),
   "PARC COMPLET",
   "PARCCOMPLET",
 ]);
@@ -119,6 +121,7 @@ export function normalizeEmplacementCode(val: string): string {
   const clean = (val || "").trim().toUpperCase().replace(/\s+/g, "");
   if (!clean || clean === "-" || clean === "NA") return "NA";
   if (clean === "LIVRAISONAUCLIENT" || clean.includes("LIVR")) return DELIVERED_EMPLACEMENT;
+  if (clean === "ENATTENTEDEPLACE") return WAITING_FOR_PLACE_EMPLACEMENT;
   if (clean.includes("COMPLET") || clean.includes("PLEIN")) return FULL_PARKING_EMPLACEMENT;
   const stripped = clean.replace(/^(ZONE|PARKING)/, "");
   if (LEGACY_DAILY_MAPPING[stripped]) return LEGACY_DAILY_MAPPING[stripped];
@@ -134,6 +137,7 @@ export function getZoneForEmplacement(place: string): string {
   const norm = normalizeEmplacementCode(place);
   if (norm === DELIVERED_EMPLACEMENT) return "Livré";
   if (norm === FULL_PARKING_EMPLACEMENT) return "Place complet";
+  if (norm === WAITING_FOR_PLACE_EMPLACEMENT) return "En attente de place";
   if (norm.startsWith("D")) return "Zone D (Daily1 / Daily2)";
   if (norm.startsWith("J")) return "Zone J (Changan / JMC)";
   if (norm.startsWith("E")) return "Zone E (Électrique)";
@@ -152,7 +156,7 @@ export function getZoneForEmplacement(place: string): string {
  *    - Devient « Livraison au client », ce qui libère sa précédente place dans l'atelier.
  * 2. Véhicule « Attente client » (ou terminé à 100% en attente livraison) :
  *    - Utilise en priorité la zone L (L1 à L8).
- *    - Si la zone L est pleine, bascule sur le parking général P (P1 à P85).
+ *    - Si la zone L est pleine, le dossier est signalé « En attente de place ».
  * 3. Véhicule « Attente réparation » (ou toute mise en attente) :
  *    - Attribué dans le parking général P (P1 à P85).
  * 4. Véhicule « En cours » :
@@ -212,7 +216,7 @@ export function calculerEmplacementAutomatique(
     }
   }
 
-  // 2. Attente client (ou travaux terminés) -> Zone L (L1..L8) puis P
+  // 2. Attente client (ou travaux terminés) -> Zone L (L1..L8)
   const isAttenteClient =
     etat.includes("attente client") ||
     avancement === "terminer" ||
@@ -225,12 +229,7 @@ export function calculerEmplacementAutomatique(
         return place;
       }
     }
-    for (const place of EMPLACEMENT_ZONES.PARKING_P) {
-      if (!occupiedPlaces.has(place.toUpperCase())) {
-        return place;
-      }
-    }
-    return FULL_PARKING_EMPLACEMENT;
+    return WAITING_FOR_PLACE_EMPLACEMENT;
   }
 
   // 3. Attente Réparation -> Parking général P (P1..P76)

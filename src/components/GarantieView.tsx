@@ -48,6 +48,36 @@ const STATUTS_GARANTIE = [
   "Dossier clôturé",
 ] as const;
 
+/** Convertit les dates enregistrées (FR, ISO ou Date Google Sheets) pour le tri. */
+function getEntryTimestamp(vehicle: Flux): number {
+  if (typeof vehicle.creationTimestamp === "number") return vehicle.creationTimestamp;
+
+  const value = String(
+    (vehicle as any).dateEntreeHeure ||
+    `${vehicle.dateEntree || vehicle.date || ""} ${vehicle.heureEntree || ""}`
+  ).trim();
+
+  const googleDate = value.match(/^Date\((\d{4}),\s*(\d{1,2}),\s*(\d{1,2})(?:,\s*(\d{1,2}),\s*(\d{1,2}),\s*(\d{1,2}))?/);
+  if (googleDate) {
+    return new Date(
+      Number(googleDate[1]), Number(googleDate[2]), Number(googleDate[3]),
+      Number(googleDate[4] || 0), Number(googleDate[5] || 0), Number(googleDate[6] || 0)
+    ).getTime();
+  }
+
+  const frenchDate = value.match(/^(\d{1,2})[/-](\d{1,2})[/-](\d{2,4})(?:\s+(\d{1,2}):(\d{2})(?::(\d{2}))?)?/);
+  if (frenchDate) {
+    const year = frenchDate[3].length === 2 ? 2000 + Number(frenchDate[3]) : Number(frenchDate[3]);
+    return new Date(
+      year, Number(frenchDate[2]) - 1, Number(frenchDate[1]),
+      Number(frenchDate[4] || 0), Number(frenchDate[5] || 0), Number(frenchDate[6] || 0)
+    ).getTime();
+  }
+
+  const parsed = Date.parse(value);
+  return Number.isFinite(parsed) ? parsed : (typeof vehicle.id === "number" ? vehicle.id : 0);
+}
+
 export default function GarantieView({
   vehicles,
   onSelectVehicle,
@@ -143,6 +173,16 @@ export default function GarantieView({
       }
 
       return true;
+    }).sort((a, b) => {
+      // Les dossiers ajoutés en dernier doivent toujours être visibles en tête
+      // du tableau, y compris avant leur synchronisation avec le serveur.
+      const aPending = Boolean(a.isPendingNewEntry);
+      const bPending = Boolean(b.isPendingNewEntry);
+      if (aPending !== bPending) return aPending ? -1 : 1;
+
+      const timestampDiff = getEntryTimestamp(b) - getEntryTimestamp(a);
+      if (timestampDiff !== 0) return timestampDiff;
+      return String(b.id ?? "").localeCompare(String(a.id ?? ""), undefined, { numeric: true });
     });
   }, [garantieVehicles, filterState, search]);
 
