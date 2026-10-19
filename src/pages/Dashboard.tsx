@@ -270,8 +270,58 @@ function makeRightParkingTenSlots(svgMarkup: string) {
     .replace("</svg>", `${mainSlots}${upperSlots}\n  </svg>`);
 }
 
-const atelierMapDisplaySvg = makeRightParkingTenSlots(
-  addAdditionalLourdStations(extendLourdZoneFrame(renameElectricStations(atelierMapSvg)))
+/** Trois places d'attente avant les ponts élévateurs, dans l'encadré de droite. */
+function addLiftWaitingSlots(svgMarkup: string) {
+  const positions = [
+    { code: "P82", x: 2434, y: 1104, width: 110, height: 40 },
+    { code: "P83", x: 2434, y: 1150, width: 110, height: 40 },
+    { code: "P84", x: 2434, y: 1196, width: 110, height: 40 },
+  ];
+
+  const slots = positions.map(({ code, x, y, width, height }) => {
+    const badgeWidth = Math.min(42, width - 12);
+    const badgeX = x + (width - badgeWidth) / 2;
+    const railHeight = 6;
+    const railInset = 6;
+    const lowerRailY = y + height - railHeight - 6;
+    const badgeY = y + (height - 20) / 2;
+
+    return `
+    <g class="lift-waiting-slot" opacity="0.98">
+      <rect id="${code}" x="${x}" y="${y}" width="${width}" height="${height}" rx="5" fill="#ffffff" stroke="#ea580c" stroke-width="2.5"/>
+      <rect x="${x + railInset}" y="${y + 6}" width="${width - railInset * 2}" height="${railHeight}" rx="2" fill="#f1f5f9" stroke="#cbd5e1" stroke-width="1" pointer-events="none"/>
+      <rect x="${x + railInset}" y="${lowerRailY}" width="${width - railInset * 2}" height="${railHeight}" rx="2" fill="#f1f5f9" stroke="#cbd5e1" stroke-width="1" pointer-events="none"/>
+      <rect x="${badgeX}" y="${badgeY}" width="${badgeWidth}" height="20" rx="5" fill="#ffffff" stroke="#ea580c" stroke-width="2" filter="url(#badgeGlow)" pointer-events="none"/>
+      <text x="${x + width / 2}" y="${badgeY + 14}" font-family="Arial, Helvetica, sans-serif" font-size="10" font-weight="900" fill="#000000" text-anchor="middle" pointer-events="none">${code}</text>
+    </g>`;
+  }).join("");
+
+  return svgMarkup.replace("</svg>", `${slots}\n  </svg>`);
+}
+
+/** Retire le cadre de la zone L, tout en conservant les places L1 à L8. */
+function removeLiftZoneFrame(svgMarkup: string) {
+  return svgMarkup
+    .replace(
+      '<rect x="2360" y="1210" width="230" height="640" rx="16" fill="#fff7ed" stroke="#ea580c" stroke-width="4"/>',
+      ""
+    )
+    .replace(
+      '<rect x="2360" y="1210" width="230" height="44" rx="10" fill="#ffedd5" stroke="#fdba74" stroke-width="1.5"/>',
+      ""
+    )
+    .replace(
+      '<text x="2375" y="1239" font-family="Arial, Helvetica, sans-serif" font-size="16" font-weight="900" fill="#000000" letter-spacing="1.5">PONTS ÉLÉVATEURS (L1 - L8)</text>',
+      ""
+    );
+}
+
+const atelierMapDisplaySvg = addLiftWaitingSlots(
+  removeLiftZoneFrame(
+    makeRightParkingTenSlots(
+      addAdditionalLourdStations(extendLourdZoneFrame(renameElectricStations(atelierMapSvg)))
+    )
+  )
 );
 // La même référence doit être conservée entre les rendus React. Sinon React
 // réinjecte le SVG et efface les couleurs appliquées aux places occupées.
@@ -303,7 +353,7 @@ const editableStatusSet = new Set<WorkshopStatus>(editableStatusOptions);
 const mapZoneIds = new Set(
   Array.from(atelierMapDisplaySvg.matchAll(/\bid="([^"]+)"/g), (match) =>
     match[1].toUpperCase()
-  )
+  ).filter((id) => !id.startsWith("LEGACY_"))
 );
 
 function removeDraft(
@@ -3879,6 +3929,72 @@ export default function Dashboard() {
     labelLayer.setAttribute("class", "atelier-zone-label");
     labelLayer.setAttribute("pointer-events", "none");
     svg.appendChild(labelLayer);
+
+    // Tous les emplacements libres utilisent le même dessin neutre : fond
+    // blanc, contour gris et cartouche central avec le code de la place.
+    // Les véhicules affectés sont dessinés ensuite par-dessus avec leur état.
+    mapZoneIds.forEach((zone) => {
+      if (rowsByZone.has(zone)) return;
+
+      let element: SVGGraphicsElement | null = null;
+      try {
+        element = svg.querySelector<SVGGraphicsElement>(`#${CSS.escape(zone)}`);
+      } catch {
+        return;
+      }
+
+      if (!element) return;
+
+      try {
+        const box = element.getBBox();
+        if (box.width <= 0 || box.height <= 0) return;
+
+        const slot = document.createElementNS("http://www.w3.org/2000/svg", "rect");
+        slot.setAttribute("x", String(box.x));
+        slot.setAttribute("y", String(box.y));
+        slot.setAttribute("width", String(box.width));
+        slot.setAttribute("height", String(box.height));
+        slot.setAttribute("rx", "5");
+        slot.setAttribute("fill", "#ffffff");
+        slot.setAttribute("stroke", "#94a3b8");
+        slot.setAttribute("stroke-width", "2");
+        labelLayer.appendChild(slot);
+
+        const fontSize = Math.max(8, Math.min(16, box.height * 0.24, box.width * 0.28));
+        const badgeW = Math.min(
+          box.width - 8,
+          Math.max(30, zone.length * fontSize * 0.7 + 10)
+        );
+        const badgeH = Math.max(18, Math.min(26, box.height * 0.28));
+        const badgeX = box.x + box.width / 2 - badgeW / 2;
+        const badgeY = box.y + box.height / 2 - badgeH / 2;
+
+        const badge = document.createElementNS("http://www.w3.org/2000/svg", "rect");
+        badge.setAttribute("x", String(badgeX));
+        badge.setAttribute("y", String(badgeY));
+        badge.setAttribute("width", String(badgeW));
+        badge.setAttribute("height", String(badgeH));
+        badge.setAttribute("rx", "4");
+        badge.setAttribute("fill", "#ffffff");
+        badge.setAttribute("stroke", "#475569");
+        badge.setAttribute("stroke-width", "1.5");
+        badge.setAttribute("filter", "url(#badgeGlow)");
+        labelLayer.appendChild(badge);
+
+        const code = document.createElementNS("http://www.w3.org/2000/svg", "text");
+        code.setAttribute("x", String(box.x + box.width / 2));
+        code.setAttribute("y", String(box.y + box.height / 2 + fontSize * 0.35));
+        code.setAttribute("text-anchor", "middle");
+        code.setAttribute("font-family", "ui-monospace, SFMono-Regular, Menlo, monospace");
+        code.setAttribute("font-size", String(fontSize));
+        code.setAttribute("font-weight", "900");
+        code.setAttribute("fill", "#000000");
+        code.textContent = zone;
+        labelLayer.appendChild(code);
+      } catch {
+        return;
+      }
+    });
 
     rowsByZone.forEach((rows, zone) => {
       if (!zone || !mapZoneIds.has(zone)) return;
