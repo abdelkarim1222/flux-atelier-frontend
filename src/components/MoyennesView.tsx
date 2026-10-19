@@ -1466,14 +1466,17 @@ export default function MoyennesView({ vehicles: vehiclesProp }: MoyennesViewPro
                 {technicianDailyRows.length} technicien(s)
               </span>
             </div>
-            <div className="overflow-x-auto bg-white">
+            <div
+              className="max-h-[calc(100vh-26rem)] min-h-[16rem] overflow-auto bg-white"
+              aria-label="Tableau des véhicules travaillés par jour"
+            >
               <table className="w-full min-w-[1250px] text-center border-collapse text-[11px]">
                 <thead>
                   <tr className="bg-[#2a6296] text-white font-bold">
-                    <th className="sticky left-0 z-10 bg-[#1f4e79] py-2 px-3 text-left min-w-[110px]">Matricule</th>
-                    <th className="sticky left-[110px] z-10 bg-[#1f4e79] py-2 px-3 text-left min-w-[160px]">Technicien</th>
-                    {daysList.map((day) => <th key={day} className="py-2 px-2 min-w-8">{day}</th>)}
-                    <th className="py-2 px-3 bg-[#183d5f]">Total</th>
+                    <th className="sticky top-0 left-0 z-30 bg-[#1f4e79] py-2 px-3 text-left min-w-[110px]">Matricule</th>
+                    <th className="sticky top-0 left-[110px] z-30 bg-[#1f4e79] py-2 px-3 text-left min-w-[160px]">Technicien</th>
+                    {daysList.map((day) => <th key={day} className="sticky top-0 z-20 bg-[#2a6296] py-2 px-2 min-w-8">{day}</th>)}
+                    <th className="sticky top-0 z-20 bg-[#183d5f] py-2 px-3">Total</th>
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-slate-100">
