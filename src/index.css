@@ -272,6 +272,33 @@ button {
   position: relative;
 }
 
+/* La page Moyennes est un document long : elle utilise le défilement normal
+   de la page, plutôt qu'un panneau interne figé à la hauteur de l'écran. */
+.pbix-monitor.moyennes-document {
+  height: auto;
+  overflow: visible;
+}
+
+.pbix-monitor.moyennes-document .dashboard-layout,
+.pbix-monitor.moyennes-document .dashboard-content-area {
+  height: auto;
+  min-height: calc(100vh - 56px);
+  overflow: visible;
+}
+
+.pbix-monitor.moyennes-document .dashboard-sidebar {
+  position: sticky;
+  top: 56px;
+  align-self: flex-start;
+  height: calc(100vh - 56px);
+}
+
+.pbix-monitor.moyennes-document .monitor-topbar {
+  position: sticky;
+  top: 0;
+  z-index: 50;
+}
+
 .monitor-brand,
 .monitor-actions {
   display: flex;
@@ -2011,6 +2038,56 @@ button {
 }
 
 @media (max-width: 768px) {
+  /* Sur téléphone, le document porte le défilement vertical. Les conteneurs
+     desktop à hauteur fixe empêchaient d'atteindre le bas des longues pages. */
+  html,
+  body,
+  #root {
+    height: auto;
+    min-height: 100%;
+    overflow-y: auto;
+  }
+
+  .pbix-monitor {
+    height: auto;
+    min-height: 100dvh;
+    overflow: visible;
+  }
+
+  .dashboard-layout {
+    height: auto;
+    min-height: calc(100dvh - 56px);
+    overflow: visible;
+  }
+
+  .dashboard-content-area {
+    display: block;
+    height: auto;
+    min-height: calc(100dvh - 56px);
+    overflow: visible;
+  }
+
+  .moyennes-print-root {
+    flex: none;
+  }
+
+  /* Une seule zone de défilement vertical sur téléphone : la page active.
+     Cela évite que les longues listes restent bloquées dans un sous-tableau. */
+  .dashboard-content-area {
+    overscroll-behavior-y: contain;
+  }
+
+  .dashboard-content-area > * {
+    min-width: 0;
+    max-width: 100%;
+  }
+
+  .dashboard-content-area .overflow-x-auto,
+  .dashboard-content-area .overflow-auto {
+    -webkit-overflow-scrolling: touch;
+    touch-action: pan-x pan-y;
+  }
+
   /* Topbar compacte sur mobile */
   .monitor-topbar {
     height: 56px;
@@ -2092,6 +2169,8 @@ button {
   [role="dialog"] {
     max-width: 95vw !important;
     margin: 12px auto !important;
+    max-height: calc(100dvh - 24px);
+    overflow-y: auto;
   }
 }
 
@@ -2180,5 +2259,33 @@ button {
 @media (max-width: 380px) {
   .monitor-reset-button {
     display: none;
+  }
+}
+
+/* Doit rester en dernière position : ces règles remplacent les hauteurs fixes
+   définies plus haut pour le bureau. Sur téléphone, le défilement appartient
+   au document entier, ce qui rend toujours accessible le bas des pages. */
+@media (max-width: 768px) {
+  .pbix-monitor {
+    height: auto;
+    min-height: 100dvh;
+    overflow: visible;
+  }
+
+  .dashboard-layout {
+    height: auto;
+    min-height: calc(100dvh - 56px);
+    overflow: visible;
+  }
+
+  .dashboard-content-area {
+    display: block;
+    height: auto;
+    min-height: calc(100dvh - 56px);
+    overflow: visible;
+  }
+
+  .moyennes-print-root {
+    flex: none;
   }
 }

@@ -94,6 +94,9 @@ export interface Flux {
   dateAvancement?: string;
   heureAvancement?: string;
   dateHeureAvancement?: string;
+  /** Dernière confirmation horaire faite par le chef, sans changement de pourcentage. */
+  dateDernierPointageAvancement?: string;
+  pointageAvancementPar?: string;
   statutGarantie?: string;
   dateValidationGarantie?: string;
   numeroAccordGarantie?: string;

@@ -1,4 +1,5 @@
 import { createServer } from 'node:http';
+import { Server as SocketIOServer } from 'socket.io';
 import { spawn } from 'node:child_process';
 import { createInterface } from 'node:readline';
 import { mkdtemp, readFile, rmdir, unlink, writeFile } from 'node:fs/promises';
@@ -7,7 +8,8 @@ import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 import pg from 'pg';
-import XLSX from 'xlsx';
+import ExcelJS from 'exceljs';
+import JSZip from 'jszip';
 
 const { Pool } = pg;
 const PORT = Number(process.env.API_PORT || 3001);
@@ -46,6 +48,7 @@ if (!SESSION_SECRET) {
 
 const pool = new Pool({ connectionString: DATABASE_URL, max: 10 });
 const schemaPath = fileURLToPath(new URL('./schema.sql', import.meta.url));
+let io = null;
 
 function send(res, status, body, headers = {}) {
   res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8', ...headers });
@@ -158,6 +161,45 @@ async function readBinary(req, maxBytes) {
   return Buffer.concat(chunks);
 }
 
+const EXCEL_MAIN_XML_NAMESPACE = 'http://schemas.openxmlformats.org/spreadsheetml/2006/main';
+
+/**
+ * Certains exports ERP utilisent le préfixe `x:` dans les XML d'un fichier
+ * .xlsx. Excel l'accepte, mais ExcelJS ne le lit pas toujours. Cette
+ * normalisation est appliquée uniquement en mémoire afin de préserver le
+ * fichier envoyé et ses données.
+ */
+async function normalizeExcelJsWorkbookBuffer(workbookBuffer) {
+  const zip = await JSZip.loadAsync(workbookBuffer);
+  let hasChanges = false;
+
+  for (const [entryName, entry] of Object.entries(zip.files)) {
+    if (entry.dir || !entryName.endsWith('.xml')) continue;
+
+    const originalXml = await entry.async('string');
+    let xml = originalXml;
+
+    if (xml.includes(`xmlns:x="${EXCEL_MAIN_XML_NAMESPACE}"`)) {
+      xml = xml
+        .replace(/(<\/?)(x:)/g, '$1')
+        .replace(/\sxmlns:x="http:\/\/schemas\.openxmlformats\.org\/spreadsheetml\/2006\/main"/g, '');
+    }
+
+    // Les tableaux Excel ne sont pas nécessaires à l'import. Les retirer de
+    // la feuille évite une erreur d'ExcelJS sur certains exports non standard.
+    if (entryName.startsWith('xl/worksheets/')) {
+      xml = xml.replace(/<tableParts\b[^>]*>[\s\S]*?<\/tableParts>/g, '');
+    }
+
+    if (xml !== originalXml) {
+      zip.file(entryName, xml);
+      hasChanges = true;
+    }
+  }
+
+  return hasChanges ? zip.generateAsync({ type: 'nodebuffer' }) : workbookBuffer;
+}
+
 async function importVehicleWorkbook(req, res) {
   const account = await requireAccount(req, res);
   if (!account) return;
@@ -173,8 +215,8 @@ async function importVehicleWorkbook(req, res) {
   }
   fileName = path.basename(fileName).slice(0, 180);
   const lowerName = fileName.toLowerCase();
-  if (!lowerName.endsWith('.xlsx') && !lowerName.endsWith('.xls')) {
-    return send(res, 400, { ok: false, error: 'Sélectionnez un classeur Excel au format .xlsx ou .xls.' });
+  if (!lowerName.endsWith('.xlsx')) {
+    return send(res, 400, { ok: false, error: 'Sélectionnez un classeur Excel au format .xlsx.' });
   }
 
   const workbookBuffer = await readBinary(req, 64 * 1024 * 1024);
@@ -182,19 +224,55 @@ async function importVehicleWorkbook(req, res) {
     return send(res, 400, { ok: false, error: 'Le fichier envoyé est vide ou corrompu.' });
   }
 
-  let workbook;
+  let workbook = new ExcelJS.Workbook();
   try {
-    workbook = XLSX.read(workbookBuffer, { type: 'buffer', cellDates: true });
+    await workbook.xlsx.load(workbookBuffer);
   } catch {
-    return send(res, 400, { ok: false, error: 'Le fichier sélectionné n’est pas un classeur Excel valide.' });
+    try {
+      workbook = new ExcelJS.Workbook();
+      const normalizedBuffer = await normalizeExcelJsWorkbookBuffer(workbookBuffer);
+      await workbook.xlsx.load(normalizedBuffer);
+    } catch {
+      return send(res, 400, {
+        ok: false,
+        error: 'Le fichier sélectionné n’est pas un classeur Excel .xlsx valide.',
+      });
+    }
   }
 
-  const sheetName = workbook.SheetNames[0];
-  if (!sheetName) {
-    return send(res, 400, { ok: false, error: 'Le classeur Excel ne contient aucune feuille de calcul.' });
+  const worksheet = workbook.worksheets[0];
+  if (!worksheet) {
+    return send(res, 400, {
+      ok: false,
+      error: 'Le classeur Excel ne contient aucune feuille de calcul.',
+    });
   }
-  const worksheet = workbook.Sheets[sheetName];
-  const rows = XLSX.utils.sheet_to_json(worksheet, { header: 1, raw: false, defval: null });
+
+  function cellToText(cell) {
+    if (!cell || cell.value == null) return null;
+
+    const value = cell.value;
+    if (value instanceof Date) return value.toLocaleDateString('fr-FR');
+
+    if (typeof value === 'object') {
+      if (Array.isArray(value.richText)) {
+        return value.richText.map((part) => part.text || '').join('');
+      }
+      if (value.result != null) return String(value.result);
+      if (value.text != null) return String(value.text);
+    }
+
+    return cell.text ?? String(value);
+  }
+
+  const rows = [];
+  worksheet.eachRow({ includeEmpty: true }, (row) => {
+    const values = [];
+    for (let i = 1; i <= worksheet.columnCount; i += 1) {
+      values.push(cellToText(row.getCell(i)));
+    }
+    rows.push(values);
+  });
   if (!rows || rows.length === 0) {
     return send(res, 400, { ok: false, error: 'La feuille Excel est vide.' });
   }
@@ -1348,10 +1426,11 @@ async function handleDatabaseAction(req, res, url) {
     const resolvedMarque = isHistoricalEntry ? text('marque', invBrand || fallbackData.marque || 'IVECO') : (invBrand || fallbackData.marque || 'IVECO');
     const resolvedModele = isHistoricalEntry ? text('modele', invModel || fallbackData.modele || '-') : (invModel || fallbackData.modele || '-');
     const resolvedCategorie = isHistoricalEntry ? text('categorie', fallbackData.categorie || '-') : (fallbackData.categorie || '-');
-    const resolvedDate = isHistoricalEntry && text('dateEntreeHeure') ? text('dateEntreeHeure') : new Date().toLocaleString('fr-FR', {
-      day: '2-digit', month: '2-digit', year: 'numeric',
-      hour: '2-digit', minute: '2-digit', second: '2-digit'
-    });
+    // L'interface capture l'heure affichée sur le poste de Réception au moment
+    // précis de la validation. On la conserve pour éviter tout décalage de
+    // fuseau horaire entre le navigateur et le serveur.
+    const requestedEntryDate = text('dateEntreeHeure');
+    const resolvedDate = requestedEntryDate || workshopDateTime().dateTime;
     const resolvedCodeClient = isHistoricalEntry ? text('codeClient', invRow?.customer_code || fallbackData.codeClient || '') : (invRow?.customer_code || fallbackData.codeClient || '');
 
     const reception = {
@@ -2210,6 +2289,7 @@ async function handleDatabaseAction(req, res, url) {
   }
   if (
     ['updateTechnicien', 'updateAvancement'].includes(action) &&
+    !text('dateDernierPointageAvancement') &&
     String(updateFields.etat || updateFields.etatIntervention || updateFields.statut || updateFields.avancement || '').toLowerCase().includes('en cours')
   ) {
     const now = workshopDateTime();
@@ -2356,7 +2436,11 @@ async function handle(req, res) {
     }
     const expiresAt = Date.now() + SESSION_TTL_SECONDS * 1000;
     const token = signSession(account.id, expiresAt);
-    const secure = process.env.NODE_ENV === 'production' ? '; Secure' : '';
+    // Un cookie « Secure » est refusé par les navigateurs sur http://, y compris
+    // lorsqu'on utilise une IP privée (172.16.x.x) depuis le réseau atelier.
+    // La variable explicite évite que NODE_ENV=production casse la connexion
+    // locale. En production HTTPS, définir COOKIE_SECURE=true.
+    const secure = process.env.COOKIE_SECURE === 'true' ? '; Secure' : '';
     return send(res, 200, { ok: true, user: cleanAccount(account) }, {
       'Set-Cookie': `${COOKIE_NAME}=${encodeURIComponent(token)}; HttpOnly; Path=/; SameSite=Lax; Max-Age=${SESSION_TTL_SECONDS}${secure}`,
     });
@@ -2425,6 +2509,10 @@ async function handle(req, res) {
       if (!name || !email.includes('@') || !password || !ROLE_VALUES.has(role)) {
         return send(res, 400, { ok: false, error: 'Nom, email, mot de passe et rôle valide requis.' });
       }
+      const assignedTeam = String(body.assignedTeam || '').trim().toUpperCase();
+      if (role === 'reception' && !/^R\d+$/.test(assignedTeam)) {
+        return send(res, 400, { ok: false, error: 'Un Centre Service au format R suivi de chiffres (ex. R22) est obligatoire pour la réception.' });
+      }
       const customPermissions = body.customPermissions && typeof body.customPermissions === 'object'
         ? JSON.stringify(body.customPermissions)
         : '{}';
@@ -2434,7 +2522,7 @@ async function handle(req, res) {
          VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)
          ON CONFLICT (email) DO NOTHING
          RETURNING id, name, email, role, assigned_team, custom_permissions`,
-        [id, name, email, passwordHash(password), role, body.assignedTeam || null, customPermissions],
+        [id, name, email, passwordHash(password), role, assignedTeam || null, customPermissions],
       );
       if (!result.rowCount) return send(res, 409, { ok: false, error: 'Un compte avec cette adresse existe déjà.' });
       return send(res, 200, { ok: true, account: cleanAccount(result.rows[0]) });
@@ -2463,13 +2551,18 @@ async function handle(req, res) {
       const customPermissions = body.customPermissions !== undefined
         ? (typeof body.customPermissions === 'object' ? JSON.stringify(body.customPermissions) : '{}')
         : (old.custom_permissions ? (typeof old.custom_permissions === 'string' ? old.custom_permissions : JSON.stringify(old.custom_permissions)) : '{}');
+      const nextRole = body.role || old.role;
+      const nextAssignedTeam = String(body.assignedTeam ?? old.assigned_team ?? '').trim().toUpperCase();
+      if (nextRole === 'reception' && !/^R\d+$/.test(nextAssignedTeam)) {
+        return send(res, 400, { ok: false, error: 'Un Centre Service au format R suivi de chiffres (ex. R22) est obligatoire pour la réception.' });
+      }
       const result = await pool.query(
         `UPDATE accounts SET name = $2, email = LOWER($3), role = $4, assigned_team = $5,
            password_hash = $6, custom_permissions = $7::jsonb, updated_at = NOW()
          WHERE id = $1 RETURNING id, name, email, role, assigned_team, custom_permissions`,
         [
           parts[2], String(body.name ?? old.name).trim(), email,
-          body.role || old.role, body.assignedTeam ?? old.assigned_team,
+          nextRole, nextAssignedTeam || null,
           password ? passwordHash(password) : old.password_hash,
           customPermissions,
         ],
@@ -2978,12 +3071,38 @@ async function handle(req, res) {
             );
           } else {
             const vehicleKey = String(record.vehicleId || record.noOr || record.or || record.chassis || '') || null;
+            // La chronométrie est un journal : deux écrans peuvent enregistrer
+            // à quelques secondes d'écart. Fusionner les étapes et le journal
+            // d'audit empêche qu'une ancienne copie navigateur efface l'historique.
+            let recordToSave = record;
+            if (collection === 'vehicle_times') {
+              const existing = await client.query(
+                'SELECT payload FROM app_records WHERE collection = $1 AND record_key = $2',
+                [collection, key],
+              );
+              const previous = existing.rows[0]?.payload || {};
+              const mergeById = (oldItems, newItems) => {
+                const merged = new Map();
+                for (const item of [...(oldItems || []), ...(newItems || [])]) {
+                  if (!item || typeof item !== 'object') continue;
+                  const itemKey = String(item.id || `${item.dateDebut || ''}-${item.label || ''}`);
+                  merged.set(itemKey, { ...(merged.get(itemKey) || {}), ...item });
+                }
+                return [...merged.values()];
+              };
+              recordToSave = {
+                ...previous,
+                ...record,
+                customSteps: mergeById(previous.customSteps, record.customSteps),
+                auditTrail: mergeById(previous.auditTrail, record.auditTrail),
+              };
+            }
             await client.query(
               `INSERT INTO app_records (collection, record_key, vehicle_key, payload)
                VALUES ($1, $2, $3, $4::jsonb)
                ON CONFLICT (collection, record_key) DO UPDATE SET
                  vehicle_key = EXCLUDED.vehicle_key, payload = EXCLUDED.payload, updated_at = NOW()`,
-              [collection, key, vehicleKey, JSON.stringify(record)],
+              [collection, key, vehicleKey, JSON.stringify(recordToSave)],
             );
           }
         }
@@ -3044,11 +3163,40 @@ async function handle(req, res) {
 }
 
 const server = createServer((req, res) => {
+  // Toute écriture réussie notifie immédiatement les autres écrans connectés.
+  // La réponse HTTP reste la source de vérité pour l'écran qui a fait l'action.
+  res.once('finish', () => {
+    const isDataChange = ['POST', 'PUT', 'DELETE'].includes(req.method)
+      && res.statusCode < 400
+      && (/^\/api\/(data|actions|inventory|accounts)(?:\/|$)/).test(req.url || '');
+    if (isDataChange) io?.emit('data:changed', { at: Date.now() });
+  });
   handle(req, res).catch((error) => {
     console.error('Erreur API PostgreSQL:', error);
     if (!res.headersSent) send(res, error.statusCode || 500, { ok: false, error: error.message || 'Erreur interne du serveur.' });
     else res.end();
   });
+});
+
+io = new SocketIOServer(server, {
+  path: '/socket.io',
+  cors: { origin: true, credentials: true },
+});
+
+// Les sockets utilisent le même cookie de session signé que l'API HTTP : une
+// connexion non authentifiée ne peut ni écouter les mises à jour ni ouvrir un
+// canal temps réel.
+io.use(async (socket, next) => {
+  try {
+    const accountId = verifySession(socket.request);
+    if (!accountId) return next(new Error('Session absente ou expirée.'));
+    const result = await pool.query('SELECT id FROM accounts WHERE id = $1', [accountId]);
+    if (!result.rowCount) return next(new Error('Compte introuvable.'));
+    socket.data.accountId = accountId;
+    return next();
+  } catch {
+    return next(new Error('Validation de session impossible.'));
+  }
 });
 
 bootstrap().then(() => {

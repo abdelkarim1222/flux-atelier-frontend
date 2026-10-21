@@ -210,25 +210,26 @@ export default function EssaiView({
   }, [tracedVehicles, selectedEquipe, search]);
 
   return (
-    <div className="p-4 sm:p-6 space-y-6 animate-in fade-in duration-200">
+    <div className="essai-page min-h-full p-3 sm:p-5 lg:p-6 space-y-4 sm:space-y-5 animate-in fade-in duration-200 md:flex-1 md:min-h-0 md:overflow-y-auto md:overscroll-contain md:pb-8">
       {/* En-tête de la Page Essai */}
-      <div className="bg-gradient-to-r from-purple-900 via-indigo-900 to-slate-900 rounded-2xl p-6 text-white shadow-xl border border-purple-500/20 relative overflow-hidden">
-        <div className="absolute right-0 top-0 w-96 h-96 bg-purple-500/10 rounded-full blur-3xl pointer-events-none" />
+      <div className="bg-gradient-to-br from-violet-800 via-indigo-900 to-slate-900 rounded-[24px] p-4 sm:p-6 text-white shadow-xl border border-violet-400/30 relative overflow-hidden">
+        <div className="absolute -right-16 -top-24 w-[28rem] h-[28rem] bg-fuchsia-400/10 rounded-full blur-3xl pointer-events-none" />
+        <div className="absolute -left-20 -bottom-32 w-80 h-80 bg-violet-400/10 rounded-full blur-3xl pointer-events-none" />
         <div className="relative z-10 flex flex-col md:flex-row md:items-center justify-between gap-4">
           <div className="flex items-center gap-4">
-            <div className="p-3.5 bg-purple-500/20 text-purple-300 rounded-2xl border border-purple-400/30 shadow-inner">
-              <Gauge className="w-8 h-8" />
+            <div className="p-3 bg-white/10 text-violet-100 rounded-2xl border border-violet-300/40 shadow-inner">
+              <Gauge className="w-7 h-7" />
             </div>
             <div>
               <div className="flex items-center gap-2">
-                <h1 className="text-xl sm:text-2xl font-black tracking-tight text-white">
+                <h1 className="text-lg sm:text-2xl font-black tracking-tight text-white">
                   Véhicules en Essai & Contrôle
                 </h1>
-                <span className="px-2.5 py-0.5 rounded-full text-xs font-black bg-purple-500/30 text-purple-200 border border-purple-400/40">
+                <span className="px-2.5 py-0.5 rounded-full text-xs font-black bg-violet-500/40 text-violet-100 border border-violet-300/40">
                   {essaiVehicles.length} en cours
                 </span>
               </div>
-              <p className="text-xs text-purple-200/80 mt-1 max-w-2xl">
+              <p className="text-xs leading-relaxed text-violet-100/80 mt-1 max-w-2xl">
                 Suivi des véhicules ayant terminé leurs réparations mécaniques et actuellement soumis aux essais sur route, contrôles qualité ou vérifications finales.
               </p>
             </div>
@@ -251,20 +252,20 @@ export default function EssaiView({
         </div>
 
         {/* Mini stats cards */}
-        <div className="grid grid-cols-2 sm:grid-cols-3 gap-3 mt-6 pt-5 border-t border-purple-500/20">
-          <div className="bg-white/5 rounded-xl p-3 border border-white/10">
-            <div className="text-[11px] text-purple-200/70 font-semibold">Total en Essai</div>
+        <div className="grid grid-cols-1 sm:grid-cols-3 gap-2.5 mt-5 pt-4 border-t border-violet-300/20">
+          <div className="bg-white/8 rounded-xl p-3 border border-white/15">
+            <div className="text-[11px] text-violet-100/70 font-semibold">Total en Essai</div>
             <div className="text-2xl font-black text-white mt-0.5">{essaiVehicles.length}</div>
           </div>
-          <div className="bg-white/5 rounded-xl p-3 border border-white/10">
-            <div className="text-[11px] text-purple-200/70 font-semibold">Équipes mobilisées</div>
-            <div className="text-2xl font-black text-purple-300 mt-0.5">
+          <div className="bg-white/8 rounded-xl p-3 border border-white/15">
+            <div className="text-[11px] text-violet-100/70 font-semibold">Équipes mobilisées</div>
+            <div className="text-2xl font-black text-violet-200 mt-0.5">
               {availableEquipes.filter((e) => e !== "Toutes").length}
             </div>
           </div>
-          <div className="col-span-2 sm:col-span-1 bg-white/5 rounded-xl p-3 border border-white/10">
-            <div className="text-[11px] text-purple-200/70 font-semibold">Historique des essais</div>
-            <div className="text-xs font-medium text-purple-100 mt-1 flex items-center gap-1">
+          <div className="bg-white/8 rounded-xl p-3 border border-white/15">
+            <div className="text-[11px] text-violet-100/70 font-semibold">Historique des essais</div>
+            <div className="text-xs font-medium text-violet-50 mt-1 flex items-center gap-1">
               <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400" />
               <span>{canViewEssaiHistory ? "Conformes et non-conformes conservés" : "Réservé à l'Administration"}</span>
             </div>
@@ -273,8 +274,8 @@ export default function EssaiView({
       </div>
 
       {/* Barre de recherche et filtres */}
-      <div className="bg-white rounded-2xl p-4 shadow-sm border border-slate-200/80 flex flex-col sm:flex-row items-center justify-between gap-3">
-        <div className="relative w-full sm:w-80">
+      <div className="bg-white/95 rounded-2xl p-3 sm:p-4 shadow-sm border border-slate-200/80 flex flex-col sm:flex-row items-stretch sm:items-center justify-between gap-3">
+        <div className="relative w-full sm:max-w-md">
           <Search className="w-4 h-4 text-slate-400 absolute left-3 top-2.5 pointer-events-none" />
           <input
             type="text"
@@ -285,7 +286,7 @@ export default function EssaiView({
           />
         </div>
 
-        <div className="flex items-center gap-2 w-full sm:w-auto">
+        <div className="flex items-center gap-2 w-full sm:w-auto sm:min-w-[210px]">
           <Filter className="w-4 h-4 text-slate-400 shrink-0" />
           <select
             value={selectedEquipe}
@@ -302,9 +303,22 @@ export default function EssaiView({
       </div>
 
       {/* Tableau des véhicules en essai */}
-      <div className="bg-white rounded-2xl shadow-sm border border-slate-200/80 overflow-hidden">
-        <div className="max-h-[calc(100vh-20rem)] min-h-56 overflow-auto overscroll-contain">
-          <table className="zebra-table w-full text-left border-collapse text-xs">
+      <div className="bg-white rounded-2xl shadow-md border border-violet-100 overflow-hidden">
+        <div className="flex items-center justify-between gap-3 px-4 py-2.5 border-b border-violet-100 bg-violet-50/60">
+          <div className="text-xs font-black text-violet-950">Véhicules en essai et contrôles</div>
+          <div className="rounded-full border border-violet-200 bg-white px-2.5 py-1 text-[11px] font-bold text-violet-700">{filteredData.length} dossier{filteredData.length > 1 ? "s" : ""}</div>
+        </div>
+        <div className="min-h-0 overflow-x-auto overflow-y-visible">
+          <table className="zebra-table w-full min-w-[1380px] text-left border-collapse text-xs">
+            <colgroup>
+              <col className="w-[165px]" />
+              <col className="w-[255px]" />
+              <col className="w-[220px]" />
+              <col className="w-[225px]" />
+              <col className="w-[165px]" />
+              <col className="w-[270px]" />
+              <col className="w-[120px]" />
+            </colgroup>
             <thead className="sticky top-0 z-10 shadow-sm">
               <tr className="bg-slate-50 border-b border-slate-200 text-slate-600 font-bold uppercase tracking-wider text-[10px]">
                 <th className="py-3 px-3.5">N° OR / Dossier</th>
@@ -313,7 +327,7 @@ export default function EssaiView({
                 <th className="py-3 px-3.5">Équipe & Tech</th>
                 <th className="py-3 px-3.5">Emplacement</th>
                 <th className="py-3 px-3.5 min-w-[210px]">Contrôle & Validation Essai</th>
-                <th className="py-3 px-3.5 text-center min-w-[120px]">Actions</th>
+                <th className="py-3 px-3.5 text-center min-w-[120px] sticky right-0 bg-slate-50 z-20">Actions</th>
               </tr>
             </thead>
             <tbody className="divide-y divide-slate-100">
@@ -502,7 +516,7 @@ export default function EssaiView({
 
                       {/* Actions */}
                       <td
-                        className="py-3 px-3.5 text-center whitespace-nowrap"
+                        className="py-3 px-3.5 text-center whitespace-nowrap sticky right-0 bg-white group-hover:bg-violet-50/80 z-10 shadow-[-4px_0_8px_-5px_rgba(76,29,149,0.35)]"
                         onClick={(e) => e.stopPropagation()}
                       >
                         <div className="flex items-center justify-center gap-1.5">

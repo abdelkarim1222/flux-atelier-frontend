@@ -92,7 +92,7 @@ export default function VehicleInventoryView() {
   const lastResult = Math.min(page * PAGE_SIZE, visibleTotal);
 
   return (
-    <main className="flex h-full min-h-0 flex-col gap-4 overflow-hidden bg-slate-50/75 p-4 sm:p-6" aria-label="Parc des véhicules et engins">
+    <main className="flex h-auto min-h-full flex-col gap-4 overflow-visible bg-slate-50/75 p-4 sm:p-6 md:h-full md:min-h-0 md:overflow-hidden" aria-label="Parc des véhicules et engins">
       <section className="flex flex-col gap-4 rounded-2xl border border-slate-200 bg-white p-4 shadow-sm sm:flex-row sm:items-center sm:justify-between sm:p-5">
         <div className="flex items-start gap-3">
           <div className="rounded-xl bg-cyan-50 p-2.5 text-cyan-800"><Database size={22} /></div>
@@ -135,7 +135,7 @@ export default function VehicleInventoryView() {
         </div>
       </section>
 
-      <section className="flex min-h-0 flex-1 flex-col overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-sm">
+      <section className="flex min-h-0 flex-1 flex-col overflow-visible rounded-2xl border border-slate-200 bg-white shadow-sm md:overflow-hidden">
         <div className="flex flex-col gap-3 border-b border-slate-200 p-3 sm:flex-row sm:items-center sm:justify-between sm:px-4">
           <div className="relative w-full sm:max-w-md">
             <Search size={16} className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" />
@@ -154,7 +154,7 @@ export default function VehicleInventoryView() {
           <div role="alert" className="m-4 rounded-xl border border-rose-200 bg-rose-50 px-4 py-3 text-sm font-medium text-rose-800">{error}</div>
         )}
 
-        <div className="min-h-0 flex-1 overflow-auto">
+        <div className="min-h-0 flex-1 overflow-x-auto overflow-y-visible md:overflow-auto">
           <table className="zebra-table min-w-[1510px] w-full border-separate border-spacing-0 text-left text-xs">
             <thead className="sticky top-0 z-10 bg-slate-100 text-[10px] uppercase tracking-wide text-slate-600">
               <tr>

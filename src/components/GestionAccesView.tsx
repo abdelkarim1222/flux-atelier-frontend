@@ -32,6 +32,7 @@ import { useAuth } from "../context/AuthContext";
 import { type RoleType, type RolePermissions, ROLES_META } from "../context/RoleContext";
 import { type AuthorizedAccount } from "../config/accounts";
 import { CANONICAL_TEAMS, parseAssignedTeams } from "../config/teams";
+import { getCustomEquipeMembers, normalizePersonName, saveCustomEquipeMembers } from "../services/database";
 
 const VIEW_PERMISSIONS: { key: keyof RolePermissions; label: string; desc: string; icon: any }[] = [
   {
@@ -224,6 +225,34 @@ export default function GestionAccesView() {
     setFormCustomPermissions({ ...ROLES_META[formRole].permissions });
   };
 
+  // Un compte Réception est aussi un collaborateur de l'équipe Réception.
+  // Son centre (R10, R18, R22...) sert de matricule pour une liaison claire.
+  const synchronizeReceptionMember = (
+    account: { name: string; role: RoleType; assignedTeam?: string },
+    previousName?: string,
+  ) => {
+    const namesToReplace = new Set([account.name, previousName]
+      .filter(Boolean)
+      .map((name) => normalizePersonName(name!)));
+    const currentMembers = getCustomEquipeMembers() || [];
+    const remainingMembers = currentMembers.filter((member) => !(
+      member.poste.toUpperCase() === "RÉCEPTION" &&
+      namesToReplace.has(normalizePersonName(member.name))
+    ));
+    const centre = String(account.assignedTeam || "").trim().toUpperCase();
+
+    if (account.role === "reception" && /^R\d+$/.test(centre)) {
+      remainingMembers.push({
+        team: "Réception",
+        name: account.name.trim(),
+        poste: "RÉCEPTION",
+        matricule: centre,
+      });
+    }
+
+    saveCustomEquipeMembers(remainingMembers);
+  };
+
   const isCustomized = useMemo(() => {
     const defaults = ROLES_META[formRole].permissions;
     return Object.keys(defaults).some((k) => {
@@ -264,14 +293,15 @@ export default function GestionAccesView() {
       setFormError("Le mot de passe est obligatoire.");
       return;
     }
-    if (formRole === "reception" && !formTeam.trim()) {
-      setFormError("Veuillez attribuer un centre de réception.");
+    const normalizedReceptionCentre = formTeam.trim().toUpperCase();
+    if (formRole === "reception" && !/^R\d+$/.test(normalizedReceptionCentre)) {
+      setFormError("Veuillez attribuer un Centre Service au format R suivi de chiffres (ex. R22).");
       return;
     }
 
     let assignedTeamValue: string | undefined = undefined;
     if (formRole === "reception") {
-      assignedTeamValue = formTeam;
+      assignedTeamValue = normalizedReceptionCentre;
     } else if (formRole === "chef_equipe" || formRole === "chef_atelier" || formRole === "facturation") {
       if (formTeam === "Toutes") {
         assignedTeamValue = "Toutes";
@@ -295,6 +325,10 @@ export default function GestionAccesView() {
         setFormError(res.error || "Erreur lors de la modification.");
         return;
       }
+      synchronizeReceptionMember(
+        { name: cleanName, role: formRole, assignedTeam: assignedTeamValue },
+        editingAccount.name,
+      );
       setFormSuccess("Accès collaborateur mis à jour avec succès !");
       setTimeout(() => {
         setIsModalOpen(false);
@@ -314,6 +348,7 @@ export default function GestionAccesView() {
         setFormError(res.error || "Erreur lors de la création.");
         return;
       }
+      synchronizeReceptionMember({ name: cleanName, role: formRole, assignedTeam: assignedTeamValue });
 
       const newTotalInSession = sessionCreatedCount + 1;
       setSessionCreatedCount(newTotalInSession);
@@ -379,7 +414,7 @@ export default function GestionAccesView() {
   }, [accounts]);
 
   return (
-    <div className="flex flex-col h-full bg-slate-900/10 backdrop-blur-xs p-4 lg:p-6 overflow-y-auto">
+    <div className="flex flex-col h-auto min-h-full bg-slate-900/10 backdrop-blur-xs p-4 overflow-visible md:h-full md:overflow-y-auto lg:p-6">
       {/* Header Card */}
       <div className="bg-white/92 backdrop-blur-md rounded-2xl p-5 border border-white/60 shadow-lg mb-4">
         <div className="flex flex-col md:flex-row md:items-center justify-between gap-4">

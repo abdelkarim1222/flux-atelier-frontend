@@ -35,6 +35,54 @@ interface SuiviTempsViewProps {
   userTeam?: string;
 }
 
+type PhaseEquipe = {
+  key: "" | "1" | "2";
+  equipe: string;
+  priseEnCharge: string;
+  technicien: string;
+  dateFinPrevue: string;
+  attenteRep: string;
+  attentePieces: string;
+  attenteDevis: string;
+  reaffecte: string;
+  essai: string;
+};
+
+const valueOrDash = (value: unknown) => {
+  const text = String(value || "").trim();
+  return text && text !== "-" && text !== "NA" ? text : "-";
+};
+
+/**
+ * Les transferts conservent l'équipe quittée dans equipe1 puis equipe2 ;
+ * l'équipe courante est la dernière phase. L'ordre affiché est donc bien :
+ * Daily → Électrique → Carrosserie, même après plusieurs VR.
+ */
+function getPhasesEquipe(source: Flux | undefined, item: VehicleTimeCalculation): PhaseEquipe[] {
+  const raw = (source || {}) as Flux & Record<string, unknown>;
+  const phase = (key: "" | "1" | "2", equipe: unknown, fallback = false): PhaseEquipe => ({
+    key,
+    equipe: valueOrDash(equipe),
+    priseEnCharge: valueOrDash(raw[`datePriseEnCharge${key}`] || raw[`dateDebut${key}`] || (fallback ? item.datePriseEnChargeEquipe : "")),
+    technicien: valueOrDash(raw[`nomTechnicien${key}`] || raw[`technicien${key}`] || (fallback ? raw.nomTechnicien || raw.technicien : "")),
+    dateFinPrevue: valueOrDash(raw[`dateFin${key}`] || raw[`dateFinRep${key}`] || (fallback ? item.dateFinReparation : "")),
+    attenteRep: valueOrDash(raw[`dateAttenteRep${key}`] || (fallback ? raw.dateEntree || item.dateEntreeReception : "")),
+    attentePieces: valueOrDash(raw[`dateAttentePieces${key}`] || (fallback ? raw.dateDemande : "")),
+    attenteDevis: valueOrDash(raw[`dateAttenteDevis${key}`] || (fallback ? raw.dateDevis : "")),
+    reaffecte: valueOrDash(raw[`dateReaffecte${key}`] || (fallback ? raw.dateReaffectation : "")),
+    essai: valueOrDash(raw[`dateEssai${key}`] || (fallback ? raw.dateDebutEssai : "")),
+  });
+
+  const history: PhaseEquipe[] = [];
+  if (valueOrDash(raw.equipe1) !== "-") history.push(phase("1", raw.equipe1));
+  if (valueOrDash(raw.equipe2) !== "-") history.push(phase("2", raw.equipe2));
+  history.push(phase("", raw.equipe || item.equipe, true));
+
+  // Sans transfert, « equipe » est la seule phase. Avec transfert, les
+  // snapshots historique précèdent toujours l'équipe courante.
+  return history.slice(0, 3);
+}
+
 export default function SuiviTempsView({ userTeam }: SuiviTempsViewProps = {}) {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -122,6 +170,17 @@ export default function SuiviTempsView({ userTeam }: SuiviTempsViewProps = {}) {
   const timeCalculations = useMemo<VehicleTimeCalculation[]>(() => {
     return buildChronoTimeCalculations(vehicles, suiviList);
   }, [vehicles, suiviList, clockMinute]);
+
+  const sourceVehicleByKey = useMemo(() => {
+    const map = new Map<string, Flux>();
+    vehicles.forEach((vehicle) => {
+      [vehicle.ordre, vehicle.no, vehicle.chassis].forEach((value) => {
+        const key = String(value || "").trim().toUpperCase();
+        if (key) map.set(key, vehicle);
+      });
+    });
+    return map;
+  }, [vehicles]);
 
   // Liste des équipes uniques pour le filtre
   const equipes = useMemo(() => {
@@ -252,7 +311,7 @@ export default function SuiviTempsView({ userTeam }: SuiviTempsViewProps = {}) {
   };
 
   return (
-    <div className="flex flex-col h-[calc(100vh-56px)] bg-slate-900/10 p-3 md:p-6 overflow-y-auto">
+    <div className="flex flex-col h-auto min-h-full bg-slate-900/10 p-3 overflow-visible md:h-[calc(100vh-56px)] md:overflow-y-auto md:p-6">
       {error && (
         <div className="mb-4 p-3 bg-red-50 border border-red-200 rounded-xl flex items-center justify-between text-xs text-red-700">
           <div className="flex items-center gap-2">
@@ -501,37 +560,88 @@ export default function SuiviTempsView({ userTeam }: SuiviTempsViewProps = {}) {
       {/* Main Table */}
       <div className="bg-white/95 backdrop-blur-md rounded-2xl border border-white/60 shadow-lg flex-1 flex flex-col min-h-[460px] overflow-hidden">
         <div className="overflow-x-auto flex-1">
-          <table className="zebra-table w-full min-w-[1550px] text-left border-collapse text-xs">
+          <table className="w-full min-w-[4400px] text-left border-collapse text-xs">
+            <thead>
+              <tr className="sticky top-0 z-10 border-b border-slate-200 bg-slate-100 text-[11px] font-bold uppercase tracking-wider text-slate-600">
+                <th className="px-3 py-3">N° OR</th>
+                <th className="px-3 py-3">N° Immatriculation</th>
+                <th className="min-w-[160px] px-3 py-3">Client</th>
+                <th className="px-3 py-3">Date entrée & heure</th>
+                {["", " 1", " 2"].flatMap((suffix) => [
+                  <th key={`new-team-${suffix}`} className="bg-blue-50 px-3 py-3">Équipe{suffix}</th>,
+                  <th key={`new-start-${suffix}`} className="px-3 py-3">Prise en charge{suffix}</th>,
+                  <th key={`new-tech-${suffix}`} className="px-3 py-3">Nom de technicien{suffix}</th>,
+                  <th key={`new-end-${suffix}`} className="bg-emerald-50 px-3 py-3 text-emerald-800">Date fin prév.{suffix}</th>,
+                  <th key={`new-rep-${suffix}`} className="bg-amber-50 px-3 py-3 text-amber-800">Attente rép.{suffix} (date/heure)</th>,
+                  <th key={`new-pieces-${suffix}`} className="bg-orange-50 px-3 py-3 text-orange-800">Attente pièces{suffix} (date/heure)</th>,
+                  <th key={`new-devis-${suffix}`} className="bg-purple-50 px-3 py-3 text-purple-800">Attente devis{suffix} (date/heure)</th>,
+                  <th key={`new-reaff-${suffix}`} className="bg-fuchsia-50 px-3 py-3 text-fuchsia-800">Réaffecté{suffix} (date/heure)</th>,
+                  <th key={`new-essai-${suffix}`} className="bg-violet-50 px-3 py-3 text-violet-800">Essai{suffix} (date/heure)</th>,
+                ])}
+                <th className="bg-blue-100 px-3 py-3 text-blue-900">Travail net</th>
+                <th className="bg-indigo-100 px-3 py-3 text-indigo-900">Reste dans le travail</th>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-slate-100">
+              {loading && timeCalculations.length === 0 ? (
+                <tr><td colSpan={33} className="py-16 text-center text-slate-400">Calcul et synchronisation des temps d'atelier…</td></tr>
+              ) : filteredCalculations.length === 0 ? (
+                <tr><td colSpan={33} className="py-16 text-center text-slate-400">Aucun véhicule trouvé pour ces critères.</td></tr>
+              ) : filteredCalculations.map((item, index) => {
+                const source = sourceVehicleByKey.get(String(item.noOr || "").trim().toUpperCase())
+                  || sourceVehicleByKey.get(String(item.chassis || "").trim().toUpperCase());
+                const phases = getPhasesEquipe(source, item);
+                return (
+                  <tr key={`phases-${item.vehicleKey}-${index}`} className="cursor-pointer hover:bg-slate-50" onClick={() => handleOpenChrono(item)}>
+                    <td className="px-3 py-3 font-mono font-bold text-slate-900">{item.noOr}</td>
+                    <td className="px-3 py-3 font-mono">{item.immatriculation || "-"}</td>
+                    <td className="px-3 py-3 font-bold text-slate-800">{item.client}</td>
+                    <td className="px-3 py-3 font-mono text-[11px]">{item.dateEntreeReception || "-"}</td>
+                    {[0, 1, 2].map((phaseIndex) => {
+                      const phase = phases[phaseIndex] || {
+                        equipe: "-", priseEnCharge: "-", technicien: "-", dateFinPrevue: "-", attenteRep: "-", attentePieces: "-", attenteDevis: "-", reaffecte: "-", essai: "-",
+                      };
+                      return (
+                        <>
+                          <td key={`team-${phaseIndex}`} className="bg-blue-50/40 px-3 py-3 font-bold text-blue-800">{phase.equipe}</td>
+                          <td key={`start-${phaseIndex}`} className="px-3 py-3 font-mono text-[11px]">{phase.priseEnCharge}</td>
+                          <td key={`tech-${phaseIndex}`} className="px-3 py-3 font-semibold">{phase.technicien}</td>
+                          <td key={`end-${phaseIndex}`} className="bg-emerald-50/40 px-3 py-3 font-mono text-[11px] text-emerald-800">{phase.dateFinPrevue}</td>
+                          <td key={`rep-${phaseIndex}`} className="bg-amber-50/40 px-3 py-3 font-mono text-[11px] text-amber-800">{phase.attenteRep}</td>
+                          <td key={`pieces-${phaseIndex}`} className="bg-orange-50/40 px-3 py-3 font-mono text-[11px] text-orange-800">{phase.attentePieces}</td>
+                          <td key={`devis-${phaseIndex}`} className="bg-purple-50/40 px-3 py-3 font-mono text-[11px] text-purple-800">{phase.attenteDevis}</td>
+                          <td key={`reaff-${phaseIndex}`} className="bg-fuchsia-50/40 px-3 py-3 font-mono text-[11px] text-fuchsia-800">{phase.reaffecte}</td>
+                          <td key={`essai-${phaseIndex}`} className="bg-violet-50/40 px-3 py-3 font-mono text-[11px] text-violet-800">{phase.essai}</td>
+                        </>
+                      );
+                    })}
+                    <td className="bg-blue-50 px-3 py-3 font-mono font-black text-blue-900">{item.tempsTravailEffectifFormat}</td>
+                    <td className="bg-indigo-50 px-3 py-3 font-mono font-black text-indigo-900">{item.tempsRestantEstimeFormat}</td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+
+          <div className="hidden">
+          <table className="zebra-table w-full min-w-[4400px] text-left border-collapse text-xs">
             <thead>
               <tr className="bg-slate-100/90 border-b border-slate-200 text-slate-600 font-bold uppercase tracking-wider text-[11px] select-none sticky top-0 z-10 backdrop-blur-md">
                 <th className="py-3 px-3.5 whitespace-nowrap">N° OR</th>
-                <th className="py-3 px-3.5 whitespace-nowrap">N° Châssis</th>
                 <th className="py-3 px-3.5 whitespace-nowrap">N° Immatriculation</th>
                 <th className="py-3 px-4 min-w-[160px]">Client</th>
-                <th className="py-3 px-3.5 whitespace-nowrap">Équipe</th>
                 <th className="py-3 px-3.5 whitespace-nowrap">Date Entrée & Heure</th>
-                <th className="py-3 px-3.5 whitespace-nowrap text-emerald-800 font-extrabold bg-emerald-50/60">
-                  Date Fin Prév.
-                </th>
-                <th className="py-3 px-3.5 whitespace-nowrap">Prise en Charge</th>
-                <th className="py-3 px-3.5 whitespace-nowrap font-extrabold bg-slate-200/50">
-                  ⏳ Tout le temps (Séjour)
-                </th>
-                <th className="py-3 px-3.5 whitespace-nowrap text-amber-700 font-extrabold bg-amber-50/50">
-                  ⏱️ Attente Rép.
-                </th>
-                <th className="py-3 px-3.5 whitespace-nowrap text-orange-700 font-extrabold bg-orange-50/50">
-                  📦 Attente Pièces
-                </th>
-                <th className="py-3 px-3.5 whitespace-nowrap text-purple-700 font-extrabold bg-purple-50/50">
-                  📋 Attente Devis
-                </th>
-                <th className="py-3 px-3.5 whitespace-nowrap text-fuchsia-700 font-extrabold bg-fuchsia-50/50">
-                  🔄 Réaffecté
-                </th>
-                <th className="py-3 px-3.5 whitespace-nowrap text-violet-700 font-extrabold bg-violet-50/50">
-                  🚗 Essai
-                </th>
+                {["", " 1", " 2"].flatMap((suffix) => [
+                  <th key={`team-${suffix}`} className="py-3 px-3.5 whitespace-nowrap bg-blue-50/50">Équipe{suffix}</th>,
+                  <th key={`start-${suffix}`} className="py-3 px-3.5 whitespace-nowrap">Prise en charge{suffix}</th>,
+                  <th key={`tech-${suffix}`} className="py-3 px-3.5 whitespace-nowrap">Nom de technicien{suffix}</th>,
+                  <th key={`end-${suffix}`} className="py-3 px-3.5 whitespace-nowrap text-emerald-800 bg-emerald-50/60">Date fin prév.{suffix}</th>,
+                  <th key={`rep-${suffix}`} className="py-3 px-3.5 whitespace-nowrap text-amber-700 bg-amber-50/50">Attente rép.{suffix} (date/heure)</th>,
+                  <th key={`pieces-${suffix}`} className="py-3 px-3.5 whitespace-nowrap text-orange-700 bg-orange-50/50">Attente pièces{suffix} (date/heure)</th>,
+                  <th key={`devis-${suffix}`} className="py-3 px-3.5 whitespace-nowrap text-purple-700 bg-purple-50/50">Attente devis{suffix} (date/heure)</th>,
+                  <th key={`reaff-${suffix}`} className="py-3 px-3.5 whitespace-nowrap text-fuchsia-700 bg-fuchsia-50/50">Réaffecté{suffix} (date/heure)</th>,
+                  <th key={`essai-${suffix}`} className="py-3 px-3.5 whitespace-nowrap text-violet-700 bg-violet-50/50">Essai{suffix} (date/heure)</th>,
+                ])}
                 <th className="py-3 px-3.5 whitespace-nowrap text-blue-800 font-black bg-blue-100/60 border-l border-r border-blue-200">
                   <div>🛠️ Travail Net</div>
                   <div className="text-[9px] font-semibold text-blue-600 normal-case">Entrée/Sortie - Attentes</div>
@@ -539,12 +649,6 @@ export default function SuiviTempsView({ userTeam }: SuiviTempsViewProps = {}) {
                 <th className="py-3 px-3.5 whitespace-nowrap text-indigo-900 font-black bg-indigo-100/60 border-r border-indigo-200">
                   <div>⏳ Reste dans le travail</div>
                   <div className="text-[9px] font-semibold text-indigo-600 normal-case">Temps restant estimé</div>
-                </th>
-                <th className="py-3 px-3.5 whitespace-nowrap min-w-[110px]">
-                  Avancement
-                </th>
-                <th className="py-3 px-3.5 whitespace-nowrap text-center sticky right-0 bg-slate-100/95 backdrop-blur-md z-10">
-                  Chronométrie
                 </th>
               </tr>
             </thead>
@@ -835,6 +939,7 @@ export default function SuiviTempsView({ userTeam }: SuiviTempsViewProps = {}) {
               )}
             </tbody>
           </table>
+          </div>
         </div>
       </div>
 

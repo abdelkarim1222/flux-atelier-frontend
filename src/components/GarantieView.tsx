@@ -297,7 +297,7 @@ export default function GarantieView({
 
   return (
     <>
-    <div className="h-full min-h-0 overflow-y-auto overscroll-contain space-y-4 p-3 sm:p-6 bg-slate-50/70">
+    <div className="h-auto min-h-full overflow-visible space-y-4 p-3 sm:p-6 bg-slate-50/70 md:h-full md:min-h-0 md:overflow-y-auto md:overscroll-contain">
       {/* En-tête Principal */}
       <div className="flex flex-col md:flex-row md:items-center justify-between gap-4 bg-white p-4 sm:p-5 rounded-2xl border border-slate-200 shadow-sm">
         <div className="flex items-center gap-3">

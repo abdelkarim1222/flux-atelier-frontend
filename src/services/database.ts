@@ -2418,14 +2418,18 @@ export async function updateDatabaseAvancement(
   const nowFormatted = getNowFormatted();
   const dateModif = (extraParams?.dateModification || nowFormatted).trim();
   const timeStr = dateModif.includes(" ") ? dateModif.split(" ")[1] : "";
+  // Un pointage horaire confirme que le véhicule est toujours au même
+  // pourcentage. Il ne doit surtout pas modifier les dates du dernier vrai
+  // avancement, utilisées par la chronométrie et les rapports.
+  const isHourlyProgressCheckIn = Boolean(extraParams?.dateDernierPointageAvancement);
 
-  const values: Record<string, string> = {
-    avancement: cleanAv,
-    dateModification: dateModif,
-    dateAvancement: dateModif,
-    heureAvancement: timeStr,
-    dateHeureAvancement: dateModif,
-  };
+  const values: Record<string, string> = { avancement: cleanAv };
+  if (!isHourlyProgressCheckIn) {
+    values.dateModification = dateModif;
+    values.dateAvancement = dateModif;
+    values.heureAvancement = timeStr;
+    values.dateHeureAvancement = dateModif;
+  }
   if (equipe || row.equipe) {
     values.equipe = (equipe || row.equipe || "").trim();
   }
@@ -2440,7 +2444,7 @@ export async function updateDatabaseAvancement(
     cleanAv.toLowerCase() === "accepter accord";
 
   // En cours (10% à 90%) : horodatage début travail
-  if (cleanAv.startsWith("En cours") || cleanAv.includes("%")) {
+  if (!isHourlyProgressCheckIn && (cleanAv.startsWith("En cours") || cleanAv.includes("%"))) {
     // Un pourcentage supplémentaire ne constitue pas un nouveau démarrage :
     // on conserve le premier horodatage de prise en charge du véhicule.
     values.dateDebutRep = extraParams?.dateDebutRep || row.dateDebutRep || row.dateDebutTravail || dateModif;

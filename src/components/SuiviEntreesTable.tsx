@@ -139,6 +139,16 @@ function getEntryDateForFilter(value?: string): string {
   return raw.split(/[ T]/)[0] || "Non renseigné";
 }
 
+function toCalendarDate(value: string): string {
+  const match = String(value || "").match(/^(\d{2})\/(\d{2})\/(\d{4})$/);
+  return match ? `${match[3]}-${match[2]}-${match[1]}` : "";
+}
+
+function fromCalendarDate(value: string): string {
+  const match = String(value || "").match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  return match ? `${match[3]}/${match[2]}/${match[1]}` : "";
+}
+
 function getColumnFilterValue(item: UnifiedReceptionRow, field: ColumnFilterField): string {
   if (field === "dateEntreeHeure") {
     return getEntryDateForFilter(item.dateEntreeHeure);
@@ -1197,6 +1207,41 @@ export default function SuiviEntreesTable({ onNavigateToMap, initialNotice }: Su
     const option = columnFilterOptions.find((item) => item.field === field);
     if (!option) return null;
     const selected = columnFilters[field] || new Set<string>();
+    const isEntryDateFilter = field === "dateEntreeHeure";
+    const selectedCalendarDate = isEntryDateFilter ? toCalendarDate(Array.from(selected)[0] || "") : "";
+
+    if (isEntryDateFilter) {
+      const calendarInputId = "reception-entry-date-calendar-filter";
+      return (
+        <span className="relative shrink-0" onClick={(event) => event.stopPropagation()}>
+          <input
+            id={calendarInputId}
+            type="date"
+            value={selectedCalendarDate}
+            onChange={(event) => {
+              const date = fromCalendarDate(event.target.value);
+              setColumnFilters((current) => ({ ...current, [field]: date ? new Set([date]) : new Set() }));
+            }}
+            className="sr-only"
+            tabIndex={-1}
+          />
+          <button
+            type="button"
+            title="Choisir la date d’entrée dans le calendrier"
+            aria-label="Choisir la date d’entrée dans le calendrier"
+            onClick={() => {
+              const input = document.getElementById(calendarInputId) as HTMLInputElement | null;
+              if (!input) return;
+              if (typeof input.showPicker === "function") input.showPicker();
+              else input.click();
+            }}
+            className={`rounded p-0.5 transition-colors ${selected.size ? "bg-emerald-200 text-emerald-900" : "text-slate-400 hover:bg-slate-200 hover:text-slate-700"}`}
+          >
+            <ChevronDown className="w-3.5 h-3.5" />
+          </button>
+        </span>
+      );
+    }
 
     return (
       <details className="relative shrink-0" onClick={(event) => event.stopPropagation()}>
@@ -1366,7 +1411,7 @@ export default function SuiviEntreesTable({ onNavigateToMap, initialNotice }: Su
   };
 
   return (
-    <div className="flex flex-col h-[calc(100vh-56px)] bg-slate-900/10 p-3 md:p-6 overflow-y-auto">
+    <div className="flex flex-col h-auto min-h-full bg-slate-900/10 p-3 overflow-visible md:h-[calc(100vh-56px)] md:overflow-y-auto md:p-6">
       {/* Top Header Card */}
       <div className="bg-white/95 backdrop-blur-md rounded-2xl p-5 border border-white/60 shadow-lg mb-5">
         <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-4">

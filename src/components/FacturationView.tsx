@@ -693,7 +693,7 @@ export default function FacturationView({
   };
 
   return (
-    <div className="flex flex-col h-full bg-slate-900/10 backdrop-blur-xs p-4 lg:p-6 overflow-y-auto space-y-5">
+    <div className="flex flex-col h-auto min-h-full bg-slate-900/10 backdrop-blur-xs p-4 overflow-visible md:h-full md:overflow-y-auto lg:p-6 space-y-5">
       {/* Header Card */}
       <div className="bg-white/92 backdrop-blur-md rounded-2xl p-5 border border-white/60 shadow-lg">
         <div className="flex flex-col md:flex-row md:items-center justify-between gap-4">

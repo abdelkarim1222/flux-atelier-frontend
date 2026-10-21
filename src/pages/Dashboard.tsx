@@ -144,6 +144,7 @@ import {
 } from "../services/database";
 import {
   recordAvancementStatusChange,
+  getLatestProgressCheckInTimestamp,
   recordVehicleModification,
 } from "../services/timeTracking";
 import { isWarrantyVehicle } from "../services/warranty";
@@ -632,6 +633,21 @@ function normalizeDateLabel(value: string | undefined) {
   return String(value ?? "").trim().replace(/\s+/g, " ");
 }
 
+/** Conversion sans fuseau horaire : filtre interne français ↔ calendrier natif. */
+function dateLabelToCalendarValue(value: string) {
+  if (!value || value === ALL_DATES) return "";
+  const text = normalizeDateLabel(value);
+  const french = text.match(/^(\d{1,2})[/-](\d{1,2})[/-](\d{4})/);
+  if (french) return `${french[3]}-${french[2].padStart(2, "0")}-${french[1].padStart(2, "0")}`;
+  const iso = text.match(/^(\d{4})-(\d{1,2})-(\d{1,2})/);
+  return iso ? `${iso[1]}-${iso[2].padStart(2, "0")}-${iso[3].padStart(2, "0")}` : "";
+}
+
+function calendarValueToDateLabel(value: string) {
+  const iso = String(value || "").match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  return iso ? `${iso[3]}/${iso[2]}/${iso[1]}` : ALL_DATES;
+}
+
 function parseStoredDate(value: string | undefined) {
   const text = normalizeDateLabel(value);
   const serializedDate = text.match(
@@ -745,6 +761,11 @@ function MetricCard({
 export default function Dashboard() {
   const { currentUser, logout } = useAuth();
   const { role, roleInfo, permissions } = useRole();
+  const [progressClock, setProgressClock] = useState(() => Date.now());
+  useEffect(() => {
+    const timer = window.setInterval(() => setProgressClock(Date.now()), 60_000);
+    return () => window.clearInterval(timer);
+  }, []);
   const assignedReceptionCs = (role === "reception" || role === "garantie")
     ? (currentUser?.assignedTeam || (role === "garantie" ? "R10" : "")).trim().toUpperCase()
     : "";
@@ -1563,11 +1584,9 @@ export default function Dashboard() {
   useEffect(() => {
     void loadVehicles(false);
 
-    // Auto-synchronisation temps réel toutes les 3 secondes
-    const interval = setInterval(() => {
-      void loadVehicles(true);
-    }, 3000);
-
+    // La synchronisation est déclenchée par Socket.IO uniquement lorsqu'une
+    // donnée change. Éviter un rechargement complet toutes les 3 secondes
+    // réduit les requêtes et les recalculs inutiles du tableau de bord.
     const handleRefreshRequested = () => {
       void loadVehicles(true);
     };
@@ -1599,7 +1618,6 @@ export default function Dashboard() {
     window.addEventListener("storage", handleStorageChange);
 
     return () => {
-      clearInterval(interval);
       window.removeEventListener("flux_refresh_requested", handleRefreshRequested);
       window.removeEventListener("flux_new_vehicle_added", handleNewVehicleAdded);
       window.removeEventListener("storage", handleStorageChange);
@@ -1886,21 +1904,6 @@ export default function Dashboard() {
       const dateDebut = row.dateDebutRep || row.dateDebutTravail || currentDateTime;
       const heureDebut = row.heureDebutTravail || currentTime;
 
-      // Calcul automatique de l'emplacement atelier selon l'équipe responsable
-      const computedVehicle: Partial<Flux> = {
-        ...row,
-        etatIntervention: nextEtat,
-        statut: nextEtat,
-        avancement: nextAvancement,
-        equipe: assignedTeam || row.equipe,
-        technicien: technicien !== "-" ? technicien : row.technicien,
-        nomTechnicien: nomTechnicien !== "-" ? nomTechnicien : row.nomTechnicien,
-        dateDebutRep: dateDebut,
-        dateDebutTravail: dateDebut,
-        heureDebutTravail: heureDebut,
-        statutAcceptation: "accepte",
-        dateAcceptation: row.dateAcceptation || currentDateTime,
-      };
       const nextEmplacement = row.emplacement || "NA";
 
       setWriteNotice("");
@@ -2091,15 +2094,6 @@ export default function Dashboard() {
 
       const { dateTime: currentDateTime, time: currentTime } = getWorkshopNow();
 
-      const computedVehicle: Partial<Flux> = {
-        ...row,
-        equipe: finalTeam,
-        technicien: technicien && technicien !== "-" ? technicien : row.technicien,
-        nomTechnicien: nomTechnicien && nomTechnicien !== "-" ? nomTechnicien : row.nomTechnicien,
-        avancement: nextAvancement,
-        etatIntervention: "En cours",
-        statut: "En cours",
-      };
       const nextEmplacement = row.emplacement || "NA";
 
       setVehicles((current) =>
@@ -2511,6 +2505,12 @@ export default function Dashboard() {
                     equipe1: row.equipe || "Atelier",
                     avancement1: nextAvancement,
                     dateFin1: nowFormatted,
+                    datePriseEnCharge1: row.dateDebutTravail || row.dateDebutRep || "",
+                    dateAttenteRep1: row.dateEntree || "",
+                    dateAttentePieces1: row.dateDemande || "",
+                    dateAttenteDevis1: row.dateDevis || "",
+                    dateReaffecte1: row.dateReaffectation || "",
+                    dateEssai1: row.dateDebutEssai || "",
                     technicien1: row.technicien,
                     nomTechnicien1: row.nomTechnicien,
                   }
@@ -2520,6 +2520,12 @@ export default function Dashboard() {
                     equipe2: row.equipe || "Atelier",
                     avancement2: nextAvancement,
                     dateFin2: nowFormatted,
+                    datePriseEnCharge2: row.dateDebutTravail || row.dateDebutRep || "",
+                    dateAttenteRep2: row.dateEntree || "",
+                    dateAttentePieces2: row.dateDemande || "",
+                    dateAttenteDevis2: row.dateDevis || "",
+                    dateReaffecte2: row.dateReaffectation || "",
+                    dateEssai2: row.dateDebutEssai || "",
                     technicien2: row.technicien,
                     nomTechnicien2: row.nomTechnicien,
                   }
@@ -2628,6 +2634,12 @@ export default function Dashboard() {
           extraPayload.equipe1 = row.equipe || "Atelier";
           extraPayload.avancement1 = nextAvancement;
           extraPayload.dateFin1 = nowFormatted;
+          extraPayload.datePriseEnCharge1 = row.dateDebutTravail || row.dateDebutRep || "";
+          extraPayload.dateAttenteRep1 = row.dateEntree || "";
+          extraPayload.dateAttentePieces1 = row.dateDemande || "";
+          extraPayload.dateAttenteDevis1 = row.dateDevis || "";
+          extraPayload.dateReaffecte1 = row.dateReaffectation || "";
+          extraPayload.dateEssai1 = row.dateDebutEssai || "";
           if (row.technicien && row.technicien !== "-") {
             extraPayload.technicien1 = row.technicien;
           }
@@ -2638,6 +2650,12 @@ export default function Dashboard() {
           extraPayload.equipe2 = row.equipe || "Atelier";
           extraPayload.avancement2 = nextAvancement;
           extraPayload.dateFin2 = nowFormatted;
+          extraPayload.datePriseEnCharge2 = row.dateDebutTravail || row.dateDebutRep || "";
+          extraPayload.dateAttenteRep2 = row.dateEntree || "";
+          extraPayload.dateAttentePieces2 = row.dateDemande || "";
+          extraPayload.dateAttenteDevis2 = row.dateDevis || "";
+          extraPayload.dateReaffecte2 = row.dateReaffectation || "";
+          extraPayload.dateEssai2 = row.dateDebutEssai || "";
           if (row.technicien && row.technicien !== "-") {
             extraPayload.technicien2 = row.technicien;
           }
@@ -2706,7 +2724,6 @@ export default function Dashboard() {
                         : `Avancement ${row.serie || row.no} mis à jour : ${nextAvancement}.`;
         setWriteNotice(noticeMsg);
       } catch (error) {
-        const errorMessage = error instanceof Error ? error.message : String(error);
         if (
           nextAvancement === "attends acheter" ||
           nextAvancement === "Essai" ||
@@ -3098,6 +3115,23 @@ export default function Dashboard() {
       return isEnCours(v.etatIntervention, v.avancement, v.technicien, isReaffActive);
     }).length;
   }, [vehicles, role, effectiveChefFilterTeam, getReaffectationForVehicle]);
+
+  // Un chef d'équipe doit confirmer l'avancement de chaque véhicule actif au
+  // moins une fois par heure. La confirmation est une trace supplémentaire,
+  // elle ne remplace jamais les anciens pourcentages ni la chronométrie.
+  const hourlyProgressDueVehicles = useMemo(() => {
+    if (role !== "chef_equipe" || !effectiveChefFilterTeam) return [];
+    return vehicles.filter((vehicle) => {
+      if (!isVehicleMatchingTeam(vehicle.equipe || vehicle.equipe1 || "", effectiveChefFilterTeam)) return false;
+      const reaffectation = getReaffectationForVehicle(vehicle);
+      if (!isEnCours(vehicle.etatIntervention, vehicle.avancement, vehicle.technicien, Boolean(reaffectation && !reaffectation.isRepris))) return false;
+      const progress = parseAvancementPct(vehicle.avancement);
+      // Seulement « En cours - 10% » jusqu'à « En cours - 90% ».
+      if (progress === null || progress < 10 || progress > 90 || !String(vehicle.avancement || "").toLowerCase().includes("en cours")) return false;
+      const lastCheckIn = getLatestProgressCheckInTimestamp(vehicle);
+      return !lastCheckIn || progressClock - lastCheckIn >= 60 * 60 * 1000;
+    });
+  }, [vehicles, role, effectiveChefFilterTeam, getReaffectationForVehicle, progressClock]);
 
   const essaiCount = useMemo(() => {
     if (role === "chef_equipe" && effectiveChefFilterTeam) {
@@ -3764,18 +3798,6 @@ export default function Dashboard() {
     [vehicles]
   );
 
-  const dateOptions = useMemo(
-    () =>
-      Array.from(
-        new Set(
-          workshopVehicles
-            .map((row) => normalizeDateLabel(row.dateEntree))
-            .filter(Boolean)
-        )
-      ).sort((a, b) => parseStoredDate(b) - parseStoredDate(a)),
-    [workshopVehicles]
-  );
-
   const teamOptions = useMemo(
     () =>
       Array.from(
@@ -3895,7 +3917,6 @@ export default function Dashboard() {
       if (!element) return;
 
       const isOccupied = rowsByZone.has(zone);
-      const isSelected = selectedZone === zone;
 
       if (!isOccupied) {
         // Une place vide reste neutre. La couleur est réservée strictement
@@ -4171,8 +4192,47 @@ export default function Dashboard() {
     setSearch("");
   };
 
+  const handleHourlyProgressCheckIn = async (vehicle: Flux) => {
+    if (savingVehicleId === vehicle.id) return;
+
+    const checkInAt = getNowFormatted();
+    const checkedBy = currentUser?.name || selectedChefEquipeName || "Chef d'équipe";
+    const vehicleLabel = vehicle.no || vehicle.ordre || vehicle.chassis || "ce véhicule";
+
+    setSavingVehicleId(vehicle.id);
+    setWriteError("");
+    try {
+      // Le pourcentage envoyé est volontairement celui déjà affiché. Le
+      // marqueur dateDernierPointageAvancement permet au serveur de le
+      // distinguer d'un véritable changement d'avancement.
+      await updateDatabaseAvancement(vehicle, vehicle.avancement || "En cours - 10%", vehicle.equipe, vehicle.bloc, undefined, {
+        dateDernierPointageAvancement: checkInAt,
+        pointageAvancementPar: checkedBy,
+      });
+
+      setVehicles((current) => current.map((item) =>
+        item.id === vehicle.id
+          ? { ...item, dateDernierPointageAvancement: checkInAt, pointageAvancementPar: checkedBy }
+          : item
+      ));
+      recordVehicleModification(
+        vehicle,
+        "Pointage horaire confirmé",
+        `Avancement inchangé : ${vehicle.avancement || "-"} • Confirmé par ${checkedBy}`,
+        checkInAt,
+      );
+      setLastRefresh(formatRefreshDate());
+      setDatabaseStatus("ready");
+      setWriteNotice(`Pointage horaire enregistré pour ${vehicleLabel} : ${vehicle.avancement || "avancement inchangé"}.`);
+    } catch (error) {
+      setWriteError(error instanceof Error ? error.message : "Impossible d'enregistrer le pointage horaire dans PostgreSQL.");
+    } finally {
+      setSavingVehicleId((current) => current === vehicle.id ? null : current);
+    }
+  };
+
   return (
-    <div className="pbix-monitor">
+    <div className={`pbix-monitor ${activeTab === "moyennes" ? "moyennes-document" : ""}`}>
       <header className="monitor-topbar">
         <div className="monitor-brand">
           <button
@@ -4613,33 +4673,6 @@ export default function Dashboard() {
               </button>
             )}
 
-            {(role === "administration" || role === "chef_atelier" || permissions.canManageEquipes) && (
-              <button
-                type="button"
-                onClick={() => setActiveTab("gestion_equipes")}
-                className={`w-full flex items-center justify-between px-3.5 py-2.5 rounded-xl text-xs font-bold transition-all cursor-pointer text-left ${activeTab === "gestion_equipes"
-                    ? "bg-rose-600 text-white shadow-sm"
-                    : "text-slate-600 hover:text-rose-700 hover:bg-slate-100/90"
-                  }`}
-              >
-                <div className="flex items-center gap-2.5">
-                  <Users size={16} className={activeTab === "gestion_equipes" ? "text-white" : "text-rose-600"} />
-                  <div>
-                    <div className="leading-tight">Tableaux ÉQUIPE</div>
-                    <div className={`text-[10px] font-medium ${activeTab === "gestion_equipes" ? "text-rose-100" : "text-slate-400"}`}>
-                      Membres atelier
-                    </div>
-                  </div>
-                </div>
-                <span className={`px-2 py-0.5 rounded-full text-[10px] font-bold shrink-0 ${activeTab === "gestion_equipes"
-                    ? "bg-white/25 text-white"
-                    : "bg-rose-50 text-rose-700 border border-rose-200"
-                  }`}>
-                  {role === "administration" || role === "chef_atelier" ? "Admin" : "Équipe"}
-                </span>
-              </button>
-            )}
-
             {(role === "administration" || role === "chef_atelier") && (
               <button
                 type="button"
@@ -4663,6 +4696,33 @@ export default function Dashboard() {
                     : "bg-teal-50 text-teal-700 border border-teal-200"
                   }`}>
                   KPI
+                </span>
+              </button>
+            )}
+
+            {(role === "administration" || role === "chef_atelier" || permissions.canManageEquipes) && (
+              <button
+                type="button"
+                onClick={() => setActiveTab("gestion_equipes")}
+                className={`w-full flex items-center justify-between px-3.5 py-2.5 rounded-xl text-xs font-bold transition-all cursor-pointer text-left ${activeTab === "gestion_equipes"
+                    ? "bg-rose-600 text-white shadow-sm"
+                    : "text-slate-600 hover:text-rose-700 hover:bg-slate-100/90"
+                  }`}
+              >
+                <div className="flex items-center gap-2.5">
+                  <Users size={16} className={activeTab === "gestion_equipes" ? "text-white" : "text-rose-600"} />
+                  <div>
+                    <div className="leading-tight">Tableaux ÉQUIPE</div>
+                    <div className={`text-[10px] font-medium ${activeTab === "gestion_equipes" ? "text-rose-100" : "text-slate-400"}`}>
+                      Membres atelier
+                    </div>
+                  </div>
+                </div>
+                <span className={`px-2 py-0.5 rounded-full text-[10px] font-bold shrink-0 ${activeTab === "gestion_equipes"
+                    ? "bg-white/25 text-white"
+                    : "bg-rose-50 text-rose-700 border border-rose-200"
+                  }`}>
+                  {role === "administration" || role === "chef_atelier" ? "Admin" : "Équipe"}
                 </span>
               </button>
             )}
@@ -5970,6 +6030,36 @@ export default function Dashboard() {
                       </div>
                     </div>
 
+                    {role === "chef_equipe" && hourlyProgressDueVehicles.length > 0 && (
+                      <div className="mx-6 mt-4 mb-2 rounded-2xl border-2 border-rose-300 bg-rose-50 p-4 shadow-sm">
+                        <div className="flex flex-wrap items-center justify-between gap-3">
+                          <div className="flex items-start gap-2.5">
+                            <Clock size={18} className="mt-0.5 shrink-0 text-rose-600" />
+                            <div>
+                              <p className="text-sm font-black text-rose-900">Pointage horaire obligatoire</p>
+                              <p className="text-xs text-rose-800">
+                                {hourlyProgressDueVehicles.length} véhicule{hourlyProgressDueVehicles.length > 1 ? "s" : ""} entre 10% et 90% sans pointage horaire depuis une heure.
+                              </p>
+                            </div>
+                          </div>
+                          <div className="flex flex-wrap gap-2">
+                            {hourlyProgressDueVehicles.map((vehicle) => (
+                              <button
+                                key={`hourly-check-${vehicle.id}`}
+                                type="button"
+                                onClick={() => void handleHourlyProgressCheckIn(vehicle)}
+                                disabled={savingVehicleId === vehicle.id}
+                                className="rounded-lg border border-rose-300 bg-white px-2.5 py-1.5 text-xs font-bold text-rose-800 shadow-2xs transition-colors hover:bg-rose-100 disabled:cursor-wait disabled:opacity-60"
+                                title="Confirmer l'avancement actuel sans modifier son pourcentage"
+                              >
+                                {savingVehicleId === vehicle.id ? "Enregistrement…" : `Pointer ${vehicle.no || vehicle.ordre || vehicle.chassis}`}
+                              </button>
+                            ))}
+                          </div>
+                        </div>
+                      </div>
+                    )}
+
                     {/* Bannière de notification des transferts pour Chef d'Équipe */}
                     {USER_NOTIFICATIONS_ENABLED && role === "chef_equipe" && incomingTransfers.length > 0 && (
                       <div className="mx-6 mt-4 mb-2 p-4 bg-gradient-to-r from-amber-500/15 via-orange-500/10 to-amber-500/15 border-2 border-amber-400 rounded-2xl shadow-sm flex flex-wrap items-center justify-between gap-4">
@@ -6051,23 +6141,29 @@ export default function Dashboard() {
 
                       <label className="state-filter date-filter">
                         <span>Date</span>
-                        <select
+                        <input
                           aria-label="Filtrer par date d'entrée"
+                          type="date"
                           onChange={(event) => {
-                            setDateFilter(event.target.value);
+                            setDateFilter(calendarValueToDateLabel(event.target.value));
                             setSelectedZone(null);
                             setSelectedVehicleId(null);
                             setIsDetailPinned(false);
                           }}
-                          value={dateFilter}
-                        >
-                          <option value={ALL_DATES}>Toutes</option>
-                          {dateOptions.map((date) => (
-                            <option key={date} value={date}>
-                              {date}
-                            </option>
-                          ))}
-                        </select>
+                          value={dateLabelToCalendarValue(dateFilter)}
+                          title="Choisir une date dans le calendrier. Effacer retire le filtre."
+                          className="min-w-[142px] cursor-pointer bg-transparent font-semibold text-slate-800 outline-none"
+                        />
+                        {dateFilter !== ALL_DATES && (
+                          <button
+                            type="button"
+                            onClick={() => setDateFilter(ALL_DATES)}
+                            className="ml-1 rounded px-1 text-[10px] font-bold text-slate-500 hover:bg-slate-200 hover:text-slate-800"
+                            title="Effacer le filtre de date"
+                          >
+                            ×
+                          </button>
+                        )}
                       </label>
 
                       {role === "administration" && (
@@ -7132,6 +7228,7 @@ export default function Dashboard() {
 
                                 return (
                                   <tr
+                                    id={`vehicle-row-${row.id}`}
                                     className={`${selectedVehicleId === row.id ? "table-row-selected" : ""
                                       } ${isTransferPending ? "bg-amber-50/40 border-l-4 border-l-amber-500" : ""}`.trim()}
                                     key={row.id}

@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from "react";
+import React, { useState, useEffect, useMemo, useRef } from "react";
 import { createPortal } from "react-dom";
 import {
   X,
@@ -53,12 +53,20 @@ export default function NouvelleEntreeModal({
   onClose,
   onSuccess,
 }: NouvelleEntreeModalProps) {
-  const { currentUser } = useAuth();
+  const { currentUser, accounts } = useAuth();
   const isReceptionOrGarantie = currentUser?.role === "reception" || currentUser?.role === "garantie";
   const defaultCs = currentUser?.role === "garantie" ? "R10" : "";
   const assignedReceptionCs = isReceptionOrGarantie && /^R\d+$/i.test(currentUser?.assignedTeam || defaultCs)
     ? (currentUser?.assignedTeam || defaultCs).toUpperCase()
     : "";
+  const centreServiceOptions = useMemo(() => Array.from(new Set([
+    "R10", "R09", "R18", "R16",
+    ...accounts
+      .filter((account) => account.role === "reception")
+      .map((account) => String(account.assignedTeam || "").trim().toUpperCase())
+      .filter((centre) => /^R\d+$/.test(centre)),
+    assignedReceptionCs,
+  ].filter(Boolean))).sort((a, b) => a.localeCompare(b, undefined, { numeric: true })), [accounts, assignedReceptionCs]);
   const getNowFormatted = (withSeconds = false) => {
     const now = new Date();
     const dd = String(now.getDate()).padStart(2, "0");
@@ -403,10 +411,9 @@ export default function NouvelleEntreeModal({
                   }
                   className="w-full px-3 py-2 rounded-lg border border-slate-200 text-xs font-medium text-slate-900 focus:outline-none focus:ring-2 focus:ring-emerald-500/20 focus:border-emerald-500 bg-white disabled:bg-slate-50 disabled:text-slate-500 disabled:cursor-not-allowed"
                 >
-                  <option value="R10">R10</option>
-                  <option value="R09">R09</option>
-                  <option value="R18">R18</option>
-                  <option value="R16">R16</option>
+                  {centreServiceOptions.map((centre) => (
+                    <option key={centre} value={centre}>{centre}</option>
+                  ))}
                 </select>
                 {assignedReceptionCs && <p className="mt-1 text-[10px] font-semibold text-emerald-700">Centre attribué automatiquement à votre compte Réception.</p>}
               </div>

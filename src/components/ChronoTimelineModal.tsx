@@ -122,7 +122,7 @@ export default function ChronoTimelineModal({
         typeof inputTempsAlloueMin === "number" && inputTempsAlloueMin > 0
           ? inputTempsAlloueMin
           : undefined,
-    });
+    }, "Modification du barème de temps alloué");
     setIsEditingAlloue(false);
     refreshCalc();
     if (onUpdated) onUpdated();
@@ -147,7 +147,7 @@ export default function ChronoTimelineModal({
         typeof inputPresenceTotalMin === "number" && inputPresenceTotalMin > 0
           ? inputPresenceTotalMin
           : undefined,
-    });
+    }, "Modification du temps de séjour total");
     setIsEditingPresence(false);
     refreshCalc();
     if (onUpdated) onUpdated();
@@ -206,7 +206,7 @@ export default function ChronoTimelineModal({
     saveVehicleTimeLog({
       ...existingLog,
       customSteps: updatedSteps,
-    });
+    }, `Ajout : ${newStep.label}`);
 
     // Reset formulaire
     setNewStepLabel("");
@@ -226,11 +226,22 @@ export default function ChronoTimelineModal({
     const existingLog = allLogs[key];
     if (!existingLog || !existingLog.customSteps) return;
 
-    const filtered = existingLog.customSteps.filter((s) => s.id !== stepId);
+    const target = existingLog.customSteps.find((step) => step.id === stepId);
+    if (!target) return;
+    const archivedSteps = existingLog.customSteps.map((step) =>
+      step.id === stepId
+        ? {
+            ...step,
+            deletedAt: Date.now(),
+            deletedBy: "Administration",
+            commentaire: `${step.commentaire ? `${step.commentaire} • ` : ""}Annulée le ${new Date().toLocaleString("fr-FR")}.`,
+          }
+        : step,
+    );
     saveVehicleTimeLog({
       ...existingLog,
-      customSteps: filtered,
-    });
+      customSteps: archivedSteps,
+    }, `Annulation conservée : ${target.label}`);
 
     refreshCalc();
     if (onUpdated) onUpdated();
@@ -860,7 +871,7 @@ export default function ChronoTimelineModal({
                               type="button"
                               onClick={() => handleDeleteCustomStep(step.id)}
                               className="text-slate-400 hover:text-red-600 p-1 rounded transition-colors cursor-pointer"
-                              title="Supprimer cette étape"
+                              title="Annuler cette étape (elle reste dans l'historique)"
                             >
                               <Trash2 className="w-3.5 h-3.5" />
                             </button>
@@ -895,6 +906,26 @@ export default function ChronoTimelineModal({
                 );
               })}
             </div>
+
+            {(() => {
+              const auditTrail = getVehicleTimeLogs()[calc.vehicleKey]?.auditTrail || [];
+              if (auditTrail.length === 0) return null;
+              return (
+                <div className="mt-5 rounded-xl border border-slate-200 bg-slate-50 p-3">
+                  <h4 className="mb-2 flex items-center gap-1.5 text-[11px] font-black uppercase tracking-wide text-slate-700">
+                    <Edit2 className="h-3.5 w-3.5 text-indigo-600" /> Journal des modifications conservé
+                  </h4>
+                  <div className="max-h-36 space-y-1 overflow-y-auto text-[11px] text-slate-600">
+                    {[...auditTrail].reverse().map((entry) => (
+                      <div key={entry.id} className="rounded bg-white px-2 py-1.5 border border-slate-100">
+                        <span className="font-semibold text-slate-800">{new Date(entry.timestamp).toLocaleString("fr-FR")}</span>
+                        <span> — {entry.label}</span>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              );
+            })()}
           </div>
         </div>
 

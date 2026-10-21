@@ -44,6 +44,21 @@ export interface VehicleTimeStep {
   dureeMinutes?: number;
   commentaire?: string;
   automatique?: boolean;
+  /** Une suppression est une annulation : la trace reste archivée. */
+  deletedAt?: number;
+  deletedBy?: string;
+}
+
+export interface VehicleTimeAuditEntry {
+  id: string;
+  timestamp: number;
+  label: string;
+  beforeSteps: number;
+  afterSteps: number;
+  beforeTempsAlloueMin?: number;
+  afterTempsAlloueMin?: number;
+  beforePresenceTotalMin?: number;
+  afterPresenceTotalMin?: number;
 }
 
 export interface VehicleTimeLog {
@@ -64,6 +79,8 @@ export interface VehicleTimeLog {
   tempsEssaiMin?: number;         // Essai routier (ex: 15 min)
   tempsAlloueMin?: number;        // Temps prévu/alloué ou barème constructeur (en minutes)
   customSteps?: VehicleTimeStep[];
+  /** Journal immuable des corrections réalisées dans la chronométrie. */
+  auditTrail?: VehicleTimeAuditEntry[];
   updatedAt?: number;
 }
 
@@ -370,12 +387,26 @@ export function getVehicleTimeLogs(): Record<string, VehicleTimeLog> {
 /**
  * Sauvegarde un log de temps pour un véhicule
  */
-export function saveVehicleTimeLog(log: VehicleTimeLog): void {
+export function saveVehicleTimeLog(log: VehicleTimeLog, auditLabel = "Mise à jour de la chronométrie"): void {
   try {
     const all = getVehicleTimeLogs();
     const key = normalizeVehicleKey(log.vehicleKey || log.noOr || log.chassis);
+    const previous = all[key];
+    const auditTrail = [...(previous?.auditTrail || log.auditTrail || [])];
+    auditTrail.push({
+      id: `chrono-audit-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+      timestamp: Date.now(),
+      label: auditLabel,
+      beforeSteps: previous?.customSteps?.length || 0,
+      afterSteps: log.customSteps?.length || 0,
+      beforeTempsAlloueMin: previous?.tempsAlloueMin,
+      afterTempsAlloueMin: log.tempsAlloueMin,
+      beforePresenceTotalMin: previous?.tempsPresenceTotalMin,
+      afterPresenceTotalMin: log.tempsPresenceTotalMin,
+    });
     all[key] = {
       ...log,
+      auditTrail,
       updatedAt: Date.now(),
     };
     localStorage.setItem(STORAGE_KEY_TIME_LOGS, JSON.stringify(all));
@@ -457,7 +488,18 @@ export function recordVehicleModification(
   saveVehicleTimeLog({
     ...existing,
     customSteps: [...(existing.customSteps || []), step],
-  });
+  }, label);
+}
+
+/**
+ * Date du dernier changement réel d'avancement ou du dernier pointage horaire
+ * confirmé. Un simple clic sur une alerte ne doit jamais repousser l'échéance.
+ */
+export function getLatestProgressCheckInTimestamp(vehicle: Partial<Flux>): number {
+  const vehicleData = vehicle as Partial<Flux> & Record<string, unknown>;
+  return parseDateTimestamp(String(
+    vehicleData.dateDernierPointageAvancement || vehicleData.dateHeureAvancement || vehicleData.dateAvancement || vehicleData.dateModification || vehicleData.dateDebutTravail || "",
+  ));
 }
 
 function normalizeVehicleKey(key?: string): string {
@@ -628,7 +670,9 @@ export function calculateVehicleTimes(
   // 4. Analyse des demandes d'achat (Pièces) pour ce véhicule
   const allAchats = getDemandesAchatLocal();
   const vehicleAchats = Object.values(allAchats).filter(matchVehicle);
-  const customSteps = customLog?.customSteps || [];
+  // Les étapes annulées restent archivées pour l'audit, mais ne doivent plus
+  // influencer le calcul des temps.
+  const customSteps = (customLog?.customSteps || []).filter((step) => !step.deletedAt);
   // Les changements d'avancement sont la source la plus précise : ils sont
   // horodatés au clic, puis fermés automatiquement à la reprise/acceptation.
   // Les anciennes fiches restent un secours pour les dossiers historiques.

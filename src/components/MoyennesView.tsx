@@ -33,7 +33,9 @@ import {
   updateDatabaseMoyennesPeriode,
   fetchDatabaseFluxData,
   fetchSuiviEntreesData,
+  fetchEquipeSheetData,
   DEFAULT_MOYENNES_DATA,
+  type EquipeMember,
   type MoyennesSheetData,
   type SuiviEntree,
 } from "../services/database";
@@ -92,58 +94,6 @@ interface MoyennesViewProps {
   vehicles?: Flux[];
 }
 
-type TechnicianReference = {
-  matricule: string;
-  name: string;
-};
-
-/**
- * Un transfert VR libère le technicien courant, mais ne doit jamais effacer
- * son travail déjà réalisé. Les champs technicien1/2/3 sont les snapshots
- * conservés lors des passages entre équipes.
- */
-function getVehicleTechnicianHistory(vehicle: Flux): TechnicianReference[] {
-  const vehicleRecord = vehicle as unknown as Record<string, unknown>;
-  const entries = ["", "1", "2", "3"].map((suffix) => ({
-    matricule: String(vehicleRecord[`technicien${suffix}`] || "").trim(),
-    name: String(vehicleRecord[`nomTechnicien${suffix}`] || "").trim(),
-  }));
-  const seen = new Set<string>();
-
-  return entries.filter(({ matricule, name }) => {
-    if ((!matricule || matricule === "-") && (!name || name === "-")) return false;
-    const key = (matricule && matricule !== "-" ? matricule : name).toLocaleLowerCase();
-    if (seen.has(key)) return false;
-    seen.add(key);
-    return true;
-  });
-}
-
-/** Un événement Chronométrie appartient au technicien indiqué dans sa note. */
-function isChronoStepForTechnician(
-  step: { label?: string; commentaire?: string },
-  technician: TechnicianReference,
-): boolean {
-  const text = `${step.label || ''} ${step.commentaire || ''}`.toLocaleLowerCase();
-  if (!text.includes('technicien')) return false;
-  const matricule = String(technician.matricule || '').trim();
-  const name = String(technician.name || '').trim().toLocaleLowerCase();
-  return Boolean(
-    (matricule && matricule !== '-' && new RegExp(`(^|\\D)${matricule.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(\\D|$)`).test(text)) ||
-    (name && name !== '-' && text.includes(name)),
-  );
-}
-
-function getChronoStepTechnician(step: { commentaire?: string }): TechnicianReference | null {
-  const match = String(step.commentaire || '').match(/technicien\s*:\s*([^•\n]+)/i);
-  if (!match) return null;
-  const description = match[1].trim();
-  if (!description || description === '-') return null;
-  const matricule = description.match(/\b\d{3,}\b/)?.[0] || '';
-  const name = description.replace(matricule, '').trim();
-  return matricule || name ? { matricule, name } : null;
-}
-
 /** Accepte les dates historiques françaises et les dates ISO venant de PostgreSQL. */
 function getWorkshopDateParts(value?: string) {
   const date = String(value || "").trim();
@@ -168,6 +118,7 @@ export default function MoyennesView({ vehicles: vehiclesProp }: MoyennesViewPro
   // Internal vehicles state — seeded from prop when available, otherwise fetched from DB
   const [vehicles, setVehicles] = useState<Flux[]>(vehiclesProp ?? []);
   const [suiviEntries, setSuiviEntries] = useState<SuiviEntree[]>([]);
+  const [teamMembers, setTeamMembers] = useState<EquipeMember[]>([]);
   const [selectedYear, setSelectedYear] = useState<number>(2026);
   const [selectedMonth, setSelectedMonth] = useState<number>(9);
   const [hasInitializedPeriod, setHasInitializedPeriod] = useState<boolean>(false);
@@ -175,6 +126,7 @@ export default function MoyennesView({ vehicles: vehiclesProp }: MoyennesViewPro
   const [refreshing, setRefreshing] = useState(false);
   const [syncingPeriod, setSyncingPeriod] = useState(false);
   const [viewMode, setViewMode] = useState<"sheet" | "techniciens" | "charts">("sheet");
+  const [technicianTable, setTechnicianTable] = useState<"rendement" | "quotidien">("quotidien");
   const [searchFilter, setSearchFilter] = useState("");
   const [notification, setNotification] = useState<string | null>(null);
   // Déclenche un nouveau calcul lorsque les attentes/interruptions sont modifiées dans Chronométrie.
@@ -239,6 +191,10 @@ export default function MoyennesView({ vehicles: vehiclesProp }: MoyennesViewPro
 
   useEffect(() => {
     loadData();
+  }, []);
+
+  useEffect(() => {
+    fetchEquipeSheetData().then(({ members }) => setTeamMembers(members)).catch(() => setTeamMembers([]));
   }, []);
 
   useEffect(() => {
@@ -587,70 +543,31 @@ export default function MoyennesView({ vehicles: vehiclesProp }: MoyennesViewPro
     };
   }, [periodChronoCalculations, vehicleByChronoKey, vehicles, timeTrackingRevision]);
 
-  // Daily workload: a vehicle is assigned to the day on which the technician
-  // actually started work. When that timestamp is absent, use the repair start
-  // date, then the entry date as a final fallback.
   const technicianDailyRows = useMemo(() => {
-    const daysInMonth = new Date(selectedYear, selectedMonth, 0).getDate();
-    const rows = new Map<string, { matricule: string; name: string; equipe: string; days: number[]; vehicleKeysByDay: Array<Set<string>> }>();
-
-    chronoCalculations.forEach((calculation) => {
-      const veh = vehicleByChronoKey.get(String(calculation.vehicleKey || '').toUpperCase().replace(/[^A-Z0-9]/g, ''));
-      if (!veh) return;
-      const technicianHistory = getVehicleTechnicianHistory(veh);
-      if (technicianHistory.length === 0) return;
-
-      const addVehicleForDay = ({ matricule, name }: TechnicianReference, day: number) => {
-        const key = matricule && matricule !== "-" ? matricule : name;
-        const existing = rows.get(key) || {
-          matricule: matricule && matricule !== "-" ? matricule : "-",
-          name: name && name !== "-" ? name : matricule,
-          equipe: veh.equipe || "-",
-          days: Array(daysInMonth).fill(0),
-          vehicleKeysByDay: Array.from({ length: daysInMonth }, () => new Set<string>()),
-        };
-        existing.vehicleKeysByDay[day - 1].add(calculation.vehicleKey);
-        rows.set(key, existing);
-      };
-
-      // Référence exacte : les prises en charge/terminaisons consignées dans
-      // Chronométrie. Un même OR n'est compté qu'une fois par technicien et jour.
-      let hasLoggedTechnicianActivity = false;
-      calculation.steps.forEach((step) => {
-        const dateParts = getWorkshopDateParts(step.dateDebut);
-        if (!dateParts || dateParts.year !== selectedYear || dateParts.month !== selectedMonth || dateParts.day < 1 || dateParts.day > daysInMonth) return;
-        const recordedTechnician = getChronoStepTechnician(step);
-        if (recordedTechnician) {
-          addVehicleForDay(recordedTechnician, dateParts.day);
-          hasLoggedTechnicianActivity = true;
-          return;
-        }
-        technicianHistory.forEach((technician) => {
-          if (!isChronoStepForTechnician(step, technician)) return;
-          addVehicleForDay(technician, dateParts.day);
-          hasLoggedTechnicianActivity = true;
-        });
-      });
-
-      // Compatibilité avec les anciens dossiers qui n'ont pas encore d'événement
-      // nominatif : une seule attribution à la date de prise en charge.
-      if (!hasLoggedTechnicianActivity) {
-        const dateParts = getWorkshopDateParts(calculation.datePriseEnChargeEquipe || calculation.dateEntreeReception);
-        if (dateParts && dateParts.year === selectedYear && dateParts.month === selectedMonth && dateParts.day >= 1 && dateParts.day <= daysInMonth) {
-          technicianHistory.forEach((technician) => addVehicleForDay(technician, dateParts.day));
-        }
-      }
+    const rows = new Map<string, { matricule: string; name: string; days: number[] }>();
+    teamMembers.forEach((member) => {
+      const matricule = String(member.matricule || "").trim();
+      const name = String(member.name || "").trim();
+      if (matricule || name) rows.set(matricule || name, { matricule: matricule || "-", name: name || matricule, days: Array(new Date(selectedYear, selectedMonth, 0).getDate()).fill(0) });
     });
-
-    return Array.from(rows.values()).map((row) => {
-      const days = row.vehicleKeysByDay.map((vehiclesForDay, index) => {
-        const count = vehiclesForDay.size;
-        row.days[index] = count;
-        return count;
-      });
-      return { matricule: row.matricule, name: row.name, equipe: row.equipe, days, total: days.reduce((sum, count) => sum + count, 0) };
-    }).sort((a, b) => b.total - a.total || a.name.localeCompare(b.name));
-  }, [chronoCalculations, vehicleByChronoKey, selectedYear, selectedMonth, timeTrackingRevision]);
+    vehicles.forEach((vehicle) => {
+      const date = getWorkshopDateParts(vehicle.dateDebutTravail || vehicle.dateDebutRep || vehicle.dateEntree);
+      const name = String(vehicle.nomTechnicien || "").trim(); const matricule = String(vehicle.technicien || "").trim();
+      // Certaines données historiques utilisent « - » pour signaler qu'aucun
+      // technicien n'a encore été affecté. Ce n'est pas un collaborateur et ne
+      // doit donc pas créer une ligne dans le tableau de rendement.
+      const hasTechnician = (name && name !== "-") || (matricule && matricule !== "-");
+      if (!date || date.year !== selectedYear || date.month !== selectedMonth || !hasTechnician) return;
+      const normalizedName = name.toLocaleLowerCase();
+      const matchedMember = teamMembers.find((member) => String(member.matricule || "").trim() === matricule || String(member.name || "").trim().toLocaleLowerCase() === normalizedName);
+      const key = matchedMember?.matricule || matchedMember?.name || matricule || name;
+      const row = rows.get(key) || { matricule: matchedMember?.matricule || matricule || "-", name: matchedMember?.name || name || matricule, days: Array(new Date(selectedYear, selectedMonth, 0).getDate()).fill(0) };
+      row.days[date.day - 1] += 1; rows.set(key, row);
+    });
+    return [...rows.values()]
+      .map((row) => ({ ...row, total: row.days.reduce((sum, value) => sum + value, 0) }))
+      .sort((a, b) => b.total - a.total || a.name.localeCompare(b.name, "fr"));
+  }, [vehicles, teamMembers, selectedYear, selectedMonth]);
 
   // CSV Export handler
   const handleExportCSV = () => {
@@ -742,7 +659,7 @@ export default function MoyennesView({ vehicles: vehiclesProp }: MoyennesViewPro
   }).format(new Date());
 
   return (
-    <div className="moyennes-print-root w-full h-full flex-1 overflow-y-auto overflow-x-hidden p-3 md:p-4 flex flex-col gap-3 bg-slate-100/80">
+    <div className="moyennes-print-root w-full min-h-full shrink-0 overflow-visible p-3 md:p-4 flex flex-col gap-3 bg-slate-100/80">
       <header className="moyennes-print-header hidden">
         <div>
           <p className="moyennes-print-kicker">ITALCAR · FLUX ATELIER</p>
@@ -1221,7 +1138,7 @@ export default function MoyennesView({ vehicles: vehiclesProp }: MoyennesViewPro
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-slate-200 font-medium">
-                    {displayData.modeles.map((row, rowIdx) => {
+                    {displayData.modeles.filter((row) => row.name !== "Non classé").map((row, rowIdx) => {
                       return (
                         <tr
                           key={`row-mod-${row.name}`}
@@ -1371,7 +1288,12 @@ export default function MoyennesView({ vehicles: vehiclesProp }: MoyennesViewPro
             </div>
           </div>
 
-          <div className="overflow-x-auto">
+          <div className="flex items-center gap-1 border-b border-slate-200 bg-slate-50 px-3 py-2">
+            <button type="button" onClick={() => setTechnicianTable("quotidien")} className={`rounded-md px-3 py-1.5 text-xs font-bold transition-colors ${technicianTable === "quotidien" ? "bg-white text-blue-800 shadow-sm" : "text-slate-600 hover:bg-white"}`}>Véhicules par jour</button>
+            <button type="button" onClick={() => setTechnicianTable("rendement")} className={`rounded-md px-3 py-1.5 text-xs font-bold transition-colors ${technicianTable === "rendement" ? "bg-white text-blue-800 shadow-sm" : "text-slate-600 hover:bg-white"}`}>Rendement & disponibilité</button>
+          </div>
+
+          <div className={`${technicianTable === "rendement" ? "block" : "hidden"} overflow-x-auto`}>
             <table className="zebra-table w-full text-xs text-left border-collapse">
               <thead>
                 <tr className="bg-slate-100 text-slate-700 font-extrabold border-b border-slate-200">
@@ -1456,43 +1378,12 @@ export default function MoyennesView({ vehicles: vehiclesProp }: MoyennesViewPro
             </table>
           </div>
 
-          <div className="border-t border-slate-300 bg-slate-50/70">
-            <div className="px-4 py-2.5 flex flex-wrap items-center justify-between gap-2">
-              <div>
-                <h2 className="font-black text-sm text-slate-900">VÉHICULES TRAVAILLÉS PAR JOUR</h2>
-                <p className="text-[11px] text-slate-500">Comptage selon la date de début de travail de chaque technicien.</p>
-              </div>
-              <span className="text-[11px] font-bold text-blue-800 bg-blue-50 border border-blue-200 rounded px-2 py-1">
-                {technicianDailyRows.length} technicien(s)
-              </span>
-            </div>
-            <div
-              className="max-h-[calc(100vh-26rem)] min-h-[16rem] overflow-auto bg-white"
-              aria-label="Tableau des véhicules travaillés par jour"
-            >
-              <table className="w-full min-w-[1250px] text-center border-collapse text-[11px]">
-                <thead>
-                  <tr className="bg-[#2a6296] text-white font-bold">
-                    <th className="sticky top-0 left-0 z-30 bg-[#1f4e79] py-2 px-3 text-left min-w-[110px]">Matricule</th>
-                    <th className="sticky top-0 left-[110px] z-30 bg-[#1f4e79] py-2 px-3 text-left min-w-[160px]">Technicien</th>
-                    {daysList.map((day) => <th key={day} className="sticky top-0 z-20 bg-[#2a6296] py-2 px-2 min-w-8">{day}</th>)}
-                    <th className="sticky top-0 z-20 bg-[#183d5f] py-2 px-3">Total</th>
-                  </tr>
-                </thead>
-                <tbody className="divide-y divide-slate-100">
-                  {technicianDailyRows.length === 0 ? (
-                    <tr><td colSpan={daysList.length + 3} className="py-6 text-slate-400">Aucun véhicule travaillé sur cette période.</td></tr>
-                  ) : technicianDailyRows.map((tech) => (
-                    <tr key={`daily-${tech.matricule}-${tech.name}`} className="hover:bg-blue-50/50">
-                      <td className="sticky left-0 z-10 bg-white py-2 px-3 text-left font-mono font-bold text-slate-800">{tech.matricule}</td>
-                      <td className="sticky left-[110px] z-10 bg-white py-2 px-3 text-left font-bold text-slate-900">{tech.name}</td>
-                      {tech.days.map((count, index) => (
-                        <td key={index} className={`py-2 px-2 font-bold ${count > 0 ? "text-blue-800 bg-blue-50/70" : "text-slate-300"}`}>{count}</td>
-                      ))}
-                      <td className="py-2 px-3 font-black text-blue-900 bg-blue-50">{tech.total}</td>
-                    </tr>
-                  ))}
-                </tbody>
+          <div className={`${technicianTable === "quotidien" ? "block" : "hidden"} border-t border-slate-300 bg-slate-50/70`}>
+            <div className="px-4 py-2.5 flex items-center justify-between"><div><h2 className="font-black text-sm text-slate-900">VÉHICULES TRAVAILLÉS PAR JOUR</h2><p className="text-[11px] text-slate-500">Comptage selon la date de début de travail de chaque technicien.</p></div><span className="text-[11px] font-bold text-blue-800 bg-blue-50 border border-blue-200 rounded px-2 py-1">{technicianDailyRows.length} technicien(s)</span></div>
+            <div className="overflow-x-auto bg-white">
+              <table className="w-full min-w-[1250px] border-collapse text-center text-[11px]">
+                <thead><tr className="bg-[#2a6296] text-white font-bold shadow-sm"><th className="min-w-[110px] bg-[#1f4e79] px-3 py-2.5 text-left">Matricule</th><th className="min-w-[160px] bg-[#1f4e79] px-3 py-2.5 text-left">Technicien</th>{daysList.map((day) => <th key={day} className="min-w-9 bg-[#2a6296] px-2 py-2.5">{day}</th>)}<th className="min-w-[70px] bg-[#183d5f] px-3 py-2.5">Total</th></tr></thead>
+                <tbody className="divide-y divide-slate-100">{technicianDailyRows.map((tech, rowIndex) => <tr key={tech.matricule} className={`group transition-colors hover:bg-blue-50/70 ${rowIndex % 2 ? "bg-slate-50" : "bg-white"}`}><td className="px-3 py-2.5 text-left font-mono font-bold">{tech.matricule}</td><td className="px-3 py-2.5 text-left font-bold text-slate-800">{tech.name}</td>{tech.days.map((value, index) => <td key={index} className="px-2 py-2.5 font-semibold">{value > 0 ? <span className="inline-flex min-w-6 items-center justify-center rounded border border-blue-700 bg-blue-600 px-1.5 py-0.5 font-bold text-white shadow-sm">{value}</span> : <span className="text-slate-300">{value}</span>}</td>)}<td className="bg-blue-50 px-3 py-2.5 font-black text-blue-900">{tech.total}</td></tr>)}</tbody>
               </table>
             </div>
           </div>

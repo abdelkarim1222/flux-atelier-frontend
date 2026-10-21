@@ -4,10 +4,12 @@ import { RoleProvider } from "./context/RoleContext";
 import ProtectedRoute from "./components/ProtectedRoute";
 import AuthPage from "./pages/AuthPage";
 import Dashboard from "./pages/Dashboard";
+import RealtimeSync from "./components/RealtimeSync";
 
 function App() {
   return (
     <AuthProvider>
+      <RealtimeSync />
       <RoleProvider>
         <BrowserRouter>
           <Routes>
